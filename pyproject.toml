@@ -1,0 +1,55 @@
+[project]
+name = "mint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.5.0",
+    "ruff>=0.14.8",
+    "ty>=0.0.1a32",
+]
+
+[build-system]
+requires = ["hatchling", "versioningit"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "versioningit"
+default-version = "0.0.0+unknown"
+
+[tool.hatch.version.format]
+distance = "{next_version}.dev{distance}+{vcs}{rev}"
+dirty = "{version}+dirty"
+distance-dirty = "{next_version}.dev{distance}+{vcs}{rev}.dirty"
+
+[tool.hatch.build]
+artifacts = ["mini/_version.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mini"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["mini"]
+
+[tool.ruff]
+line-length = 79
+
+[tool.ruff.lint]
+select = ["ALL"]
+exclude = ["*mock*.py"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**.py" = [
+  "S101",  # assert
+]
+
+[tool.pdm.scripts]
+lint = "ruff check --fix"
+tc = "mypy ."
+pre = "pre-commit run --all-files"
+test = "python -m pytest tests"
+testv = "python -m pytest -s tests"

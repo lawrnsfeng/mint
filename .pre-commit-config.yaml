@@ -1,0 +1,61 @@
+---
+# See https://pre-commit.com for more information
+# See https://pre-commit.com/hooks.html for more hooks
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args:
+          - --maxkb=1000
+  - repo: https://github.com/adrienverge/yamllint.git
+    rev: v1.37.1
+    hooks:
+      - id: yamllint
+        name: yamllint
+        entry: yamllint
+        language: python
+        types:
+          - yaml
+        args:
+          - --strict
+  - repo: https://github.com/lyz-code/yamlfix.git
+    rev: 1.19.0
+    hooks:
+      - id: yamlfix
+        entry: env YAMLFIX_SEQUENCE_STYLE=block_style yamlfix
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args:
+          - --ignore-words-list=NIN,braket,RepoT
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.46.0
+    hooks:
+      - id: markdownlint
+        name: markdownlint-fix
+        description: Fixes the style of Markdown/Commonmark files.
+        entry: markdownlint --fix
+        language: node
+        types:
+          - markdown
+        args:
+          - --disable
+          - MD013
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.8
+    hooks:
+      - id: ruff
+        args:
+          - --fix
+      - id: ruff-format
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty check
+        entry: uvx ty check . --ignore unresolved-import
+        language: python

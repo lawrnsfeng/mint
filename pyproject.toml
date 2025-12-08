@@ -8,6 +8,7 @@ dependencies = []
 
 [dependency-groups]
 dev = [
+    "pdm>=2.26.2",
     "pre-commit>=4.5.0",
     "ruff>=0.14.8",
     "ty>=0.0.1a32",
@@ -45,6 +46,11 @@ exclude = ["*mock*.py"]
 [tool.ruff.lint.per-file-ignores]
 "tests/**.py" = [
   "S101",  # assert
+]
+"interface.py" = [
+  "D100",
+  "D101",
+  "D102",
 ]
 
 [tool.pdm.scripts]

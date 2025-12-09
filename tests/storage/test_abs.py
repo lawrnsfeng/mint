@@ -1,15 +1,24 @@
 """Tests for Azure Blob Storage implementation using Azurite testcontainer."""
 
-import tempfile
 from io import BytesIO
 from pathlib import Path
 
+import aiofiles.tempfile
 import pytest
 from azure.storage.blob.aio import BlobServiceClient, ContainerClient
 
 from mint.fs.asynk.abs import AzureBlobStorage
-from mint.fs.exc import ObjectNotFoundError, OperationalError
-from mint.fs.structs import CopyManyResult, ListItem, Stat
+from mint.fs.exc import (
+    InvalidArgumentsError,
+    ObjectNotFoundError,
+)
+from mint.fs.structs import (
+    CopyResult,
+    ListItem,
+    MoveResult,
+    RemoveResult,
+    Stat,
+)
 
 # =============================================================================
 # Azurite Container Health Check Test
@@ -33,27 +42,22 @@ async def test_azurite_is_running_and_operational(
         test_container_name: Name of the test container.
 
     """
-    # Verify container exists
     container_props = await test_container.get_container_properties()
     assert container_props is not None
     assert container_props.name == test_container_name
 
-    # Test creating a blob
     blob_name = "health-check-blob.txt"
     blob_content = b"Hello, Azurite!"
     blob_client = test_container.get_blob_client(blob_name)
 
     await blob_client.upload_blob(blob_content, overwrite=True)
 
-    # Test getting the blob
     download_stream = await blob_client.download_blob()
     downloaded_content = await download_stream.readall()
     assert downloaded_content == blob_content
 
-    # Test deleting the blob
     await blob_client.delete_blob()
 
-    # Verify blob is deleted
     blob_exists = await blob_client.exists()
     assert blob_exists is False
 
@@ -65,59 +69,79 @@ async def test_azurite_is_running_and_operational(
 
 @pytest.mark.asyncio
 async def test_is_folder_returns_true_for_folder_prefix(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that is_folder returns True for a path that is a folder prefix.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with folder prefix
     blob_client = test_container.get_blob_client("folder/file.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # Test
-    result = await abs_storage.is_folder("folder")
+    result = await azure_storage.is_folder("folder")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_folder_returns_true_with_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that is_folder handles trailing slash correctly.
+
+    The trailing slash is stripped, so "folder/" checks for "folder" prefix.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("folder/file.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.is_folder("folder/")
     assert result is True
 
 
 @pytest.mark.asyncio
 async def test_is_folder_returns_false_for_file(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that is_folder returns False for a path that is a file.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob
     blob_client = test_container.get_blob_client("file.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # Test
-    result = await abs_storage.is_folder("file.txt")
+    result = await azure_storage.is_folder("file.txt")
     assert result is False
 
 
 @pytest.mark.asyncio
 async def test_is_folder_returns_false_for_nonexistent_path(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that is_folder returns False for a path that doesn't exist.
+    """Test that is_folder returns False for nonexistent paths (no exception).
+
+    Unlike other methods, is_folder does NOT raise ObjectNotFoundError.
+    This allows safe checking before operations.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    result = await abs_storage.is_folder("nonexistent")
+    result = await azure_storage.is_folder("nonexistent")
     assert result is False
 
 
@@ -128,47 +152,90 @@ async def test_is_folder_returns_false_for_nonexistent_path(
 
 @pytest.mark.asyncio
 async def test_get_downloads_file_to_local_path(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that get downloads a blob to the specified local path.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with content
     blob_name = "download-test.txt"
     blob_content = b"Content to download"
     blob_client = test_container.get_blob_client(blob_name)
     await blob_client.upload_blob(blob_content, overwrite=True)
 
-    # Test
-    with tempfile.TemporaryDirectory() as tmpdir:
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
         save_path = Path(tmpdir) / "downloaded.txt"
-        await abs_storage.get(blob_name, str(save_path))
+        await azure_storage.get(blob_name, str(save_path))
 
         assert save_path.exists()
         assert save_path.read_bytes() == blob_content
 
 
 @pytest.mark.asyncio
-async def test_get_raises_error_for_nonexistent_file(
-    abs_storage: AzureBlobStorage,
+async def test_get_creates_parent_directories(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that get raises an error when the blob doesn't exist.
+    """Test that get creates parent directories if they don't exist.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
+    blob_client = test_container.get_blob_client("nested-get.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
+        save_path = Path(tmpdir) / "nested" / "deep" / "downloaded.txt"
+        await azure_storage.get("nested-get.txt", str(save_path))
+
+        assert save_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_get_empty_file_downloads_correctly(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that get downloads empty files correctly.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("get-empty.txt")
+    await blob_client.upload_blob(b"", overwrite=True)
+
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
+        save_path = Path(tmpdir) / "downloaded-empty.txt"
+        await azure_storage.get("get-empty.txt", str(save_path))
+
+        assert save_path.exists()
+        assert save_path.read_bytes() == b""
+
+
+@pytest.mark.asyncio
+async def test_get_raises_error_for_nonexistent_file(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that get raises ObjectNotFoundError when the blob doesn't exist.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
         save_path = Path(tmpdir) / "downloaded.txt"
         with pytest.raises(ObjectNotFoundError):
-            await abs_storage.get("nonexistent.txt", str(save_path))
+            await azure_storage.get("nonexistent.txt", str(save_path))
 
 
 # =============================================================================
@@ -178,26 +245,26 @@ async def test_get_raises_error_for_nonexistent_file(
 
 @pytest.mark.asyncio
 async def test_save_uploads_from_string_path(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that save uploads a file from a local string path.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a local file
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
         local_path = Path(tmpdir) / "upload.txt"
         content = b"Upload from string path"
         local_path.write_bytes(content)
 
-        # Upload
-        result = await abs_storage.save("uploaded-string.txt", str(local_path))
+        result = await azure_storage.save(
+            "uploaded-string.txt",
+            str(local_path),
+        )
 
-        # Verify
         assert result == "uploaded-string.txt"
         blob_client = test_container.get_blob_client("uploaded-string.txt")
         download = await blob_client.download_blob()
@@ -206,26 +273,23 @@ async def test_save_uploads_from_string_path(
 
 @pytest.mark.asyncio
 async def test_save_uploads_from_pathlib_path(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that save uploads a file from a pathlib.Path object.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Create a local file
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
         local_path = Path(tmpdir) / "upload.txt"
         content = b"Upload from pathlib path"
         local_path.write_bytes(content)
 
-        # Upload
-        result = await abs_storage.save("uploaded-pathlib.txt", local_path)
+        result = await azure_storage.save("uploaded-pathlib.txt", local_path)
 
-        # Verify
         assert result == "uploaded-pathlib.txt"
         blob_client = test_container.get_blob_client("uploaded-pathlib.txt")
         download = await blob_client.download_blob()
@@ -234,23 +298,21 @@ async def test_save_uploads_from_pathlib_path(
 
 @pytest.mark.asyncio
 async def test_save_uploads_from_io_object(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that save uploads content from an IO object.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
     content = b"Upload from BytesIO"
     io_obj = BytesIO(content)
 
-    # Upload
-    result = await abs_storage.save("uploaded-io.txt", io_obj)
+    result = await azure_storage.save("uploaded-io.txt", io_obj)
 
-    # Verify
     assert result == "uploaded-io.txt"
     blob_client = test_container.get_blob_client("uploaded-io.txt")
     download = await blob_client.download_blob()
@@ -259,22 +321,20 @@ async def test_save_uploads_from_io_object(
 
 @pytest.mark.asyncio
 async def test_save_uploads_from_bytes(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that save uploads content from bytes directly.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
     content = b"Upload from bytes directly"
 
-    # Upload
-    result = await abs_storage.save("uploaded-bytes.txt", content)
+    result = await azure_storage.save("uploaded-bytes.txt", content)
 
-    # Verify
     assert result == "uploaded-bytes.txt"
     blob_client = test_container.get_blob_client("uploaded-bytes.txt")
     download = await blob_client.download_blob()
@@ -283,517 +343,85 @@ async def test_save_uploads_from_bytes(
 
 @pytest.mark.asyncio
 async def test_save_returns_uploaded_path(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that save returns the path of the uploaded blob.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
     blob_path = "nested/folder/file.txt"
-    result = await abs_storage.save(blob_path, b"content")
+    result = await azure_storage.save(blob_path, b"content")
 
     assert result == blob_path
 
 
-# =============================================================================
-# IFileStorage.copy Method Tests
-# =============================================================================
-
-
 @pytest.mark.asyncio
-async def test_copy_single_file(
-    abs_storage: AzureBlobStorage,
+async def test_save_empty_bytes(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that copy copies a single file to destination.
+    """Test that save handles empty bytes correctly.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create source blob
-    blob_client = test_container.get_blob_client("source.txt")
-    await blob_client.upload_blob(b"source content", overwrite=True)
+    result = await azure_storage.save("empty-bytes.txt", b"")
 
-    # Copy
-    result = await abs_storage.copy("source.txt", "destination.txt")
-
-    # Verify
-    assert result == "destination.txt"
-    dst_blob = test_container.get_blob_client("destination.txt")
-    download = await dst_blob.download_blob()
-    assert await download.readall() == b"source content"
+    assert result == "empty-bytes.txt"
+    blob_client = test_container.get_blob_client("empty-bytes.txt")
+    download = await blob_client.download_blob()
+    assert await download.readall() == b""
 
 
 @pytest.mark.asyncio
-async def test_copy_returns_destination_path_for_single_file(
-    abs_storage: AzureBlobStorage,
+async def test_save_empty_bytesio(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that copy returns the destination path for single file copy.
+    """Test that save handles empty BytesIO correctly.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create source blob
-    blob_client = test_container.get_blob_client("source.txt")
-    await blob_client.upload_blob(b"source content", overwrite=True)
+    empty_io = BytesIO(b"")
+    result = await azure_storage.save("empty-io.txt", empty_io)
 
-    # Copy
-    result = await abs_storage.copy("source.txt", "dest-path.txt")
-
-    assert isinstance(result, str)
-    assert result == "dest-path.txt"
+    assert result == "empty-io.txt"
+    blob_client = test_container.get_blob_client("empty-io.txt")
+    download = await blob_client.download_blob()
+    assert await download.readall() == b""
 
 
 @pytest.mark.asyncio
-async def test_copy_recursive_copies_folder(
-    abs_storage: AzureBlobStorage,
+async def test_save_empty_file_from_path(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that copy with recursive=True copies all files in a folder.
+    """Test that save handles empty file from path correctly.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create multiple blobs in a folder
-    for i in range(3):
-        blob_client = test_container.get_blob_client(f"src-folder/file{i}.txt")
-        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
-
-    # Copy folder (path must end with / to indicate folder)
-    result = await abs_storage.copy(
-        "src-folder/",
-        "dst-folder/",
-        recursive=True,
-    )
-
-    # Verify all files were copied
-    assert isinstance(result, CopyManyResult)
-    assert len(result.success) == 3
-    assert len(result.failure) == 0
-
-    # Verify destination files exist
-    for i in range(3):
-        dst_blob = test_container.get_blob_client(f"dst-folder/file{i}.txt")
-        assert await dst_blob.exists()
-
-
-@pytest.mark.asyncio
-async def test_copy_recursive_returns_copy_many_result(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that copy with recursive=True returns CopyManyResult.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs in a folder
-    for i in range(3):
-        blob_client = test_container.get_blob_client(f"src-folder/file{i}.txt")
-        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
-
-    # Copy folder
-    result = await abs_storage.copy(
-        "src-folder/",
-        "dst-folder/",
-        recursive=True,
-    )
-
-    assert isinstance(result, CopyManyResult)
-    assert hasattr(result, "success")
-    assert hasattr(result, "failure")
-
-
-@pytest.mark.asyncio
-async def test_copy_preserves_content(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that copy preserves the content of the original file.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create source blob with specific content
-    content = b"preserve this content exactly"
-    blob_client = test_container.get_blob_client("preserve-source.txt")
-    await blob_client.upload_blob(content, overwrite=True)
-
-    # Copy
-    await abs_storage.copy("preserve-source.txt", "preserve-dest.txt")
-
-    # Verify content is preserved
-    dst_blob = test_container.get_blob_client("preserve-dest.txt")
-    download = await dst_blob.download_blob()
-    assert await download.readall() == content
-
-
-# =============================================================================
-# IFileStorage.move Method Tests
-# =============================================================================
-
-
-@pytest.mark.asyncio
-async def test_move_single_file(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that move moves a single file to destination.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create source blob
-    blob_client = test_container.get_blob_client("move-source.txt")
-    await blob_client.upload_blob(b"move content", overwrite=True)
-
-    # Move
-    await abs_storage.move("move-source.txt", "move-dest.txt")
-
-    # Verify destination exists with correct content
-    dst_blob = test_container.get_blob_client("move-dest.txt")
-    download = await dst_blob.download_blob()
-    assert await download.readall() == b"move content"
-
-
-@pytest.mark.asyncio
-async def test_move_removes_source_file(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that move removes the source file after moving.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create source blob
-    blob_client = test_container.get_blob_client("move-source.txt")
-    await blob_client.upload_blob(b"move content", overwrite=True)
-
-    # Move
-    await abs_storage.move("move-source.txt", "move-dest.txt")
-
-    # Verify source is removed
-    assert not await blob_client.exists()
-
-
-@pytest.mark.asyncio
-async def test_move_returns_none_for_single_file(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that move returns None for single file move.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create source blob
-    blob_client = test_container.get_blob_client("move-source.txt")
-    await blob_client.upload_blob(b"move content", overwrite=True)
-
-    # Move
-    result = await abs_storage.move("move-source.txt", "move-dest.txt")
-
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_move_recursive_moves_folder(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that move with recursive=True moves all files in a folder.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs in a folder
-    for i in range(3):
-        blob_client = test_container.get_blob_client(
-            f"move-folder/file{i}.txt",
-        )
-        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
-
-    # Move folder
-    await abs_storage.move("move-folder/", "moved-folder/", recursive=True)
-
-    # Verify all files were moved to destination
-    for i in range(3):
-        dst_blob = test_container.get_blob_client(f"moved-folder/file{i}.txt")
-        assert await dst_blob.exists()
-
-    # Verify source files are removed
-    for i in range(3):
-        src_blob = test_container.get_blob_client(f"move-folder/file{i}.txt")
-        assert not await src_blob.exists()
-
-
-@pytest.mark.asyncio
-async def test_move_raises_error_for_nonexistent_source(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that move raises error when source doesn't exist.
-
-    The implementation wraps Azure SDK's ResourceNotFoundError as
-    OperationalError since copy doesn't pre-check existence.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    with pytest.raises(OperationalError):
-        await abs_storage.move("nonexistent.txt", "dest.txt")
-
-
-# =============================================================================
-# IFileStorage.remove Method Tests
-# =============================================================================
-
-
-@pytest.mark.asyncio
-async def test_remove_single_file(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove deletes a single file.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create a blob
-    blob_client = test_container.get_blob_client("remove-target.txt")
-    await blob_client.upload_blob(b"to be removed", overwrite=True)
-
-    # Remove
-    await abs_storage.remove("remove-target.txt")
-
-    # Verify blob is removed
-    assert not await blob_client.exists()
-
-
-@pytest.mark.asyncio
-async def test_remove_returns_removed_path_for_single_file(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove returns the path of the removed file.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create a blob
-    blob_client = test_container.get_blob_client("remove-target.txt")
-    await blob_client.upload_blob(b"to be removed", overwrite=True)
-
-    # Remove
-    result = await abs_storage.remove("remove-target.txt")
-
-    assert result == "remove-target.txt"
-
-
-@pytest.mark.asyncio
-async def test_remove_recursive_removes_folder(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove with recursive=True removes all files in a folder.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs in a folder
-    for i in range(3):
-        blob_client = test_container.get_blob_client(
-            f"remove-folder/file{i}.txt",
-        )
-        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
-
-    # Remove folder
-    await abs_storage.remove("remove-folder/", recursive=True)
-
-    # Verify all blobs are removed
-    for i in range(3):
-        blob_client = test_container.get_blob_client(
-            f"remove-folder/file{i}.txt",
-        )
-        assert not await blob_client.exists()
-
-
-@pytest.mark.asyncio
-async def test_remove_recursive_returns_tuple_for_folder(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove with recursive=True returns tuple of results.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs in a folder
-    for i in range(3):
-        blob_client = test_container.get_blob_client(
-            f"remove-folder/file{i}.txt",
-        )
-        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
-
-    # Remove folder
-    result = await abs_storage.remove("remove-folder/", recursive=True)
-
-    # Should return tuple (success_list, failure_list)
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-
-
-# =============================================================================
-# IFileStorage.remove_many Method Tests
-# =============================================================================
-
-
-@pytest.mark.asyncio
-async def test_remove_many_removes_multiple_files(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove_many removes multiple files at once.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs
-    paths = ["file1.txt", "file2.txt", "file3.txt"]
-    for path in paths:
-        blob_client = test_container.get_blob_client(path)
-        await blob_client.upload_blob(b"content", overwrite=True)
-
-    # Remove many
-    await abs_storage.remove_many(paths)
-
-    # Verify all blobs are removed
-    for path in paths:
-        blob_client = test_container.get_blob_client(path)
-        assert not await blob_client.exists()
-
-
-@pytest.mark.asyncio
-async def test_remove_many_returns_tuple(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove_many returns tuple with success/failure lists.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create multiple blobs
-    paths = ["file1.txt", "file2.txt", "file3.txt"]
-    for path in paths:
-        blob_client = test_container.get_blob_client(path)
-        await blob_client.upload_blob(b"content", overwrite=True)
-
-    # Remove many
-    result = await abs_storage.remove_many(paths)
-
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    success, failure = result
-    assert len(success) == 3
-    assert len(failure) == 0
-
-
-@pytest.mark.asyncio
-async def test_remove_many_tracks_failures(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove_many tracks which files failed to remove.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create only some of the files to be removed
-    blob_client = test_container.get_blob_client("exists.txt")
-    await blob_client.upload_blob(b"content", overwrite=True)
-
-    # Try to remove existing and non-existing files
-    result = await abs_storage.remove_many(["exists.txt", "not-exists.txt"])
-
-    success, failure = result
-    assert "exists.txt" in success
-    assert len(failure) == 1  # not-exists.txt should fail
-
-
-@pytest.mark.asyncio
-async def test_remove_many_recursive_removes_folders(
-    abs_storage: AzureBlobStorage,
-    test_container: ContainerClient,
-) -> None:
-    """Test that remove_many with recursive=True removes folders.
-
-    Args:
-        abs_storage: The AzureBlobStorage instance.
-        test_container: The test container client.
-
-    """
-    # Setup: Create blobs in multiple folders
-    for folder in ["folder1", "folder2"]:
-        for i in range(2):
-            blob_client = test_container.get_blob_client(
-                f"{folder}/file{i}.txt",
-            )
-            await blob_client.upload_blob(
-                f"content {i}".encode(),
-                overwrite=True,
-            )
-
-    # Remove folders
-    await abs_storage.remove_many(["folder1/", "folder2/"], recursive=True)
-
-    # Verify all blobs are removed
-    for folder in ["folder1", "folder2"]:
-        for i in range(2):
-            blob_client = test_container.get_blob_client(
-                f"{folder}/file{i}.txt",
-            )
-            assert not await blob_client.exists()
+    async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
+        empty_file = Path(tmpdir) / "empty.txt"
+        empty_file.write_bytes(b"")
+
+        result = await azure_storage.save("empty-path.txt", empty_file)
+
+        assert result == "empty-path.txt"
+        blob_client = test_container.get_blob_client("empty-path.txt")
+        download = await blob_client.download_blob()
+        assert await download.readall() == b""
 
 
 # =============================================================================
@@ -803,23 +431,21 @@ async def test_remove_many_recursive_removes_folders(
 
 @pytest.mark.asyncio
 async def test_stat_returns_file_statistics(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that stat returns Stat object with file information.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with known content
     content = b"content for stat test"
     blob_client = test_container.get_blob_client("stat-target.txt")
     await blob_client.upload_blob(content, overwrite=True)
 
-    # Get stat
-    result = await abs_storage.stat("stat-target.txt")
+    result = await azure_storage.stat("stat-target.txt")
 
     assert isinstance(result, Stat)
     assert hasattr(result, "size")
@@ -828,63 +454,81 @@ async def test_stat_returns_file_statistics(
 
 @pytest.mark.asyncio
 async def test_stat_returns_correct_size(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that stat returns the correct file size.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with known content size
     content = b"x" * 100
     blob_client = test_container.get_blob_client("size-test.txt")
     await blob_client.upload_blob(content, overwrite=True)
 
-    # Get stat
-    result = await abs_storage.stat("size-test.txt")
+    result = await azure_storage.stat("size-test.txt")
 
     assert result.size == 100
 
 
 @pytest.mark.asyncio
 async def test_stat_returns_last_modified(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that stat returns a valid last_modified timestamp.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob
     blob_client = test_container.get_blob_client("modified-test.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # Get stat
-    result = await abs_storage.stat("modified-test.txt")
+    result = await azure_storage.stat("modified-test.txt")
 
     assert result.last_modified is not None
 
 
 @pytest.mark.asyncio
-async def test_stat_raises_error_for_nonexistent_file(
-    abs_storage: AzureBlobStorage,
+async def test_stat_empty_file_returns_zero_size(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that stat raises an error for nonexistent files.
+    """Test that stat returns size=0 for empty files.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("stat-empty.txt")
+    await blob_client.upload_blob(b"", overwrite=True)
+
+    result = await azure_storage.stat("stat-empty.txt")
+
+    assert isinstance(result, Stat)
+    assert result.size == 0
+    assert result.last_modified is not None
+
+
+@pytest.mark.asyncio
+async def test_stat_raises_error_for_nonexistent_file(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that stat raises ObjectNotFoundError for nonexistent files.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
     with pytest.raises(ObjectNotFoundError):
-        await abs_storage.stat("nonexistent.txt")
+        await azure_storage.stat("nonexistent.txt")
 
 
 # =============================================================================
@@ -894,24 +538,22 @@ async def test_stat_raises_error_for_nonexistent_file(
 
 @pytest.mark.asyncio
 async def test_list_returns_file_names(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list returns collection of file names in path.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create multiple blobs
     files = ["list-test/file1.txt", "list-test/file2.txt"]
     for file in files:
         blob_client = test_container.get_blob_client(file)
         await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List
-    result = await abs_storage.list("list-test/")
+    result = await azure_storage.list("list-test/")
 
     assert len(result) == 2
     result_list = list(result)
@@ -920,42 +562,153 @@ async def test_list_returns_file_names(
 
 
 @pytest.mark.asyncio
-async def test_list_returns_empty_for_empty_path(
-    abs_storage: AzureBlobStorage,
+async def test_list_with_trailing_slash_lists_folder_contents(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that list returns empty collection for empty path.
+    """Test that list with trailing slash lists folder contents.
+
+    The trailing '/' is the convention for folder operations.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    result = await abs_storage.list("nonexistent-prefix/")
+    for i in range(2):
+        blob = test_container.get_blob_client(f"slash-test/file{i}.txt")
+        await blob.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list("slash-test/")
+
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_without_trailing_slash_uses_prefix(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that list without trailing slash uses path as prefix.
+
+    Without trailing '/', the path is treated as a prefix, potentially
+    matching multiple folders/files with that prefix.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob1 = test_container.get_blob_client("prefix-file1.txt")
+    await blob1.upload_blob(b"content", overwrite=True)
+    blob2 = test_container.get_blob_client("prefix-file2.txt")
+    await blob2.upload_blob(b"content", overwrite=True)
+    blob3 = test_container.get_blob_client("other-file.txt")
+    await blob3.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list("prefix")
+
+    result_list = list(result)
+    assert len(result_list) == 2
+    assert "prefix-file1.txt" in result_list
+    assert "prefix-file2.txt" in result_list
+
+
+@pytest.mark.asyncio
+async def test_list_non_recursive_excludes_nested_files(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that list with recursive=False excludes nested files.
+
+    Non-recursive listing only returns immediate children.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    files = [
+        "non-recursive/file1.txt",
+        "non-recursive/nested/file2.txt",
+    ]
+    for file in files:
+        blob_client = test_container.get_blob_client(file)
+        await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list("non-recursive/", recursive=False)
+
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert "non-recursive/file1.txt" in result_list
+
+
+@pytest.mark.asyncio
+async def test_list_recursive_includes_nested_files(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that list with recursive=True includes nested files.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    files = [
+        "recursive-list/file1.txt",
+        "recursive-list/sub1/file2.txt",
+        "recursive-list/sub1/sub2/file3.txt",
+    ]
+    for file in files:
+        blob_client = test_container.get_blob_client(file)
+        await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list("recursive-list/", recursive=True)
+
+    result_list = list(result)
+    assert len(result_list) == 3
+    for file in files:
+        assert file in result_list
+
+
+@pytest.mark.asyncio
+async def test_list_returns_empty_for_nonexistent_prefix(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that list returns empty collection for nonexistent prefix.
+
+    Does NOT raise ObjectNotFoundError - just returns empty.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.list("nonexistent-prefix/")
 
     assert len(result) == 0
 
 
 @pytest.mark.asyncio
 async def test_list_filters_by_prefix(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list only returns files under the specified path.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create blobs in different folders
     folders = ["folder-a", "folder-b"]
     for folder in folders:
         blob_client = test_container.get_blob_client(f"{folder}/file.txt")
         await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List only folder-a
-    result = await abs_storage.list("folder-a/")
+    result = await azure_storage.list("folder-a/")
 
     result_list = list(result)
     assert len(result_list) == 1
@@ -970,30 +723,27 @@ async def test_list_filters_by_prefix(
 
 @pytest.mark.asyncio
 async def test_list_detailed_returns_list_items(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed returns collection of ListItem objects.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create blobs
     files = ["detailed/file1.txt", "detailed/file2.txt"]
     for file in files:
         blob_client = test_container.get_blob_client(file)
         await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List detailed
-    result = await abs_storage.list_detailed(
+    result = await azure_storage.list_detailed(
         "detailed/",
         show_stats=True,
         show_info=True,
     )
 
-    # Check result is collection of ListItems
     result_list = list(result)
     assert len(result_list) == 2
     for item in result_list:
@@ -1002,22 +752,20 @@ async def test_list_detailed_returns_list_items(
 
 @pytest.mark.asyncio
 async def test_list_detailed_includes_object_name(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed returns ListItems with object_name.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob
     blob_client = test_container.get_blob_client("detailed-name.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List detailed
-    result = await abs_storage.list_detailed(
+    result = await azure_storage.list_detailed(
         "detailed-name.txt",
         show_stats=True,
         show_info=True,
@@ -1030,23 +778,21 @@ async def test_list_detailed_includes_object_name(
 
 @pytest.mark.asyncio
 async def test_list_detailed_with_show_info_includes_size(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed with show_info=True includes size info.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with known size
     content = b"x" * 50
     blob_client = test_container.get_blob_client("info-size.txt")
     await blob_client.upload_blob(content, overwrite=True)
 
-    # List detailed
-    result = await abs_storage.list_detailed("info-size.txt", show_info=True)
+    result = await azure_storage.list_detailed("info-size.txt", show_info=True)
 
     result_list = list(result)
     assert len(result_list) == 1
@@ -1055,22 +801,20 @@ async def test_list_detailed_with_show_info_includes_size(
 
 @pytest.mark.asyncio
 async def test_list_detailed_with_show_info_includes_last_modified(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed with show_info=True includes last_modified.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob
     blob_client = test_container.get_blob_client("info-modified.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List detailed
-    result = await abs_storage.list_detailed(
+    result = await azure_storage.list_detailed(
         "info-modified.txt",
         show_info=True,
     )
@@ -1082,17 +826,16 @@ async def test_list_detailed_with_show_info_includes_last_modified(
 
 @pytest.mark.asyncio
 async def test_list_detailed_with_show_stats_includes_metadata(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed with show_stats=True includes metadata.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob with metadata
     blob_client = test_container.get_blob_client("stats-metadata.txt")
     await blob_client.upload_blob(
         b"content",
@@ -1100,8 +843,7 @@ async def test_list_detailed_with_show_stats_includes_metadata(
         metadata={"key": "value"},
     )
 
-    # List detailed
-    result = await abs_storage.list_detailed(
+    result = await azure_storage.list_detailed(
         "stats-metadata.txt",
         show_stats=True,
     )
@@ -1113,22 +855,20 @@ async def test_list_detailed_with_show_stats_includes_metadata(
 
 @pytest.mark.asyncio
 async def test_list_detailed_with_show_stats_includes_content_type(
-    abs_storage: AzureBlobStorage,
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
     """Test that list_detailed with show_stats=True includes content_type.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    # Setup: Create a blob
     blob_client = test_container.get_blob_client("stats-content-type.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    # List detailed
-    result = await abs_storage.list_detailed(
+    result = await azure_storage.list_detailed(
         "stats-content-type.txt",
         show_stats=True,
     )
@@ -1139,21 +879,673 @@ async def test_list_detailed_with_show_stats_includes_content_type(
 
 
 @pytest.mark.asyncio
-async def test_list_detailed_returns_empty_for_empty_path(
-    abs_storage: AzureBlobStorage,
+async def test_list_detailed_recursive_returns_all_nested_files(
+    azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test that list_detailed returns empty collection for empty path.
+    """Test list_detailed with recursive=True returns all nested files.
 
     Args:
-        abs_storage: The AzureBlobStorage instance.
+        azure_storage: The AzureBlobStorage instance.
         test_container: The test container client.
 
     """
-    result = await abs_storage.list_detailed(
+    files = [
+        "detailed-recursive/file1.txt",
+        "detailed-recursive/sub1/file2.txt",
+        "detailed-recursive/sub1/sub2/file3.txt",
+    ]
+    for file in files:
+        blob_client = test_container.get_blob_client(file)
+        await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list_detailed(
+        "detailed-recursive/",
+        recursive=True,
+        show_info=True,
+    )
+
+    result_list = list(result)
+    assert len(result_list) == 3
+    names = [item.object_name for item in result_list]
+    for file in files:
+        assert file in names
+
+
+@pytest.mark.asyncio
+async def test_list_detailed_non_recursive_excludes_nested_files(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test list_detailed with recursive=False excludes nested files.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    files = [
+        "detailed-non-recursive/file1.txt",
+        "detailed-non-recursive/sub/file2.txt",
+    ]
+    for file in files:
+        blob_client = test_container.get_blob_client(file)
+        await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.list_detailed(
+        "detailed-non-recursive/",
+        recursive=False,
+        show_info=True,
+    )
+
+    result_list = list(result)
+    assert len(result_list) == 1
+    assert result_list[0].object_name == "detailed-non-recursive/file1.txt"
+
+
+@pytest.mark.asyncio
+async def test_list_detailed_returns_empty_for_nonexistent_prefix(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that list_detailed returns empty for nonexistent prefix.
+
+    Does NOT raise ObjectNotFoundError - just returns empty.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.list_detailed(
         "nonexistent-prefix/",
         show_stats=True,
         show_info=True,
     )
 
     assert len(list(result)) == 0
+
+
+# =============================================================================
+# IFileStorage.copy Method Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_copy_single_file_returns_copy_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that copy single file returns CopyResult with one success.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("source.txt")
+    await blob_client.upload_blob(b"source content", overwrite=True)
+
+    result = await azure_storage.copy("source.txt", "destination.txt")
+
+    assert isinstance(result, CopyResult)
+    assert len(result.success) == 1
+    assert "destination.txt" in result.success
+    assert len(result.failure) == 0
+
+
+@pytest.mark.asyncio
+async def test_copy_single_file_preserves_content(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that copy preserves the content of the original file.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    content = b"preserve this content exactly"
+    blob_client = test_container.get_blob_client("preserve-source.txt")
+    await blob_client.upload_blob(content, overwrite=True)
+
+    await azure_storage.copy("preserve-source.txt", "preserve-dest.txt")
+
+    dst_blob = test_container.get_blob_client("preserve-dest.txt")
+    download = await dst_blob.download_blob()
+    assert await download.readall() == content
+
+
+@pytest.mark.asyncio
+async def test_copy_folder_with_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy with trailing '/' copies folder contents.
+
+    The trailing '/' indicates folder operation.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    for i in range(3):
+        blob_client = test_container.get_blob_client(f"src-folder/file{i}.txt")
+        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
+
+    result = await azure_storage.copy(
+        "src-folder/",
+        "dst-folder/",
+        recursive=True,
+    )
+
+    assert isinstance(result, CopyResult)
+    assert len(result.success) == 3
+    assert len(result.failure) == 0
+
+    for i in range(3):
+        dst_blob = test_container.get_blob_client(f"dst-folder/file{i}.txt")
+        assert await dst_blob.exists()
+
+
+@pytest.mark.asyncio
+async def test_copy_folder_non_recursive(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy folder without recursive only copies immediate children.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob1 = test_container.get_blob_client("copy-nr-src/file1.txt")
+    await blob1.upload_blob(b"content", overwrite=True)
+    blob2 = test_container.get_blob_client("copy-nr-src/sub/file2.txt")
+    await blob2.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.copy(
+        "copy-nr-src/",
+        "copy-nr-dst/",
+        recursive=False,
+    )
+
+    assert isinstance(result, CopyResult)
+    assert len(result.success) == 1
+
+    dst1 = test_container.get_blob_client("copy-nr-dst/file1.txt")
+    assert await dst1.exists()
+    dst2 = test_container.get_blob_client("copy-nr-dst/sub/file2.txt")
+    assert not await dst2.exists()
+
+
+@pytest.mark.asyncio
+async def test_copy_empty_folder_returns_empty_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy of empty/nonexistent folder returns empty CopyResult.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.copy(
+        "nonexistent-folder/",
+        "dest-folder/",
+        recursive=True,
+    )
+
+    assert isinstance(result, CopyResult)
+    assert len(result.success) == 0
+    assert len(result.failure) == 0
+
+
+@pytest.mark.asyncio
+async def test_copy_raises_not_found_for_nonexistent_single_file(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy raises ObjectNotFoundError for nonexistent single file.
+
+    Single file copy (no trailing '/') requires source to exist.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    with pytest.raises(ObjectNotFoundError):
+        await azure_storage.copy("nonexistent-src.txt", "nonexistent-dst.txt")
+
+
+@pytest.mark.asyncio
+async def test_copy_raises_error_when_src_is_folder_without_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy raises InvalidArgumentsError for folder without '/'.
+
+    When src doesn't end with '/' but is actually a folder prefix,
+    copy raises InvalidArgumentsError to prevent ambiguity.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("folder-src/file.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    with pytest.raises(InvalidArgumentsError):
+        await azure_storage.copy("folder-src", "folder-dst.txt")
+
+
+@pytest.mark.asyncio
+async def test_copy_raises_error_when_dst_is_folder(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test copy raises InvalidArgumentsError when dst is a folder.
+
+    When copying single file but dst is a folder prefix (has children),
+    copy raises InvalidArgumentsError.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("single-src.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    dst_blob = test_container.get_blob_client("dst-folder/file.txt")
+    await dst_blob.upload_blob(b"dst content", overwrite=True)
+
+    with pytest.raises(InvalidArgumentsError):
+        await azure_storage.copy("single-src.txt", "dst-folder")
+
+
+# =============================================================================
+# IFileStorage.move Method Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_move_single_file_returns_move_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that move single file returns MoveResult.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("move-source.txt")
+    await blob_client.upload_blob(b"move content", overwrite=True)
+
+    result = await azure_storage.move("move-source.txt", "move-dest.txt")
+
+    assert isinstance(result, MoveResult)
+    assert len(result.copy.success) == 1
+    assert "move-dest.txt" in result.copy.success
+    assert len(result.copy.failure) == 0
+    assert len(result.remove.success) == 1
+    assert "move-source.txt" in result.remove.success
+
+
+@pytest.mark.asyncio
+async def test_move_single_file_removes_source(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that move removes the source file after moving.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("move-source.txt")
+    await blob_client.upload_blob(b"move content", overwrite=True)
+
+    await azure_storage.move("move-source.txt", "move-dest.txt")
+
+    assert not await blob_client.exists()
+
+
+@pytest.mark.asyncio
+async def test_move_single_file_preserves_content(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that move preserves content at destination.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("move-source.txt")
+    await blob_client.upload_blob(b"move content", overwrite=True)
+
+    await azure_storage.move("move-source.txt", "move-dest.txt")
+
+    dst_blob = test_container.get_blob_client("move-dest.txt")
+    download = await dst_blob.download_blob()
+    assert await download.readall() == b"move content"
+
+
+@pytest.mark.asyncio
+async def test_move_folder_with_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test move with trailing '/' moves folder contents.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    for i in range(3):
+        blob_client = test_container.get_blob_client(
+            f"move-folder/file{i}.txt",
+        )
+        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
+
+    result = await azure_storage.move(
+        "move-folder/",
+        "moved-folder/",
+        recursive=True,
+    )
+
+    assert isinstance(result, MoveResult)
+    assert len(result.copy.success) == 3
+    assert len(result.remove.success) == 3
+
+    for i in range(3):
+        dst_blob = test_container.get_blob_client(f"moved-folder/file{i}.txt")
+        assert await dst_blob.exists()
+
+    for i in range(3):
+        src_blob = test_container.get_blob_client(f"move-folder/file{i}.txt")
+        assert not await src_blob.exists()
+
+
+@pytest.mark.asyncio
+async def test_move_empty_folder_returns_empty_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test move of empty folder returns MoveResult with empty lists.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.move(
+        "empty-move-src/",
+        "empty-move-dst/",
+        recursive=True,
+    )
+
+    assert isinstance(result, MoveResult)
+    assert result.copy.success == []
+    assert result.copy.failure == []
+    assert result.remove.success == []
+    assert result.remove.failure == []
+
+
+@pytest.mark.asyncio
+async def test_move_raises_error_for_nonexistent_source(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that move raises ObjectNotFoundError when source doesn't exist.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    with pytest.raises(ObjectNotFoundError):
+        await azure_storage.move("nonexistent.txt", "dest.txt")
+
+
+# =============================================================================
+# IFileStorage.remove Method Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_remove_single_file_returns_remove_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that remove single file returns RemoveResult.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("remove-target.txt")
+    await blob_client.upload_blob(b"to be removed", overwrite=True)
+
+    result = await azure_storage.remove("remove-target.txt")
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 1
+    assert "remove-target.txt" in result.success
+    assert len(result.failure) == 0
+
+
+@pytest.mark.asyncio
+async def test_remove_single_file_deletes_blob(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that remove actually deletes the blob.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("remove-target.txt")
+    await blob_client.upload_blob(b"to be removed", overwrite=True)
+
+    await azure_storage.remove("remove-target.txt")
+
+    assert not await blob_client.exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_folder_with_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test remove with trailing '/' removes folder contents.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    for i in range(3):
+        blob_client = test_container.get_blob_client(
+            f"remove-folder/file{i}.txt",
+        )
+        await blob_client.upload_blob(f"content {i}".encode(), overwrite=True)
+
+    result = await azure_storage.remove("remove-folder/", recursive=True)
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 3
+    assert len(result.failure) == 0
+
+    for i in range(3):
+        blob_client = test_container.get_blob_client(
+            f"remove-folder/file{i}.txt",
+        )
+        assert not await blob_client.exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_empty_folder_returns_empty_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test remove of empty/nonexistent folder returns empty result.
+
+    Does NOT raise ObjectNotFoundError for folder operations.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.remove("nonexistent-folder/", recursive=True)
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 0
+    assert len(result.failure) == 0
+
+
+@pytest.mark.asyncio
+async def test_remove_raises_error_for_nonexistent_file(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test remove raises ObjectNotFoundError for nonexistent single file.
+
+    Single file remove (no trailing '/') requires file to exist.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    with pytest.raises(ObjectNotFoundError):
+        await azure_storage.remove("nonexistent.txt")
+
+
+# =============================================================================
+# IFileStorage.remove_many Method Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_remove_many_removes_multiple_files(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that remove_many removes multiple files at once.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    paths = ["file1.txt", "file2.txt", "file3.txt"]
+    for path in paths:
+        blob_client = test_container.get_blob_client(path)
+        await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.remove_many(paths)
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 3
+    assert len(result.failure) == 0
+
+    for path in paths:
+        blob_client = test_container.get_blob_client(path)
+        assert not await blob_client.exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_many_tracks_failures(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that remove_many tracks which files failed to remove.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("exists.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    result = await azure_storage.remove_many(["exists.txt", "not-exists.txt"])
+
+    assert isinstance(result, RemoveResult)
+    assert "exists.txt" in result.success
+    assert len(result.failure) == 1
+
+
+@pytest.mark.asyncio
+async def test_remove_many_recursive_removes_folders(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test that remove_many with recursive=True removes folders.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    for folder in ["folder1", "folder2"]:
+        for i in range(2):
+            blob_client = test_container.get_blob_client(
+                f"{folder}/file{i}.txt",
+            )
+            await blob_client.upload_blob(
+                f"content {i}".encode(),
+                overwrite=True,
+            )
+
+    result = await azure_storage.remove_many(
+        ["folder1/", "folder2/"],
+        recursive=True,
+    )
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 4
+    assert len(result.failure) == 0
+
+    for folder in ["folder1", "folder2"]:
+        for i in range(2):
+            blob_client = test_container.get_blob_client(
+                f"{folder}/file{i}.txt",
+            )
+            assert not await blob_client.exists()
+
+
+@pytest.mark.asyncio
+async def test_remove_many_empty_list_returns_empty_result(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test remove_many with empty list returns empty result.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    result = await azure_storage.remove_many([])
+
+    assert isinstance(result, RemoveResult)
+    assert len(result.success) == 0
+    assert len(result.failure) == 0

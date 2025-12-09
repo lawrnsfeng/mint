@@ -130,7 +130,7 @@ def test_container_name() -> str:
 
 
 @pytest.fixture
-def abs_storage(
+def azure_storage(
     azurite_connection_string: str,
     test_container_name: str,
 ) -> AzureBlobStorage:

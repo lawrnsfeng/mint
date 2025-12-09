@@ -41,9 +41,10 @@ from mint.fs.exc import (
     OperationalError,
 )
 from mint.fs.structs import (
-    CopyManyResult,
+    CopyResult,
     ListItem,
     MoveResult,
+    RemoveResult,
     Stat,
 )
 from mint.logger import get_logger
@@ -376,6 +377,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     ) -> None:
         """Download a blob to a local file.
 
+        Creates parent directories if they don't exist.
+        Supports downloading empty files (size=0).
+
         Args:
             path: Path of the blob in the container.
             save_to: Local file path to save the downloaded content.
@@ -405,6 +409,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         overwrite: bool = True,
     ) -> str:
         """Upload content to a blob.
+
+        Supports uploading empty content (empty bytes, BytesIO, or file).
 
         Args:
             path: Destination path in the container.
@@ -448,35 +454,53 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         dst: str,
         *,
         recursive: bool = False,
-    ) -> str | CopyManyResult:
+    ) -> CopyResult:
         """Copy blob(s) from source to destination.
 
-        For single file copy, src should not end with '/'.
-        For folder copy, src must end with '/' and recursive applies.
+        Path conventions:
+            - src without trailing '/': single file copy.
+            - src with trailing '/': folder/prefix copy.
+
+        Examples:
+            - copy("file.txt", "backup.txt"): copies single file.
+            - copy("folder/", "backup/", recursive=True): copies all files
+              under folder/ to backup/.
+            - copy("folder/", "backup/"): copies only immediate children
+              (non-recursive).
+
+        Edge cases:
+            - Single file not found: raises ObjectNotFoundError.
+            - Empty folder (no children): returns CopyResult with empty lists.
+            - Partial failures: CopyResult.failure lists failed paths with
+              error messages.
+            - src is folder but missing '/': raises InvalidArgumentsError.
 
         Args:
-            src: Source path (file or folder with trailing '/').
+            src: Source path. Add trailing '/' for folder operations.
             dst: Destination path.
-            recursive: Whether to copy recursively for folders.
+            recursive: Whether to copy recursively (only for folder src).
 
         Returns:
-            For single file: destination path string.
-            For folder: CopyManyResult with success/failure lists.
+            CopyResult with success (destination paths) and failure lists.
 
         Raises:
-            InvalidArgumentsError: If src or dst is ambiguous.
+            ObjectNotFoundError: If single file src doesn't exist.
+            InvalidArgumentsError: If src or dst is detected as folder but
+                src doesn't have trailing '/'.
 
         """
         if not src.endswith("/"):
             if await self.is_folder(src) or await self.is_folder(dst):
                 raise InvalidArgumentsError(
-                    detail="either src or dst is a folder",
+                    detail="src or dst is a folder; add trailing '/' to src",
                 )
             dst = dst.rstrip("/")
             src_blob = self.container.get_blob_client(blob=src)
+            if not await src_blob.exists():
+                raise ObjectNotFoundError(src)
             dst_blob = self.container.get_blob_client(blob=dst)
             await dst_blob.start_copy_from_url(src_blob.url)
-            return dst
+            return CopyResult(success=[dst], failure=[])
 
         src = f"{src.rstrip('/')}/"
         src_blobs = await self.list(src, recursive=recursive)
@@ -505,7 +529,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                 failure.extend([f"{path}: {result_or_exc!s}"])
             else:
                 success.extend([str(path)])
-        return CopyManyResult(success=success, failure=failure)
+        return CopyResult(success=success, failure=failure)
 
     @_auto_catch_native_exc
     @_ensure_client
@@ -515,42 +539,52 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         dst: str,
         *,
         recursive: bool = False,
-    ) -> MoveResult | None:
+    ) -> MoveResult:
         """Move blob(s) from source to destination.
 
         Performs a copy followed by removal of the source.
 
+        Path conventions:
+            - src without trailing '/': single file move.
+            - src with trailing '/': folder/prefix move.
+
+        Examples:
+            - move("file.txt", "backup.txt"): moves single file.
+            - move("folder/", "backup/", recursive=True): moves all files
+              under folder/ to backup/.
+
+        Edge cases:
+            - Single file not found: raises ObjectNotFoundError.
+            - Empty folder: returns MoveResult with empty success lists.
+            - Partial copy failures: raises MoveCleanupError (no removal
+              attempted to prevent data loss).
+            - src is folder but missing '/': raises InvalidArgumentsError.
+
         Args:
-            src: Source path (file or folder with trailing '/').
+            src: Source path. Add trailing '/' for folder operations.
             dst: Destination path.
-            recursive: Whether to move recursively for folders.
+            recursive: Whether to move recursively (only for folder src).
 
         Returns:
-            For single file: None.
-            For folder: MoveResult with copy and remove details.
+            MoveResult with copy and remove results.
 
         Raises:
-            MoveCleanupError: If copy succeeded but removal failed.
+            ObjectNotFoundError: If single file src doesn't exist.
+            MoveCleanupError: If copy had failures (removal not attempted).
+            InvalidArgumentsError: If src or dst is detected as folder but
+                src doesn't have trailing '/'.
 
         """
         copy_result = await self.copy(src, dst, recursive=recursive)
-        if isinstance(copy_result, str):
-            await self.remove(src, recursive=recursive)
-            return None
         if len(copy_result.failure) > 0:
             raise MoveCleanupError(src=src, failure=copy_result.failure)
         remove_result = await self.remove(src, recursive=recursive)
-        # remove_result is tuple[success, failure] for folders
-        if isinstance(remove_result, tuple):
-            remove_success, remove_failure = remove_result
-        else:
-            remove_success, remove_failure = [remove_result], []
         return MoveResult(
-            copy=CopyManyResult(
+            copy=CopyResult(
                 success=copy_result.success,
-                failure=list(remove_failure),
+                failure=[],
             ),
-            remove=list(remove_success),
+            remove=remove_result,
         )
 
     @_auto_catch_native_exc
@@ -560,33 +594,47 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         path: str,
         *,
         recursive: bool = False,
-    ) -> str | tuple[Sequence[str], Sequence[str]]:
+    ) -> RemoveResult:
         """Remove a blob or folder.
 
+        Path conventions:
+            - path without trailing '/': single file removal.
+            - path with trailing '/': folder/prefix removal.
+
+        Examples:
+            - remove("file.txt"): removes single file.
+            - remove("folder/", recursive=True): removes all files under
+              folder/.
+            - remove("folder/"): removes only immediate children
+              (non-recursive).
+
+        Edge cases:
+            - Single file not found: raises ObjectNotFoundError.
+            - Empty folder: returns RemoveResult with empty lists.
+            - Partial failures: RemoveResult.failure lists failed paths.
+
         Args:
-            path: Path to remove (folder paths must end with '/').
-            recursive: Whether to remove recursively for folders.
+            path: Path to remove. Add trailing '/' for folder operations.
+            recursive: Whether to remove recursively (only for folder path).
 
         Returns:
-            For single file: the removed path.
-            For folder: tuple of (success list, failure list).
+            RemoveResult with success and failure lists.
 
         Raises:
-            ObjectNotFoundError: If the blob does not exist.
+            ObjectNotFoundError: If single file doesn't exist.
 
         """
         if path.endswith("/"):
             objs = await self.list(path, recursive=recursive)
             if len(objs) == 0:
-                # ABS seems not to care about folders
-                return path
+                return RemoveResult(success=[], failure=[])
             return await self.remove_many(objs, recursive=recursive)
 
         blob = self.container.get_blob_client(path)
         if not (await blob.exists()):
             raise ObjectNotFoundError(path)
         await blob.delete_blob()
-        return path
+        return RemoveResult(success=[path], failure=[])
 
     async def _remove_many_files(
         self,
@@ -625,7 +673,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         paths: Collection[str],
         *,
         recursive: bool = False,
-    ) -> tuple[Sequence[str], Sequence[str]]:
+    ) -> RemoveResult:
         """Remove multiple blobs.
 
         Args:
@@ -633,11 +681,11 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             recursive: Whether to remove folders recursively.
 
         Returns:
-            Tuple of (successfully removed paths, failed paths).
+            RemoveResult with success and failure lists.
 
         """
         if len(paths) == 0:
-            return ([], [])
+            return RemoveResult(success=[], failure=[])
 
         folders: list[str] = [path for path in paths if path.endswith("/")]
         files: list[str] = [path for path in paths if path not in folders]
@@ -695,19 +743,22 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                 children_paths = await self.list(folderpath, recursive=True)
                 if len(children_paths) == 0:
                     continue
-                deleted_, errors_ = await self.remove_many(
+                child_result = await self.remove_many(
                     children_paths,
                     recursive=True,
                 )
-                deleted.extend(deleted_)
-                errors.extend(errors_)
+                deleted.extend(child_result.success)
+                errors.extend(child_result.failure)
 
-        return deleted, [*notfound, *errors]
+        return RemoveResult(success=deleted, failure=[*notfound, *errors])
 
     @_auto_catch_native_exc
     @_ensure_client
     async def stat(self, path: str) -> Stat:
         """Get statistics for a blob.
+
+        Edge cases:
+            - Empty files: returns Stat with size=0 and valid last_modified.
 
         Args:
             path: Path of the blob.
@@ -738,8 +789,20 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     ) -> Collection[str]:
         """List blobs under a path prefix.
 
+        The path is used as a prefix filter. Typically use trailing '/'
+        to list folder contents.
+
+        Examples:
+            - list("folder/"): lists immediate children in folder/.
+            - list("folder/", recursive=True): lists all nested blobs.
+            - list("prefix"): lists blobs starting with "prefix".
+
+        Edge cases:
+            - Nonexistent prefix: returns empty collection (no exception).
+            - Non-recursive: excludes blobs in subdirectories.
+
         Args:
-            path: Path prefix to list.
+            path: Path prefix to list (use trailing '/' for folders).
             recursive: Whether to list recursively into subfolders.
 
         Returns:
@@ -749,12 +812,15 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         blob_props_list: AsyncItemPaged[BlobProperties] = (
             self.container.list_blobs(name_starts_with=path)
         )
-        return [
-            blob_props.name
-            async for blob_props in blob_props_list
-            if recursive
-            or "/" not in str(Path(blob_props.name).relative_to(Path(path)))
-        ]
+        results: list[str] = []
+        async for blob_props in blob_props_list:
+            if recursive:
+                results.append(blob_props.name)
+                continue
+            suffix = blob_props.name[len(path) :]
+            if "/" not in suffix:
+                results.append(blob_props.name)
+        return results
 
     @_auto_catch_native_exc
     @_ensure_client
@@ -764,15 +830,29 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         *,
         show_stats: bool = False,
         show_info: bool = False,
-        recursive: bool = False,  # noqa: ARG002
+        recursive: bool = False,
     ) -> Collection[ListItem]:
         """List blobs with detailed information.
 
+        The path is used as a prefix filter. Typically use trailing '/'
+        to list folder contents.
+
+        Examples:
+            - list_detailed("folder/", show_info=True): lists immediate
+              children with size/modified info.
+            - list_detailed("folder/", recursive=True): lists all nested
+              blobs.
+
+        Edge cases:
+            - Non-recursive: excludes blobs in subdirectories.
+            - Recursive: includes all nested blobs under the prefix.
+            - Nonexistent prefix: returns empty collection (no exception).
+
         Args:
-            path: Path prefix to list.
+            path: Path prefix to list (use trailing '/' for folders).
             show_stats: Include content_type and metadata.
             show_info: Include bucket, modified, etag, and size.
-            recursive: Reserved for future use (currently ignored).
+            recursive: Whether to list recursively into subfolders.
 
         Returns:
             Collection of ListItem objects with blob details.
@@ -785,6 +865,10 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         objs: list[ListItem] = []
         async for blob_props_page in blob_props_list.by_page():
             async for blob_props in blob_props_page:
+                if not recursive:
+                    suffix = blob_props.name[len(path) :]
+                    if "/" in suffix:
+                        continue
                 obj = ListItem(
                     object_name=blob_props.name,
                 )
@@ -914,11 +998,26 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     async def is_folder(self, path: str) -> bool:
         """Check if a path is a folder (has children blobs).
 
+        A path is considered a folder if there exist blobs with names that
+        start with the path as a prefix but are not the path itself.
+
+        Note:
+            Does NOT raise ObjectNotFoundError for nonexistent paths.
+            Returns False for both nonexistent paths and existing files.
+            Use this to disambiguate between file and folder paths.
+
+        Examples:
+            - is_folder("folder") -> True if "folder/file.txt" exists.
+            - is_folder("file.txt") -> False if "file.txt" is a blob.
+            - is_folder("nonexistent") -> False (no exception).
+            - is_folder("folder/") -> True if "folder/file.txt" exists
+              (trailing slash is stripped).
+
         Args:
-            path: Path to check.
+            path: Path to check (trailing '/' is stripped).
 
         Returns:
-            True if path is a folder prefix, False otherwise.
+            True if path is a folder prefix with children, False otherwise.
 
         """
         path_noslash = path.rstrip("/")

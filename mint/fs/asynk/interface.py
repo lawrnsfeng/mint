@@ -3,15 +3,23 @@ from pathlib import Path
 from typing import IO, Protocol
 
 from mint.fs.structs import (
-    CopyManyResult,
+    CopyResult,
     ListItem,
     MoveResult,
-    RemoveManyResult,
+    RemoveResult,
     Stat,
 )
 
 
 class IFileStorage[T](Protocol):
+    """Protocol for async file storage operations.
+
+    Path conventions:
+        - Paths ending with '/' are treated as folders/prefixes.
+        - Paths without trailing '/' are treated as single files.
+
+    """
+
     @property
     def client(self) -> T: ...
     async def is_folder(self, path: str) -> bool: ...
@@ -23,32 +31,38 @@ class IFileStorage[T](Protocol):
         dst: str,
         *,
         recursive: bool = ...,
-    ) -> str | CopyManyResult: ...
+    ) -> CopyResult: ...
     async def move(
         self,
         src: str,
         dst: str,
         *,
         recursive: bool = ...,
-    ) -> MoveResult | None: ...
+    ) -> MoveResult: ...
     async def remove(
         self,
         path: str,
         *,
         recursive: bool = ...,
-    ) -> str | RemoveManyResult: ...
+    ) -> RemoveResult: ...
     async def remove_many(
         self,
         paths: Sequence[str],
         *,
         recursive: bool = ...,
-    ) -> RemoveManyResult: ...
+    ) -> RemoveResult: ...
     async def stat(self, path: str) -> Stat: ...
-    async def list(self, path: str) -> Collection[str]: ...
+    async def list(
+        self,
+        path: str,
+        *,
+        recursive: bool = ...,
+    ) -> Collection[str]: ...
     async def list_detailed(
         self,
         path: str,
         *,
         show_stats: bool = ...,
         show_info: bool = ...,
+        recursive: bool = ...,
     ) -> Collection[ListItem]: ...

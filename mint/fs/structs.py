@@ -5,12 +5,26 @@ from datetime import datetime
 
 
 @dataclass
-class CopyManyResult:
-    """Result of a bulk copy operation.
+class CopyResult:
+    """Result of a copy operation.
 
     Attributes:
-        success: List of successfully copied file paths.
-        failure: List of failed file paths with error messages.
+        success: List of successfully copied destination paths.
+        failure: List of failed paths with error messages.
+
+    """
+
+    success: list[str]
+    failure: list[str]
+
+
+@dataclass
+class RemoveResult:
+    """Result of a remove operation.
+
+    Attributes:
+        success: List of successfully removed file paths.
+        failure: List of failed paths with error messages.
 
     """
 
@@ -24,26 +38,12 @@ class MoveResult:
 
     Attributes:
         copy: Result of the copy phase of the move.
-        remove: List of successfully removed source paths.
+        remove: Result of the remove phase of the move.
 
     """
 
-    copy: CopyManyResult
-    remove: list[str]
-
-
-@dataclass
-class RemoveManyResult:
-    """Result of a bulk remove operation.
-
-    Attributes:
-        success: List of successfully removed file paths.
-        failure: List of failed file paths with error messages.
-
-    """
-
-    success: list[str]
-    failure: list[str]
+    copy: CopyResult
+    remove: RemoveResult
 
 
 @dataclass

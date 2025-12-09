@@ -10,3 +10,5 @@ globs: **/*.py
 - Limit the use of global variables to reduce side effects.
 - ALWAYS KEEP MAX LINE LENGTH TO 79.
 - Prefer `pathlib` to `os.path`.
+- No comments in the function body, only docstring allowed.
+- Always try to activate virtual environment in working directory's `.venv` before running any python command.

@@ -4,14 +4,27 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.2",
+    "structlog>=25.5.0",
+]
 
 [dependency-groups]
+azure = [
+    "azure-identity>=1.25.1",
+    "azure-storage-blob>=12.27.1",
+]
 dev = [
     "pdm>=2.26.2",
     "pre-commit>=4.5.0",
     "ruff>=0.14.8",
     "ty>=0.0.1a32",
+]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "testcontainers[azurite]>=4.0.0",
 ]
 
 [build-system]
@@ -28,13 +41,13 @@ dirty = "{version}+dirty"
 distance-dirty = "{next_version}.dev{distance}+{vcs}{rev}.dirty"
 
 [tool.hatch.build]
-artifacts = ["mini/_version.py"]
+artifacts = ["mint/_version.py"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["mini"]
+packages = ["mint"]
 
 [tool.hatch.build.targets.sdist]
-only-include = ["mini"]
+only-include = ["mint"]
 
 [tool.ruff]
 line-length = 79
@@ -42,15 +55,32 @@ line-length = 79
 [tool.ruff.lint]
 select = ["ALL"]
 exclude = ["*mock*.py"]
+ignore = [
+    "D100",  # undocumented-public-module
+    "D104",  # undocumented-public-package
+    "D105",  # undocumented-magic-method
+    "D203",  # one-blank-line-before-class
+    "D213",  # multi-line-summary-second-line
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**.py" = [
-  "S101",  # assert
+    "S101",  # assert
+    "ARG001",  # unused-function-argument (fixtures for setup/cleanup)
+    "PLR2004",  # magic-value-comparison (test assertions)
 ]
 "interface.py" = [
-  "D100",
-  "D101",
-  "D102",
+    "D100",
+    "D101",
+    "D102",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
 ]
 
 [tool.pdm.scripts]

@@ -1683,3 +1683,86 @@ async def test_concurrent_mixed_operations_on_same_instance(
     assert len(list_results) == 100
 
     await azure_storage.remove("mixed/", recursive=True)
+
+
+# =============================================================================
+# Concurrency Limiter Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_clients_creates_limiter(
+    azurite_connection_string: str,
+    test_container_name: str,
+    test_container: ContainerClient,
+) -> None:
+    """Test that max_concurrent_clients creates a ConcurrencyLimiter.
+
+    This test verifies that when max_concurrent_clients is set,
+    the storage instance has a properly configured limiter and
+    operations complete successfully.
+
+    Args:
+        azurite_connection_string: Connection string for Azurite.
+        test_container_name: Name of the test container.
+        test_container: The test container client.
+
+    """
+    max_clients = 5
+    storage = AzureBlobStorage(
+        container_name=test_container_name,
+        storage_account_name="devstoreaccount1",
+        connection_string=azurite_connection_string,
+        max_concurrent_clients=max_clients,
+    )
+
+    assert storage._limiter is not None
+    assert storage._limiter.max_concurrent == max_clients
+
+    for i in range(20):
+        blob_client = test_container.get_blob_client(f"limited/{i}.txt")
+        await blob_client.upload_blob(f"data-{i}".encode(), overwrite=True)
+
+    results = await asyncio.gather(
+        *[storage.stat(f"limited/{i}.txt") for i in range(20)],
+    )
+
+    assert len(results) == 20
+
+    await storage.remove("limited/", recursive=True)
+
+
+@pytest.mark.asyncio
+async def test_unlimited_concurrent_clients_when_none(
+    azurite_connection_string: str,
+    test_container_name: str,
+    test_container: ContainerClient,
+) -> None:
+    """Test that no limit is applied when max_concurrent_clients is None.
+
+    Args:
+        azurite_connection_string: Connection string for Azurite.
+        test_container_name: Name of the test container.
+        test_container: The test container client.
+
+    """
+    storage = AzureBlobStorage(
+        container_name=test_container_name,
+        storage_account_name="devstoreaccount1",
+        connection_string=azurite_connection_string,
+        max_concurrent_clients=None,
+    )
+
+    assert storage._limiter is None
+
+    for i in range(50):
+        blob_client = test_container.get_blob_client(f"unlimited/{i}.txt")
+        await blob_client.upload_blob(f"data-{i}".encode(), overwrite=True)
+
+    results = await asyncio.gather(
+        *[storage.stat(f"unlimited/{i}.txt") for i in range(50)],
+    )
+
+    assert len(results) == 50
+
+    await storage.remove("unlimited/", recursive=True)

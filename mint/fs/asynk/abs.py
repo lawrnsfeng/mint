@@ -50,6 +50,7 @@ from mint.fs.structs import (
 )
 from mint.logger import get_logger
 from mint.utils.batch import Batch
+from mint.utils.limiter import ConcurrencyLimiter
 
 from .interface import IFileStorage
 from .structs import AzureCredentialMode, AzureSessionParams
@@ -104,6 +105,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         sas_token: str | None = None,
         tenant_id: str | None = None,
         client_id: str | None = None,
+        *,
+        max_concurrent_clients: int | None = None,
     ) -> None:
         """Initialize AzureBlobStorage with credentials.
 
@@ -125,6 +128,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             sas_token: Shared access signature token.
             tenant_id: Azure AD tenant ID for service principal.
             client_id: Azure AD client/application ID.
+            max_concurrent_clients: Maximum number of concurrent clients.
+                Use None for unlimited (default).
 
         """
         self.container_name = container_name
@@ -140,6 +145,11 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         self._client_ctx: ContextVar[BlobServiceClient | None] = ContextVar(
             f"_abs_client_{id(self)}",
             default=None,
+        )
+        self._limiter: ConcurrencyLimiter | None = (
+            ConcurrencyLimiter(max_concurrent_clients)
+            if max_concurrent_clients is not None
+            else None
         )
 
     @property
@@ -350,6 +360,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         async-safe, per-coroutine client isolation to avoid race
         conditions when multiple coroutines share the same instance.
 
+        When max_concurrent_clients is set, limits the number of
+        concurrent client connections using ConcurrencyLimiter.
+
         Args:
             func: The async function requiring a client.
 
@@ -368,12 +381,18 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             if self._client_ctx.get() is not None:
                 return await func(self, *args, **kwargs)
 
-            async with self._create_client() as client:
-                token = self._client_ctx.set(client)
-                try:
-                    return await func(self, *args, **kwargs)
-                finally:
-                    self._client_ctx.reset(token)
+            async def _execute_with_client() -> RT:
+                async with self._create_client() as client:
+                    token = self._client_ctx.set(client)
+                    try:
+                        return await func(self, *args, **kwargs)
+                    finally:
+                        self._client_ctx.reset(token)
+
+            if self._limiter is not None:
+                async with self._limiter:
+                    return await _execute_with_client()
+            return await _execute_with_client()
 
         return wrapper
 

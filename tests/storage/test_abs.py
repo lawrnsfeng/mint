@@ -1,5 +1,6 @@
 """Tests for Azure Blob Storage implementation using Azurite testcontainer."""
 
+import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -1549,3 +1550,136 @@ async def test_remove_many_empty_list_returns_empty_result(
     assert isinstance(result, RemoveResult)
     assert len(result.success) == 0
     assert len(result.failure) == 0
+
+
+# =============================================================================
+# Concurrent Operations Tests (Race Condition Prevention)
+# =============================================================================
+
+CONCURRENCY_COUNT = 300
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stat_operations_on_same_instance(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test 150+ concurrent stat operations on the same instance.
+
+    This test verifies that the ContextVar-based client management
+    prevents race conditions when multiple coroutines use the same
+    AzureBlobStorage instance simultaneously for read operations.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    content = b"x" * 100
+    for i in range(CONCURRENCY_COUNT):
+        blob_client = test_container.get_blob_client(f"concurrent/{i}.txt")
+        await blob_client.upload_blob(content, overwrite=True)
+
+    async def stat_operation(idx: int) -> int:
+        stat = await azure_storage.stat(f"concurrent/{idx}.txt")
+        return stat.size
+
+    results = await asyncio.gather(
+        *[stat_operation(i) for i in range(CONCURRENCY_COUNT)],
+    )
+
+    assert len(results) == CONCURRENCY_COUNT
+    assert all(size == 100 for size in results)
+
+    await azure_storage.remove("concurrent/", recursive=True)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_save_operations_on_same_instance(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test 150+ concurrent save operations on the same instance.
+
+    This test runs many save operations concurrently to verify that
+    each coroutine has its own isolated client and no data corruption
+    or race conditions occur.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+
+    async def save_op(idx: int) -> str:
+        path = f"concurrent_save/{idx}.txt"
+        content = f"data-{idx:04d}".encode()
+        await azure_storage.save(path, content)
+        return path
+
+    results = await asyncio.gather(
+        *[save_op(i) for i in range(CONCURRENCY_COUNT)],
+    )
+
+    assert len(results) == CONCURRENCY_COUNT
+    assert all(p.startswith("concurrent_save/") for p in results)
+
+    files = await azure_storage.list("concurrent_save/", recursive=True)
+    assert len(files) == CONCURRENCY_COUNT
+
+    await azure_storage.remove("concurrent_save/", recursive=True)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_mixed_operations_on_same_instance(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Test 300 concurrent mixed operations on the same instance.
+
+    This test runs save, stat, list, and get operations concurrently
+    to verify that the ContextVar-based client isolation works across
+    different operation types.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    content = b"test-content"
+    for i in range(100):
+        blob_client = test_container.get_blob_client(f"mixed/{i}.txt")
+        await blob_client.upload_blob(content, overwrite=True)
+
+    async def save_op(idx: int) -> str:
+        path = f"mixed/new-{idx}.txt"
+        await azure_storage.save(path, f"new-{idx}".encode())
+        return f"saved:{path}"
+
+    async def stat_op(idx: int) -> str:
+        stat = await azure_storage.stat(f"mixed/{idx % 50}.txt")
+        return f"stat:size={stat.size}"
+
+    async def list_op(_: int) -> str:
+        files = await azure_storage.list("mixed/")
+        return f"list:count={len(files)}"
+
+    tasks: list[asyncio.Task[str]] = []
+    for i in range(100):
+        tasks.append(asyncio.create_task(save_op(i)))
+        tasks.append(asyncio.create_task(stat_op(i)))
+        tasks.append(asyncio.create_task(list_op(i)))
+
+    results = await asyncio.gather(*tasks)
+
+    assert len(results) == CONCURRENCY_COUNT
+    save_results = [r for r in results if r.startswith("saved:")]
+    stat_results = [r for r in results if r.startswith("stat:")]
+    list_results = [r for r in results if r.startswith("list:")]
+
+    assert len(save_results) == 100
+    assert len(stat_results) == 100
+    assert all(r == "stat:size=12" for r in stat_results)
+    assert len(list_results) == 100
+
+    await azure_storage.remove("mixed/", recursive=True)

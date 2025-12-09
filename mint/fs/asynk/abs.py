@@ -3,6 +3,7 @@
 import asyncio
 import os
 from collections.abc import Callable, Collection, Coroutine, Sequence
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from io import BytesIO
@@ -136,7 +137,10 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         self.client_secret = client_secret
 
         self.mode, self.params = self._init_credential_mode()
-        self._client: BlobServiceClient | None = None
+        self._client_ctx: ContextVar[BlobServiceClient | None] = ContextVar(
+            f"_abs_client_{id(self)}",
+            default=None,
+        )
 
     @property
     def client(self) -> BlobServiceClient:
@@ -149,9 +153,10 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             RuntimeError: If client is not initialized.
 
         """
-        if self._client is None:
+        client = self._client_ctx.get()
+        if client is None:
             raise RuntimeError(_ERR_CLIENT_NOT_INITIALIZED)
-        return self._client
+        return client
 
     @property
     def container(self) -> ContainerClient:
@@ -335,13 +340,15 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                 raise InvalidArgumentsError(detail=f"mode = {self.mode}")
 
     @staticmethod
-    def _ensure_client[StorageT: "AzureBlobStorage", **P, RT](
-        func: Callable[Concatenate[StorageT, P], Coro[RT]],
-    ) -> Callable[Concatenate[StorageT, P], Coro[RT]]:
+    def _ensure_client[S: "AzureBlobStorage", **P, RT](
+        func: Callable[Concatenate[S, P], Coro[RT]],
+    ) -> Callable[Concatenate[S, P], Coro[RT]]:
         """Wrap async function to ensure client is initialized.
 
         Create and manage the client lifecycle, initializing it before
-        the operation and cleaning up afterward.
+        the operation and cleaning up afterward. Uses ContextVar for
+        async-safe, per-coroutine client isolation to avoid race
+        conditions when multiple coroutines share the same instance.
 
         Args:
             func: The async function requiring a client.
@@ -353,18 +360,20 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         @wraps(func)
         async def wrapper(
-            self: StorageT,
+            self: S,
             /,
             *args: P.args,
             **kwargs: P.kwargs,
         ) -> RT:
-            if self._client is not None:
+            if self._client_ctx.get() is not None:
                 return await func(self, *args, **kwargs)
 
-            async with self._create_client() as self._client:
-                retval = await func(self, *args, **kwargs)
-            self._client = None
-            return retval
+            async with self._create_client() as client:
+                token = self._client_ctx.set(client)
+                try:
+                    return await func(self, *args, **kwargs)
+                finally:
+                    self._client_ctx.reset(token)
 
         return wrapper
 

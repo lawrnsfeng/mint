@@ -60,7 +60,7 @@ class OperationalError(FileStorageError):
     """Uncaught exception when running logic."""
 
     TEMPLATE = "Operational uncaught error: {error}"
-    error: Exception
+    error: BaseException
 
 
 @dataclass

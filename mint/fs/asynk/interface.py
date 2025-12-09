@@ -1,6 +1,6 @@
 from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Any, Protocol
 
 from mint.fs.structs import (
     CopyResult,
@@ -24,7 +24,11 @@ class IFileStorage[T](Protocol):
     def client(self) -> T: ...
     async def is_folder(self, path: str) -> bool: ...
     async def get(self, path: str, save_to: str) -> None: ...
-    async def save(self, path: str, ref: str | Path | IO | bytes) -> str: ...
+    async def save(
+        self,
+        path: str,
+        ref: str | Path | IO[Any] | bytes,
+    ) -> str: ...
     async def copy(
         self,
         src: str,

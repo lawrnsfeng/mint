@@ -9,6 +9,7 @@ from functools import wraps
 from io import BytesIO
 from pathlib import Path
 from typing import (
+    IO,
     TYPE_CHECKING,
     Any,
     Concatenate,
@@ -432,7 +433,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     async def save(
         self,
         path: str,
-        ref: str | Path | BytesIO | bytes,
+        ref: str | Path | IO[Any] | bytes,
         *,
         overwrite: bool = True,
     ) -> str:
@@ -471,7 +472,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                         overwrite=overwrite,
                     )
             case _:
-                raise InvalidArgumentsError(name=ref, value=str(type(ref)))
+                raise InvalidArgumentsError(detail="{ref = str(type(ref))}")
         return path
 
     @_auto_catch_native_exc
@@ -957,7 +958,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             )
         else:
             account_key = self.client.credential.account_key
-        blob_name = blob.blob_name  # type: ignore[attr-defined]
+        blob_name = blob.blob_name
         sas_token = generate_blob_sas(
             account_name=self.storage_account_name,
             container_name=self.container_name,

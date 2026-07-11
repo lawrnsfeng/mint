@@ -161,3 +161,109 @@ async def test_limiter_decorator_releases_on_exception() -> None:
 
     result = await service.success_method()
     assert result == "success"
+
+
+@pytest.mark.asyncio
+async def test_limiter_reentrancy_correctness() -> None:
+    """Test that the semaphore stays held until the outermost context exits."""
+    limiter = ConcurrencyLimiter(max_concurrent=1)
+    critical_section_active = False
+
+    async def inner() -> None:
+        async with limiter:
+            pass
+
+    async def outer() -> None:
+        nonlocal critical_section_active
+        async with limiter:
+            critical_section_active = True
+            await inner()
+            await asyncio.sleep(0.05)
+            critical_section_active = False
+
+    async def intruder() -> None:
+        await asyncio.sleep(0.01)
+        async with limiter:
+            assert not critical_section_active, (
+                "Intruder acquired lock while outer was still active"
+            )
+
+    await asyncio.gather(outer(), intruder())
+
+
+@pytest.mark.asyncio
+async def test_limiter_deep_nesting_releases_only_at_outermost() -> None:
+    """Test that 3 levels of nesting release only when the outermost exits."""
+    limiter = ConcurrencyLimiter(max_concurrent=1)
+    outermost_active = False
+
+    async def level_three() -> None:
+        async with limiter:
+            pass
+
+    async def level_two() -> None:
+        async with limiter:
+            await level_three()
+
+    async def level_one() -> None:
+        nonlocal outermost_active
+        async with limiter:
+            outermost_active = True
+            await level_two()
+            await asyncio.sleep(0.05)
+            outermost_active = False
+
+    async def prober() -> None:
+        await asyncio.sleep(0.01)
+        async with limiter:
+            assert not outermost_active, "Prober acquired lock before outermost level released it"
+
+    await asyncio.gather(level_one(), prober())
+
+
+@pytest.mark.asyncio
+async def test_limiter_nested_context_releases_on_inner_exception() -> None:
+    """Test that a failing nested block still frees the limiter for later use."""
+    limiter = ConcurrencyLimiter(max_concurrent=1)
+
+    async def inner_failing() -> None:
+        async with limiter:
+            raise ValueError("inner failure")
+
+    async def outer() -> None:
+        async with limiter:
+            await inner_failing()
+
+    with pytest.raises(ValueError, match="inner failure"):
+        await outer()
+
+    async with limiter:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_limiter_decorator_and_context_manager_share_depth() -> None:
+    """Test that the decorator and bare context manager share one depth counter."""
+    limiter = ConcurrencyLimiter(max_concurrent=1)
+    critical_section_active = False
+
+    class Service:
+        @limiter.limit
+        async def outer(self) -> None:
+            nonlocal critical_section_active
+            critical_section_active = True
+            async with limiter:
+                pass
+            await asyncio.sleep(0.05)
+            critical_section_active = False
+
+    service = Service()
+
+    async def intruder() -> None:
+        await asyncio.sleep(0.01)
+        async with limiter:
+            assert not critical_section_active, (
+                "Intruder acquired lock while decorated outer call was still active"
+            )
+
+    await asyncio.gather(service.outer(), intruder())

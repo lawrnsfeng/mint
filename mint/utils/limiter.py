@@ -5,7 +5,7 @@ from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from functools import wraps
 from types import TracebackType
-from typing import Any, Concatenate, Final
+from typing import Any, Concatenate, Final, Self
 
 
 class ConcurrencyLimiter:
@@ -45,9 +45,9 @@ class ConcurrencyLimiter:
         """
         self._max_concurrent = max_concurrent or self.DEFAULT_MAX_CONCURRENT
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
-        self._acquired_ctx: ContextVar[bool] = ContextVar(
-            f"_limiter_acquired_{id(self)}",
-            default=False,
+        self._acquired_ctx: ContextVar[int] = ContextVar(
+            f"_limiter_depth_{id(self)}",
+            default=0,
         )
 
     @property
@@ -55,11 +55,12 @@ class ConcurrencyLimiter:
         """Get the maximum concurrent operations allowed."""
         return self._max_concurrent
 
-    async def __aenter__(self) -> "ConcurrencyLimiter":
+    async def __aenter__(self) -> Self:
         """Acquire the semaphore on context entry."""
-        if not self._acquired_ctx.get():
+        depth = self._acquired_ctx.get()
+        if depth == 0:
             await self._semaphore.acquire()
-            self._acquired_ctx.set(True)
+        self._acquired_ctx.set(depth + 1)
         return self
 
     async def __aexit__(
@@ -69,9 +70,10 @@ class ConcurrencyLimiter:
         exc_tb: TracebackType | None,
     ) -> None:
         """Release the semaphore on context exit."""
-        if self._acquired_ctx.get():
+        depth = self._acquired_ctx.get()
+        self._acquired_ctx.set(depth - 1)
+        if depth - 1 == 0:
             self._semaphore.release()
-            self._acquired_ctx.set(False)
 
     def limit[S, **P, R](
         self,
@@ -98,11 +100,11 @@ class ConcurrencyLimiter:
             *args: P.args,
             **kwargs: P.kwargs,
         ) -> R:
-            if self._acquired_ctx.get():
+            if self._acquired_ctx.get() > 0:
                 return await func(self_inner, *args, **kwargs)
 
             await self._semaphore.acquire()
-            token = self._acquired_ctx.set(True)
+            token = self._acquired_ctx.set(1)
             try:
                 return await func(self_inner, *args, **kwargs)
             finally:

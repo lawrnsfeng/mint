@@ -84,8 +84,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     )
     DefaultPresignedURLExpirationInSeconds: Final[int] = 60 * 60
     TmplBlobSAS: Final[str] = (
-        "https://{account_name}.blob.core.windows.net"
-        "/{container_name}/{blob_name}?{sas_token}"
+        "https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
     )
     TmplAccountURL: Final[str] = (
         "https://{self.storage_account_name}.blob.core.windows.net"
@@ -839,7 +838,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         """
         blob_props_list: AsyncItemPaged[BlobProperties] = (
-            self.container.list_blobs(name_starts_with=path)
+            self.container.list_blobs(
+                name_starts_with=path,
+            )
         )
         results: list[str] = []
         async for blob_props in blob_props_list:
@@ -888,7 +889,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         """
         blob_props_list: AsyncItemPaged[BlobProperties] = (
-            self.container.list_blobs(name_starts_with=path)
+            self.container.list_blobs(
+                name_starts_with=path,
+            )
         )
 
         objs: list[ListItem] = []

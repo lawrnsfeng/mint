@@ -2,6 +2,7 @@
 
 import os
 from collections.abc import AsyncGenerator, Generator
+from dataclasses import dataclass
 from typing import Final, Self
 
 import pytest
@@ -12,6 +13,35 @@ from testcontainers.core.wait_strategies import PortWaitStrategy
 from mint.fs.asynk.abs import AzureBlobStorage
 
 
+@dataclass(frozen=True, slots=True)
+class AzuritePorts:
+    """Azurite service port mapping."""
+
+    blob: int = 10000
+    queue: int = 10001
+    table: int = 10002
+
+
+@dataclass(frozen=True, slots=True)
+class AzuriteAccount:
+    """Azurite storage account credentials."""
+
+    name: str = "devstoreaccount1"
+    key: str = (
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu"
+        "Fq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+    )
+
+    @classmethod
+    def from_env(cls) -> Self:
+        """Build account credentials from environment overrides."""
+        default = cls()
+        return cls(
+            name=os.environ.get("AZURITE_ACCOUNT_NAME", default.name),
+            key=os.environ.get("AZURITE_ACCOUNT_KEY", default.key),
+        )
+
+
 class AzuriteContainer(DockerContainer):
     """Custom Azurite container using new wait strategy API.
 
@@ -20,66 +50,52 @@ class AzuriteContainer(DockerContainer):
 
     """
 
-    AZURITE_ACCOUNT_NAME: Final[str] = "devstoreaccount1"
-    AZURITE_ACCOUNT_KEY: Final[str] = (
-        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu"
-        "Fq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-    )
     TEST_CONTAINER_NAME: Final[str] = "test-container"
-    AZURITE_BLOB_PORT: Final[int] = 10000
-    AZURITE_QUEUE_PORT: Final[int] = 10001
-    AZURITE_TABLE_PORT: Final[int] = 10002
+    DEFAULT_PORTS: Final[AzuritePorts] = AzuritePorts()
+    DEFAULT_ACCOUNT: Final[AzuriteAccount] = AzuriteAccount()
+    AZURITE_ACCOUNT_NAME: Final[str] = DEFAULT_ACCOUNT.name
+    AZURITE_ACCOUNT_KEY: Final[str] = DEFAULT_ACCOUNT.key
+    AZURITE_BLOB_PORT: Final[int] = DEFAULT_PORTS.blob
+    AZURITE_QUEUE_PORT: Final[int] = DEFAULT_PORTS.queue
+    AZURITE_TABLE_PORT: Final[int] = DEFAULT_PORTS.table
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
         image: str = "mcr.microsoft.com/azure-storage/azurite:latest",
         *,
-        blob_service_port: int = AZURITE_BLOB_PORT,
-        queue_service_port: int = AZURITE_QUEUE_PORT,
-        table_service_port: int = AZURITE_TABLE_PORT,
-        account_name: str | None = None,
-        account_key: str | None = None,
+        ports: AzuritePorts | None = None,
+        account: AzuriteAccount | None = None,
     ) -> None:
         """Initialize AzuriteContainer with structured wait strategy."""
         super().__init__(image=image)
-        self.account_name = account_name or os.environ.get(
-            "AZURITE_ACCOUNT_NAME",
-            self.AZURITE_ACCOUNT_NAME,
-        )
-        self.account_key = account_key or os.environ.get(
-            "AZURITE_ACCOUNT_KEY",
-            "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu"
-            "Fq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
-        )
-        self.blob_service_port = blob_service_port
-        self.queue_service_port = queue_service_port
-        self.table_service_port = table_service_port
+        self.service_ports = ports or self.DEFAULT_PORTS
+        self.account = account or AzuriteAccount.from_env()
 
         self.with_exposed_ports(
-            blob_service_port,
-            queue_service_port,
-            table_service_port,
+            self.service_ports.blob,
+            self.service_ports.queue,
+            self.service_ports.table,
         )
         self.with_env(
             "AZURITE_ACCOUNTS",
-            f"{self.account_name}:{self.account_key}",
+            f"{self.account.name}:{self.account.key}",
         )
-        self.waiting_for(PortWaitStrategy(blob_service_port))
+        self.waiting_for(PortWaitStrategy(self.service_ports.blob))
 
     def get_connection_string(self) -> str:
         """Generate connection string for local host access."""
         host_ip = self.get_container_host_ip()
-        blob_port = self.get_exposed_port(self.blob_service_port)
-        queue_port = self.get_exposed_port(self.queue_service_port)
-        table_port = self.get_exposed_port(self.table_service_port)
+        blob_port = self.get_exposed_port(self.service_ports.blob)
+        queue_port = self.get_exposed_port(self.service_ports.queue)
+        table_port = self.get_exposed_port(self.service_ports.table)
 
         return (
             f"DefaultEndpointsProtocol=http;"
-            f"AccountName={self.account_name};"
-            f"AccountKey={self.account_key};"
-            f"BlobEndpoint=http://{host_ip}:{blob_port}/{self.account_name};"
-            f"QueueEndpoint=http://{host_ip}:{queue_port}/{self.account_name};"
-            f"TableEndpoint=http://{host_ip}:{table_port}/{self.account_name};"
+            f"AccountName={self.account.name};"
+            f"AccountKey={self.account.key};"
+            f"BlobEndpoint=http://{host_ip}:{blob_port}/{self.account.name};"
+            f"QueueEndpoint=http://{host_ip}:{queue_port}/{self.account.name};"
+            f"TableEndpoint=http://{host_ip}:{table_port}/{self.account.name};"
         )
 
     def start(self) -> Self:
@@ -132,8 +148,9 @@ def azurite_blob_endpoint(azurite_container: AzuriteContainer) -> str:
 
     """
     host = azurite_container.get_container_host_ip()
-    port = azurite_container.get_exposed_port(10000)
-    return f"http://{host}:{port}/{AzuriteContainer.AZURITE_ACCOUNT_NAME}"
+    blob_port = azurite_container.service_ports.blob
+    port = azurite_container.get_exposed_port(blob_port)
+    return f"http://{host}:{port}/{azurite_container.account.name}"
 
 
 @pytest.fixture

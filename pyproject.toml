@@ -9,12 +9,17 @@ dependencies = [
     "aiohttp>=3.13.2",
     "pydantic>=2.12.5",
     "structlog>=25.5.0",
+    "tenacity>=9.0.0",
 ]
 
 [dependency-groups]
 azure = [
     "azure-identity>=1.25.1",
     "azure-storage-blob~=12.27.1",
+]
+s3 = [
+    "aiobotocore>=2.15.2",
+    "types-aiobotocore[s3]>=2.15.2",
 ]
 dev = [
     "mypy>=1.19.0",
@@ -29,6 +34,7 @@ test = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "testcontainers[azurite]>=4.0.0",
+    "testcontainers[localstack]>=4.0.0",
 ]
 
 [build-system]

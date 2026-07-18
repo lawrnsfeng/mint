@@ -216,7 +216,9 @@ async def test_limiter_deep_nesting_releases_only_at_outermost() -> None:
     async def prober() -> None:
         await asyncio.sleep(0.01)
         async with limiter:
-            assert not outermost_active, "Prober acquired lock before outermost level released it"
+            assert not outermost_active, (
+                "Prober acquired lock before outermost level released it"
+            )
 
     await asyncio.gather(level_one(), prober())
 

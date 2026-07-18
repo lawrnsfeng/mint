@@ -22,6 +22,8 @@ repos:
           - yaml
         args:
           - --strict
+          - -d
+          - '{extends: default, rules: {truthy: {check-keys: false}}}'
   - repo: https://github.com/lyz-code/yamlfix.git
     rev: 1.19.0
     hooks:
@@ -58,6 +60,14 @@ repos:
       - id: ty
         name: ty
         entry: uv run ty check
+        language: system
+        types:
+          - python
+        pass_filenames: false
+        always_run: true
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
         language: system
         types:
           - python

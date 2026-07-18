@@ -26,6 +26,27 @@ class Stack[T]:
     def push(self, item: T) -> None: ...
 ```
 
+### Type parameter naming
+
+Generic type parameters are named `T`, or `SomethingT` when a descriptive name adds
+clarity (e.g. multiple type parameters that would otherwise collide, or a name that
+disambiguates intent like `KeyT`/`ValueT`). Never use a bare descriptive noun like
+`Item` or `Value` as a type parameter name.
+
+- Single type parameter → always `T`.
+- Multiple type parameters → suffix each with `T`: `KeyT`, `ValueT`, `ResultT`.
+
+```python
+# Wrong
+class Fetcher[Item](Protocol): ...
+
+# Correct — single param
+class Fetcher[T](Protocol): ...
+
+# Correct — multiple params
+class Cache[KeyT, ValueT]: ...
+```
+
 Use `TypeVar` only when a third-party API requires it.
 
 Never add `from __future__ import annotations`. Resolve forward references with
@@ -105,6 +126,13 @@ def run(*, verbose: bool) -> None: ...
 ## Naming
 
 Intermediate dict variable: `mp_<keytype>_<valuetype>` (e.g. `mp_str_int`).
+
+### Module names
+
+Never name a module after a stdlib module (`types.py`, `io.py`, `email.py`, ...) —
+it shadows the stdlib name for every absolute import inside the package and forces
+awkward relative-import gymnastics. Pick a distinguishing name instead
+(`typedefs.py`, not `types.py`).
 
 ## Immutability
 

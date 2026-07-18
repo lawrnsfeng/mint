@@ -28,6 +28,48 @@ class Expense:
     def process(self, owner_id: str) -> None: ...
 ```
 
+### Dangling modules
+
+If *every* function in a module takes the same owned class as its first param
+(a `_serialize_x`/`build_x`-style module), the module itself is the code smell.
+Fold each function into that class as a method and **delete the module** — don't
+leave a thin re-export shim behind.
+
+```python
+# WRONG — serialize.py exists only to hold functions keyed on Order
+def serialize_order(order: Order) -> dict[str, object]: ...
+def serialize_line_item(item: LineItem) -> dict[str, object]: ...
+
+# CORRECT — folded into the owning classes, serialize.py deleted
+class Order:
+    @property
+    def as_dict(self) -> dict[str, object]: ...
+
+class LineItem:
+    @property
+    def as_dict(self) -> dict[str, object]: ...
+```
+
+### Zero-arg derivations → `@property`
+
+A Case A method that takes only `self`, does no I/O, and returns a value computed
+purely from the instance's own state must be a `@property`, not a plain method.
+
+```python
+# WRONG
+class TreeNode:
+    def as_dict(self) -> dict[str, object]: ...
+
+node.as_dict()
+
+# CORRECT
+class TreeNode:
+    @property
+    def as_dict(self) -> dict[str, object]: ...
+
+node.as_dict
+```
+
 ## Case B → method on a service class
 
 The function needs a repository, external client, event publisher, or coordinates

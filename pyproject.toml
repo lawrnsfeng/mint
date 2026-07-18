@@ -8,9 +8,12 @@ dependencies = [
     "aiofiles>=25.1.0",
     "aiohttp>=3.13.2",
     "pydantic>=2.12.5",
+    "sprout",
     "structlog>=25.5.0",
-    "tenacity>=9.0.0",
 ]
+
+[tool.uv.sources]
+sprout = { git = "ssh://git@github.com/lawrnsfeng/sprout.git" }
 
 [dependency-groups]
 azure = [

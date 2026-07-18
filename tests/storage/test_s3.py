@@ -3,7 +3,7 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pytest
 
@@ -377,8 +377,9 @@ class TestSave:
             s3_storage: S3Storage fixture.
 
         """
+        bad_ref: Any = 12345
         with pytest.raises((InvalidArgumentsError, OperationalError)):
-            await s3_storage.save("bad.txt", 12345)  # type: ignore[arg-type]
+            await s3_storage.save("bad.txt", bad_ref)
 
 
 # ---------------------------------------------------------------------------
@@ -1291,8 +1292,8 @@ class TestGetFileobj:
 
         """
         content = b"fileobj content"
-        await s3_storage.save("fo.txt", content)
-        async with s3_storage.get_fileobj("fo.txt") as f:
+        await s3_storage.save("fileobj.txt", content)
+        async with s3_storage.get_fileobj("fileobj.txt") as f:
             assert f.read() == content
 
     async def test_get_fileobj_raises_not_found(

@@ -15,14 +15,14 @@ from typing import (
     Concatenate,
     Final,
     Self,
+    cast,
 )
 from urllib.parse import quote
 
 import aiofiles
 from botocore.exceptions import ClientError
+from sprout import ChildRef, Executor, FetchResult
 
-from mint.asynctree.executor import AsyncTreeExecutor
-from mint.asynctree.models import ChildRef, FetchResult
 from mint.fs.exc import (
     FileAlreadyExistsError,
     FileStorageError,
@@ -47,10 +47,9 @@ from .interface import IFileStorage
 from .s3_structs import S3CredentialMode, S3SessionParams
 
 if TYPE_CHECKING:
-    from aiobotocore.client import (
-        ClientCreatorContext,  # type: ignore[attr-defined]
-    )
+    from aiobotocore.session import ClientCreatorContext
     from types_aiobotocore_s3.client import S3Client
+    from types_aiobotocore_s3.literals import BucketLocationConstraintType
 
 logger = get_logger(__name__)
 type Coro[T] = Coroutine[Any, Any, T]
@@ -485,11 +484,11 @@ class S3Storage(IFileStorage["S3Client"]):
                     raise
 
         match ref:
-            case BytesIO():
+            case BytesIO() as buf:
                 await self.client.put_object(
                     Bucket=self.bucket_name,
                     Key=path,
-                    Body=ref.read() if ref.tell() == 0 else ref.getvalue(),
+                    Body=buf.read() if buf.tell() == 0 else buf.getvalue(),
                 )
             case bytes():
                 await self.client.put_object(
@@ -765,9 +764,9 @@ class S3Storage(IFileStorage["S3Client"]):
         return deleted, errors
 
     async def _remove_folder_tree(self, folder: str) -> RemoveResult:
-        """Remove a folder and all its children using AsyncTreeExecutor.
+        """Remove a folder and all its children using sprout's Executor.
 
-        Uses AsyncTreeExecutor to safely traverse nested folder structure
+        Uses Executor to safely traverse nested folder structure
         without async recursion. Files at each node are deleted in bulk via
         delete_objects; subfolders become child refs for deeper traversal.
 
@@ -781,12 +780,11 @@ class S3Storage(IFileStorage["S3Client"]):
         prefix = f"{folder.rstrip('/')}/"
         deleted: list[str] = []
         errors: list[str] = []
-        storage = self
 
         async def fetcher(ref: ChildRef, _depth: int) -> FetchResult[str]:
             current_prefix = ref.id
-            response = await storage.client.list_objects_v2(
-                Bucket=storage.bucket_name,
+            response = await self.client.list_objects_v2(
+                Bucket=self.bucket_name,
                 Prefix=current_prefix,
                 Delimiter="/",
             )
@@ -799,7 +797,7 @@ class S3Storage(IFileStorage["S3Client"]):
                 cp["Prefix"] for cp in (response.get("CommonPrefixes") or [])
             ]
             if file_keys:
-                del_keys, del_errors = await storage._delete_objects_batch(  # noqa: SLF001
+                del_keys, del_errors = await self._delete_objects_batch(
                     file_keys,
                 )
                 deleted.extend(del_keys)
@@ -809,7 +807,7 @@ class S3Storage(IFileStorage["S3Client"]):
                 child_refs=[ChildRef(id=p) for p in subfolder_prefixes],
             )
 
-        executor: AsyncTreeExecutor[str] = AsyncTreeExecutor(fetcher)
+        executor: Executor[str] = Executor(fetcher)
         await executor.expand_unbounded(ChildRef(id=prefix))
         return RemoveResult(success=deleted, failure=errors)
 
@@ -898,7 +896,7 @@ class S3Storage(IFileStorage["S3Client"]):
         show_stats: bool = False,
         show_info: bool = False,
         recursive: bool = False,
-    ) -> Collection[ListItem]:
+    ) -> Sequence[ListItem]:
         """List objects with detailed information.
 
         Note:
@@ -914,7 +912,7 @@ class S3Storage(IFileStorage["S3Client"]):
             recursive: Whether to list recursively into sub-prefixes.
 
         Returns:
-            Collection of ListItem objects with requested detail level.
+            Sequence of ListItem objects with requested detail level.
 
         """
         objs: list[ListItem] = []
@@ -1091,7 +1089,10 @@ class S3Storage(IFileStorage["S3Client"]):
                 await self.client.create_bucket(
                     Bucket=self.bucket_name,
                     CreateBucketConfiguration={
-                        "LocationConstraint": self.region_name,
+                        "LocationConstraint": cast(
+                            "BucketLocationConstraintType",
+                            self.region_name,
+                        ),
                     },
                 )
             else:

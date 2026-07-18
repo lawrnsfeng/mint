@@ -24,7 +24,7 @@ from azure.core.exceptions import (
     ResourceNotFoundError,
     ServiceRequestError,
 )
-from azure.identity import ClientSecretCredential, DefaultAzureCredential
+from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.storage.blob import (
     BlobSasPermissions,
     generate_blob_sas,
@@ -320,7 +320,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             case AzureCredentialMode.ClientSecret:
                 return BlobServiceClient(
                     self.account_url,
-                    credential=ClientSecretCredential(  # type: ignore[arg-type]
+                    credential=ClientSecretCredential(
                         cast("str", self.tenant_id),
                         cast("str", self.client_id),
                         cast("str", self.client_secret),
@@ -344,7 +344,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             case AzureCredentialMode.Default:
                 return BlobServiceClient(
                     self.account_url,
-                    credential=DefaultAzureCredential(),  # type: ignore[arg-type]
+                    credential=DefaultAzureCredential(),
                 )
             case _:
                 raise InvalidArgumentsError(detail=f"mode = {self.mode}")
@@ -861,7 +861,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         show_stats: bool = False,
         show_info: bool = False,
         recursive: bool = False,
-    ) -> Collection[ListItem]:
+    ) -> Sequence[ListItem]:
         """List blobs with detailed information.
 
         The path is used as a prefix filter. Typically use trailing '/'
@@ -885,7 +885,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             recursive: Whether to list recursively into subfolders.
 
         Returns:
-            Collection of ListItem objects with blob details.
+            Sequence of ListItem objects with blob details.
 
         """
         blob_props_list: AsyncItemPaged[BlobProperties] = (

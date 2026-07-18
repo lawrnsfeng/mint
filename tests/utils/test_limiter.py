@@ -225,7 +225,7 @@ async def test_limiter_deep_nesting_releases_only_at_outermost() -> None:
 
 @pytest.mark.asyncio
 async def test_limiter_nested_context_releases_on_inner_exception() -> None:
-    """Test that a failing nested block still frees the limiter for later use."""
+    """A failing nested block still frees the limiter for later use."""
     limiter = ConcurrencyLimiter(max_concurrent=1)
 
     async def inner_failing() -> None:
@@ -245,7 +245,7 @@ async def test_limiter_nested_context_releases_on_inner_exception() -> None:
 
 @pytest.mark.asyncio
 async def test_limiter_decorator_and_context_manager_share_depth() -> None:
-    """Test that the decorator and bare context manager share one depth counter."""
+    """The decorator and bare context manager share one depth counter."""
     limiter = ConcurrencyLimiter(max_concurrent=1)
     critical_section_active = False
 
@@ -265,7 +265,8 @@ async def test_limiter_decorator_and_context_manager_share_depth() -> None:
         await asyncio.sleep(0.01)
         async with limiter:
             assert not critical_section_active, (
-                "Intruder acquired lock while decorated outer call was still active"
+                "Intruder acquired lock while decorated outer call "
+                "was still active"
             )
 
     await asyncio.gather(service.outer(), intruder())

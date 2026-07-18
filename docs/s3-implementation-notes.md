@@ -9,11 +9,11 @@
 | `get` | `download_blob()` + `aiofiles` | `get_object()["Body"]` + `aiofiles` | Equivalent | None |
 | `save` | `upload_blob(overwrite=)` | `put_object()` always overwrites; `head_object` check for `overwrite=False` | Equivalent | Extra round-trip for `overwrite=False` |
 | `copy` (single) | `start_copy_from_url()` | `copy_object()` | **Behavioral gap** | S3 `copy_object` limited to **5 GB**. Objects >5 GB require multipart copy. Current impl raises error for >5 GB. |
-| `copy` (folder) | Concurrent `start_copy_from_url` via `asyncio.gather` | `AsyncTreeExecutor` traverses prefix, copies each file | Equivalent | See recursive analysis below |
+| `copy` (folder) | Concurrent `start_copy_from_url` via `asyncio.gather` | `sprout.Executor` traverses prefix, copies each file | Equivalent | See recursive analysis below |
 | `move` | `copy` then `remove` | `copy` then `remove` | Equivalent | Inherits copy 5 GB limit |
 | `remove` (single) | `delete_blob()` | `delete_object()` | Equivalent | None |
 | `remove` (folder) | `list` then `remove_many` | `list` then `remove_many` | Equivalent | None |
-| `remove_many` | Individual deletes via `_remove_many_files` in Batch | S3 `delete_objects` (max 1000/call) batched, `AsyncTreeExecutor` for recursive folders | More efficient | S3 bulk delete is atomic per object |
+| `remove_many` | Individual deletes via `_remove_many_files` in Batch | S3 `delete_objects` (max 1000/call) batched, `sprout.Executor` for recursive folders | More efficient | S3 bulk delete is atomic per object |
 | `stat` | `get_blob_properties()` | `head_object()` with ClientError 404 detection | Equivalent | Different exception type (ClientError vs ResourceNotFoundError) |
 | `list` | `list_blobs(name_starts_with)` auto-paginating `AsyncItemPaged` | `list_objects_v2` with manual `while` loop on `ContinuationToken` | Equivalent | ABS auto-paginates; S3 must paginate manually (max 1000 keys/call) |
 | `list_detailed` | Blob properties returned inline from list call; `show_stats` adds `blob_type` + `metadata` | `list_objects_v2` returns keys + basic info; `show_stats` requires extra `head_object` per object | **Performance gap** | `show_stats=True` on 1000 objects = 1000 extra `head_object` calls |
@@ -68,11 +68,11 @@ while True:
 
 No recursion. No stack growth. Used for `list` and `list_detailed`.
 
-### Remedy 2: AsyncTreeExecutor (for recursive folder traversal)
+### Remedy 2: sprout.Executor (for recursive folder traversal)
 
 `remove_many(recursive=True)` and `copy(folder/, recursive=True)` are genuine tree traversal
 problems: each folder may have subfolders discovered only at runtime. This maps directly to
-the `AsyncTreeExecutor` pattern from `mint.asynctree`.
+the `Executor` pattern from the [`sprout`](https://github.com/lawrnsfeng/sprout) package.
 
 Advantages over recursive async calls:
 - **Bounded concurrency**: `ConcurrencyGate` with semaphore + rate limiting
@@ -82,7 +82,7 @@ Advantages over recursive async calls:
 - **Deduplication**: cycle detection prevents infinite loops on symlink-like structures
 - **Non-recursive**: uses `asyncio.wait(FIRST_COMPLETED)` event loop, O(1) stack depth
 
-#### AsyncTreeExecutor usage in S3Storage
+#### sprout.Executor usage in S3Storage
 
 For `remove(folder/, recursive=True)` and `remove_many(paths, recursive=True)`:
 - Root ref = folder path

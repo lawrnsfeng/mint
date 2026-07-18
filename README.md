@@ -10,8 +10,9 @@ protocol, plus the concurrency and execution primitives they're built on.
   two implementations:
   - `mint.fs.asynk.abs.AzureBlobStorage` — Azure Blob Storage
   - `mint.fs.asynk.s3.S3Storage` — S3-compatible (AWS S3, LocalStack, MinIO)
-- **`mint.asynctree`** — bounded, retrying async tree executor used internally
-  for folder traversal/copy/remove without unbounded fan-out.
+- **[`sprout`](https://github.com/lawrnsfeng/sprout)** — bounded, retrying async
+  tree executor (external dependency) used internally for folder
+  traversal/copy/remove without unbounded fan-out.
 - **`mint.utils`** — `ConcurrencyLimiter` (reentrant async semaphore wrapper),
   `Batch`, and `run_bounded` (bounded concurrent fan-out with retry and
   structured per-item failures).

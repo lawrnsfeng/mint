@@ -86,7 +86,7 @@ Use `ContextVar` for per-coroutine client isolation. Support optional
 ### FR-05: No Async Recursion
 Pagination (`list`, `list_detailed`) uses iterative `while` loops with
 `ContinuationToken`. Recursive folder traversal (`remove`, `copy`) uses
-`AsyncTreeExecutor` from `mint.asynctree`.
+`Executor` from the `sprout` package.
 
 ### FR-06: Error Mapping
 Map S3 `ClientError` 404 codes to `ObjectNotFoundError`. Map `ValueError`
@@ -104,16 +104,12 @@ Single-object copy raises `InvalidArgumentsError` for objects exceeding
 `save(..., overwrite=False)` raises `FileAlreadyExistsError` if the object
 already exists. Default behavior (`overwrite=True`) always writes.
 
-### FR-10: Standalone asynctree Package
-`mint.asynctree` is a standalone package with zero imports from other `mint`
-modules, ready for extraction as a separate library.
-
 ---
 
 ## Success Criteria
 
 - All `IFileStorage` Protocol methods pass static type checking with `ty`.
-- 100% test coverage on `mint/fs/asynk/s3.py` and `mint/asynctree/`.
+- 100% test coverage on `mint/fs/asynk/s3.py`.
 - Integration tests use a real LocalStack container (no mocks).
 - 300 concurrent operations complete without error in under 30 seconds.
 - Tests with `max_concurrent_clients=5` complete all operations.
@@ -128,7 +124,7 @@ modules, ready for extraction as a separate library.
 | `S3Storage` | Main async S3 storage class implementing `IFileStorage[S3Client]` |
 | `S3CredentialMode` | Enum for credential resolution strategy |
 | `S3SessionParams` | TypedDict for aiobotocore session parameters |
-| `AsyncTreeExecutor` | Async tree traversal engine for recursive folder operations |
+| `Executor` | Async tree traversal engine from `sprout`, used for recursive folder operations |
 | `LocalStackContainer` | Testcontainer providing S3-compatible backend for tests |
 
 ---
@@ -143,12 +139,11 @@ modules, ready for extraction as a separate library.
   is out of scope for this feature.
 - `aiobotocore>=2.15.2` and `types-aiobotocore[s3]>=2.15.2` are added as
   optional dependency group `s3` in `pyproject.toml`.
-- `tenacity>=9.0.0` is added to main dependencies for asynctree retry.
 
 ---
 
 ## Dependencies & Notes
 
-- Depends on: `mint.asynctree` (this feature also introduces it)
+- Depends on: `sprout` (external git dependency providing `Executor`)
 - Related: `mint/fs/asynk/abs.py` (ABS implementation, structural reference)
 - Documentation: `docs/s3-implementation-notes.md` (implementation decisions)

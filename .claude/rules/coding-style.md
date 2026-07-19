@@ -147,6 +147,38 @@ Limit global state. Pass dependencies explicitly.
 All code must pass `uv run ruff check` and `uv run ruff format --check` and
 `uv run ty check` before a change is considered done.
 
+## Type narrowing over hasattr/getattr
+
+Prefer `isinstance()`/`issubclass()` to narrow a type over `hasattr()` or
+`getattr(obj, name, default)`. `hasattr`/`getattr` with a default silently
+accept any object shape, including the wrong one, and give the type
+checker nothing to narrow on — the following line still sees the original
+(possibly `Any`) type. `isinstance`/`issubclass` against a real type (a
+concrete class, or a `Protocol`) narrow the checked variable's static type
+for the rest of the block, so the type checker catches a shape mismatch
+that `hasattr`/`getattr` would let through silently.
+
+```python
+# Wrong
+if hasattr(schema, "is_deleted"):
+    ...
+owner = getattr(self, "owner", None)
+
+# Correct
+if issubclass(schema, IsDeletedMixin):
+    ...
+if isinstance(self, IScopedRepository):
+    owner = self.owner
+```
+
+One caveat: `issubclass()` raises `TypeError` on a `Protocol` that has any
+non-method (data) member — only a `Protocol` with exclusively method
+members supports `issubclass()`. For a class-level check against a
+data-bearing shape, check against a concrete class instead (as with
+`IsDeletedMixin` above), not a data `Protocol`. `isinstance()` has no such
+restriction and works on any `@runtime_checkable` `Protocol`, data members
+included — prefer it for instance-level structural checks.
+
 ## No suppression comments
 
 Fix the underlying issue — don't silence the linter/type-checker with

@@ -16,10 +16,20 @@ protocol, plus the concurrency and execution primitives they're built on.
 - **`mint.utils`** — `ConcurrencyLimiter` (reentrant async semaphore wrapper),
   `Batch`, and `run_bounded` (bounded concurrent fan-out with retry and
   structured per-item failures).
+- **`mint.db`** — generic SQLModel-based repository layer for Postgres, async
+  (`mint.db.asynk`) and sync (`mint.db.sync`): `RepositoryBase[T]`/
+  `EntityRepository[T, I]` for zero-boilerplate CRUD on a new table,
+  `SoftDeleteMixin`/`ResourceOwnerMixin` for soft-delete and per-owner
+  scoping (enforced automatically, including on hand-written custom
+  queries — not opt-in), `UnitOfWork` for multi-repository atomic
+  transactions, and `MaterializedViewRepository` for read-only
+  materialized-view-backed tables.
 
 See `docs/s3-implementation-notes.md` for a method-by-method comparison
-between the Azure and S3 backends (including known behavioral gaps), and
-`specs/001-s3-storage/spec.md` for the S3 backend's feature spec.
+between the Azure and S3 backends (including known behavioral gaps),
+`docs/db-repository-implementation-notes.md` for `mint.db`'s design
+decisions and confirmed SQLModel gotchas, and `specs/001-s3-storage/spec.md`
+/ `specs/002-db-repository-layer/spec.md` for their feature specs.
 
 ## Install
 
@@ -27,11 +37,13 @@ between the Azure and S3 backends (including known behavioral gaps), and
 uv sync --all-extras --all-groups --all-packages -U   # or: make sync
 ```
 
-Storage backends are optional dependency groups — pull in only what you need:
+Storage backends and the DB layer are optional dependency groups — pull in
+only what you need:
 
 ```bash
-uv sync --extra azure   # AzureBlobStorage
-uv sync --extra s3      # S3Storage
+uv sync --group azure   # AzureBlobStorage
+uv sync --group s3      # S3Storage
+uv sync --group db      # mint.db (SQLModel + asyncpg + psycopg2)
 ```
 
 ## Usage
@@ -68,10 +80,34 @@ await storage.copy("path/", "backup/", recursive=True)
 Both classes accept a `max_concurrent_clients` keyword to cap concurrent
 underlying client operations via `ConcurrencyLimiter`.
 
+```python
+from uuid import UUID
+from sqlmodel import SQLModel
+from mint.db.models import BaseWithUUID
+from mint.db.asynk import Database, EntityRepository
+
+class Job(BaseWithUUID, table=True):
+    name: str
+
+class JobCreate(SQLModel):
+    name: str
+
+class JobRepository(EntityRepository[Job, UUID]):
+    Schema = Job
+
+db = Database("postgresql+asyncpg://user:pass@localhost/mydb")
+repo = JobRepository(db)
+job = await repo.create(JobCreate(name="x"))
+await repo.get(job.id)
+```
+
+See `docs/db-repository-implementation-notes.md` for owner-scoped tables,
+`UnitOfWork`, and materialized views.
+
 ## Development
 
 ```bash
-uv run pytest                # needs Docker: spins up Azurite + LocalStack
+uv run pytest                # needs Docker: spins up Azurite + LocalStack + Postgres
 uv run pytest --cov          # with coverage
 uv run ruff check
 uv run ruff format --check

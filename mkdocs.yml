@@ -1,0 +1,49 @@
+---
+site_name: mint
+site_description: File storage, concurrency, and a Postgres repository layer
+site_url: https://lawrnsfeng.github.io/mint/
+repo_url: https://github.com/lawrnsfeng/mint
+repo_name: lawrnsfeng/mint
+theme:
+  name: material
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - content.code.copy
+nav:
+  - Home: index.md
+  - File Storage:
+      - Usage: fs/usage.md
+      - API Reference: fs/api.md
+      - Implementation Notes: s3-implementation-notes.md
+  - DB Repository Layer:
+      - Usage: db/usage.md
+      - API Reference: db/api.md
+      - Implementation Notes: db-repository-implementation-notes.md
+  - Utils:
+      - Usage: utils/usage.md
+      - API Reference: utils/api.md
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_source: false
+            show_root_heading: true
+            docstring_style: google
+markdown_extensions:
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - admonition

@@ -208,3 +208,7 @@ __marimo__/
 
 # versioningit
 mint/_version.py
+
+# spec-kit local tooling scaffolding (specs/ output itself is tracked)
+.specify/
+/CLAUDE.md

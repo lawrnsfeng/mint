@@ -1,0 +1,157 @@
+[project]
+name = "mint"
+dynamic = ["version"]
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "aiohttp>=3.13.2",
+    "pydantic>=2.12.5",
+    "sprout",
+    "structlog>=25.5.0",
+]
+
+[tool.uv.sources]
+sprout = { git = "ssh://git@github.com/lawrnsfeng/sprout.git" }
+
+[dependency-groups]
+azure = [
+    "azure-identity>=1.25.1",
+    "azure-storage-blob~=12.27.1",
+]
+s3 = [
+    "aiobotocore>=2.15.2",
+    "types-aiobotocore[s3]>=2.15.2",
+]
+dev = [
+    "mypy>=1.19.0",
+    "pdm>=2.26.2",
+    "pre-commit>=4.5.0",
+    "ruff>=0.14.8",
+    "ty>=0.0.1a32",
+    "types-aiofiles>=25.1.0.20251011",
+]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.15.1",
+    "testcontainers[azurite]>=4.0.0",
+    "testcontainers[localstack]>=4.0.0",
+]
+
+[build-system]
+requires = ["hatchling", "versioningit"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "versioningit"
+default-version = "0.0.0+unknown"
+
+[tool.hatch.version.format]
+distance = "{next_version}.dev{distance}+{vcs}{rev}"
+dirty = "{version}+dirty"
+distance-dirty = "{next_version}.dev{distance}+{vcs}{rev}.dirty"
+
+[tool.hatch.build]
+artifacts = ["mint/_version.py"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["mint"]
+
+[tool.hatch.build.targets.sdist]
+only-include = ["mint"]
+
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
+select = ["ALL"]
+exclude = ["*mock*.py"]
+ignore = [
+    "D100",  # undocumented-public-module
+    "D104",  # undocumented-public-package
+    "D105",  # undocumented-magic-method
+    "D203",  # one-blank-line-before-class
+    "D213",  # multi-line-summary-second-line
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**.py" = [
+    "S101",  # assert
+    "ARG001",  # unused-function-argument (fixtures for setup/cleanup)
+    "PLR2004",  # magic-value-comparison (test assertions)
+    "EM101",  # raw-string-in-exception
+    "SLF001",  # private-member-access
+    "TRY003",  # raise-vanilla-args
+]
+"interface.py" = [
+    "D100",
+    "D101",
+    "D102",
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["mint", "tests"]
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_untyped_calls = true
+disallow_any_generics = true
+ignore_missing_imports = true
+no_implicit_reexport = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    # Suppress internal testcontainers library deprecation (their own code issue)
+    "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning:testcontainers.core.waiting_utils",
+]
+
+[tool.pdm.scripts]
+lint = "ruff check --fix"
+tc = "mypy ."
+pre = "pre-commit run --all-files"
+test = "python -m pytest tests"
+testv = "python -m pytest -s tests"
+cov = "python -m pytest --cov=mint --cov-report=term-missing tests"
+
+[tool.semantic_release]
+commit_parser = "conventional"
+tag_format = "v{version}"
+major_on_zero = true
+allow_zero_version = true
+commit_message = "chore(release): v{version}\n\n[skip ci]"
+commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+[tool.semantic_release.commit_parser_options]
+parse_squash_commits = true
+ignore_merge_commits = true
+
+[tool.semantic_release.branches.main]
+match = "master"
+prerelease = false
+
+[tool.semantic_release.remote]
+type = "github"
+token = { env = "GH_TOKEN" }
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true
+
+[tool.semantic_release.changelog]
+mode = "update"
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"

@@ -1,0 +1,37 @@
+---
+name: Pre-commit
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Use https for git dependencies
+        run: |
+          git config --global url."https://github.com/".insteadOf \
+            "ssh://git@github.com/"
+      - name: Install dependencies
+        run: uv sync --all-extras --all-groups --all-packages
+      - name: Cache pre-commit envs
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Run pre-commit
+        run: uv run pre-commit run --all-files --show-diff-on-failure

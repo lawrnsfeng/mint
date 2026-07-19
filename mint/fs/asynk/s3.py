@@ -24,6 +24,8 @@ from botocore.exceptions import ClientError
 from sprout import ChildRef, Executor, FetchResult
 
 from mint.fs.exc import (
+    AmbiguousFolderPathError,
+    CopySourceTooLargeError,
     FileAlreadyExistsError,
     FileStorageError,
     FolderAlreadyExistsError,
@@ -31,6 +33,8 @@ from mint.fs.exc import (
     MoveCleanupError,
     ObjectNotFoundError,
     OperationalError,
+    TrailingSlashNotAllowedError,
+    UnsupportedRefTypeError,
 )
 from mint.fs.structs import (
     CopyResult,
@@ -88,9 +92,7 @@ class S3Storage(IFileStorage["S3Client"]):
 
     DefaultPresignedURLExpirationInSeconds: Final[int] = _1HOUR
     DefaultChunkSizeNoMultipartInBytes: Final[int] = 4 * _1KB
-    ContentDispositionFormat: Final[str] = (
-        "attachment; filename*=UTF-8''{filename_utf8}"
-    )
+    ContentDispositionFormat: Final[str] = "attachment; filename*=UTF-8''{filename_utf8}"
 
     def __init__(  # noqa: PLR0913
         self,
@@ -172,9 +174,7 @@ class S3Storage(IFileStorage["S3Client"]):
             session_token=self.aws_session_token,
             profile_name=self.profile_name,
             region_name=self.region_name,
-            max_concurrent_clients=(
-                self._limiter.max_concurrent if self._limiter else None
-            ),
+            max_concurrent_clients=(self._limiter.max_concurrent if self._limiter else None),
         )
 
     def _init_credential_mode(
@@ -234,9 +234,7 @@ class S3Storage(IFileStorage["S3Client"]):
         if not credentials_path.exists():
             return False
         content = credentials_path.read_text(encoding="utf-8")
-        header = (
-            "[default]" if profile_name == "default" else f"[{profile_name}]"
-        )
+        header = "[default]" if profile_name == "default" else f"[{profile_name}]"
         return header in content
 
     def _create_client(self) -> "ClientCreatorContext[S3Client]":
@@ -459,15 +457,14 @@ class S3Storage(IFileStorage["S3Client"]):
             The object key of the uploaded object.
 
         Raises:
-            InvalidArgumentsError: If path ends with '/' or ref type
-                is unsupported.
+            TrailingSlashNotAllowedError: If path ends with '/'.
+            UnsupportedRefTypeError: If ref type is unsupported.
             FolderAlreadyExistsError: If path is an existing folder prefix.
             FileAlreadyExistsError: If object exists and overwrite=False.
 
         """
         if path.endswith("/"):
-            _msg = "path must not end with '/'"
-            raise InvalidArgumentsError(_msg)
+            raise TrailingSlashNotAllowedError(path)
 
         if await self.is_folder(path):
             raise FolderAlreadyExistsError(path)
@@ -504,8 +501,7 @@ class S3Storage(IFileStorage["S3Client"]):
                         Body=await upload_file.read(),
                     )
             case _:
-                _msg = f"unsupported ref type: {type(ref).__name__}"
-                raise InvalidArgumentsError(_msg)
+                raise UnsupportedRefTypeError(path, type(ref).__name__)
         return path
 
     @_auto_catch_native_exc
@@ -525,7 +521,7 @@ class S3Storage(IFileStorage["S3Client"]):
 
         Note:
             Single object copy is limited to 5 GB. Objects larger than
-            5 GB will raise InvalidArgumentsError.
+            5 GB will raise CopySourceTooLargeError.
 
         Args:
             src: Source path. Add trailing '/' for folder operations.
@@ -537,14 +533,14 @@ class S3Storage(IFileStorage["S3Client"]):
 
         Raises:
             ObjectNotFoundError: If single-file src doesn't exist.
-            InvalidArgumentsError: If src is detected as folder but lacks
-                trailing '/', or if object exceeds 5 GB.
+            AmbiguousFolderPathError: If src is detected as folder but
+                lacks trailing '/'.
+            CopySourceTooLargeError: If object exceeds 5 GB.
 
         """
         if not src.endswith("/"):
             if await self.is_folder(src) or await self.is_folder(dst):
-                _msg = "src or dst is a folder; add trailing '/' to src"
-                raise InvalidArgumentsError(_msg)
+                raise AmbiguousFolderPathError(src, dst)
             dst_key = dst.rstrip("/")
             try:
                 head = await self.client.head_object(
@@ -557,11 +553,7 @@ class S3Storage(IFileStorage["S3Client"]):
                 raise
             size: int = head.get("ContentLength", 0)
             if size > _S3_COPY_MAX_BYTES:
-                _msg = (
-                    f"object {src} is {size} bytes; single copy"
-                    f" limited to {_S3_COPY_MAX_BYTES} bytes (5 GB)"
-                )
-                raise InvalidArgumentsError(_msg)
+                raise CopySourceTooLargeError(src, size, _S3_COPY_MAX_BYTES)
             await self.client.copy_object(
                 Bucket=self.bucket_name,
                 CopySource={"Bucket": self.bucket_name, "Key": src},
@@ -571,7 +563,11 @@ class S3Storage(IFileStorage["S3Client"]):
 
         src_prefix = f"{src.rstrip('/')}/"
         dst_prefix = f"{dst.rstrip('/')}/"
-        src_keys = await self.list(src_prefix, recursive=recursive)
+        src_keys = [
+            key
+            for key in await self.list(src_prefix, recursive=recursive)
+            if not key.endswith("/")
+        ]
 
         success: list[str] = []
         failure: list[str] = []
@@ -620,7 +616,8 @@ class S3Storage(IFileStorage["S3Client"]):
         Raises:
             ObjectNotFoundError: If single-file src doesn't exist.
             MoveCleanupError: If copy had failures (removal not attempted).
-            InvalidArgumentsError: If src is folder but lacks trailing '/'.
+            AmbiguousFolderPathError: If src is folder but lacks trailing
+                '/'.
 
         """
         copy_result = await self.copy(src, dst, recursive=recursive)
@@ -661,10 +658,12 @@ class S3Storage(IFileStorage["S3Client"]):
 
         """
         if path.endswith("/"):
-            keys = await self.list(path, recursive=recursive)
+            keys = [
+                key for key in await self.list(path, recursive=recursive) if not key.endswith("/")
+            ]
             if not keys:
                 return RemoveResult(success=[], failure=[])
-            return await self.remove_many(list(keys), recursive=recursive)
+            return await self.remove_many(keys, recursive=recursive)
 
         try:
             await self.client.head_object(
@@ -758,8 +757,7 @@ class S3Storage(IFileStorage["S3Client"]):
             )
             deleted.extend(obj["Key"] for obj in response.get("Deleted", []))
             errors.extend(
-                err.get("Message", err.get("Key", "unknown"))
-                for err in response.get("Errors", [])
+                err.get("Message", err.get("Key", "unknown")) for err in response.get("Errors", [])
             )
         return deleted, errors
 
@@ -877,10 +875,7 @@ class S3Storage(IFileStorage["S3Client"]):
             response = await self.client.list_objects_v2(**kwargs)
             keys.extend(obj["Key"] for obj in (response.get("Contents") or []))
             if not recursive:
-                keys.extend(
-                    cp["Prefix"]
-                    for cp in (response.get("CommonPrefixes") or [])
-                )
+                keys.extend(cp["Prefix"] for cp in (response.get("CommonPrefixes") or []))
             token = response.get("NextContinuationToken")
             if token is None:
                 break
@@ -1034,10 +1029,7 @@ class S3Storage(IFileStorage["S3Client"]):
                 "Key": path,
                 "ResponseContentDisposition": content_disposition,
             },
-            ExpiresIn=(
-                expiration_in_seconds
-                or self.DefaultPresignedURLExpirationInSeconds
-            ),
+            ExpiresIn=(expiration_in_seconds or self.DefaultPresignedURLExpirationInSeconds),
         )
 
     @_auto_catch_native_exc
@@ -1063,9 +1055,7 @@ class S3Storage(IFileStorage["S3Client"]):
             list(objects),
             size=batch_size or Batch.DEFAULT_SIZE,
         ):
-            tasks: list[Coro[str]] = [
-                self.save(path, ref) for path, ref in batch
-            ]
+            tasks: list[Coro[str]] = [self.save(path, ref) for path, ref in batch]
             results.extend(
                 await asyncio.gather(*tasks, return_exceptions=True),
             )

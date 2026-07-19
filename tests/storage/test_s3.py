@@ -10,11 +10,12 @@ import pytest
 from mint.fs.asynk.s3 import S3Storage, _GetObjectContextManager
 from mint.fs.asynk.s3_structs import S3CredentialMode
 from mint.fs.exc import (
+    AmbiguousFolderPathError,
     FileAlreadyExistsError,
     FolderAlreadyExistsError,
-    InvalidArgumentsError,
     ObjectNotFoundError,
-    OperationalError,
+    TrailingSlashNotAllowedError,
+    UnsupportedRefTypeError,
 )
 from mint.fs.structs import (
     CopyResult,
@@ -23,6 +24,7 @@ from mint.fs.structs import (
     RemoveResult,
     Stat,
 )
+from mint.utils.exc import InvalidConcurrencyLimitError
 from tests.storage.conftest import LocalStackContainer
 
 # ---------------------------------------------------------------------------
@@ -330,13 +332,13 @@ class TestSave:
         self,
         s3_storage: S3Storage,
     ) -> None:
-        """Save raises InvalidArgumentsError for path ending with '/'.
+        """Save raises TrailingSlashNotAllowedError for path ending with '/'.
 
         Args:
             s3_storage: S3Storage fixture.
 
         """
-        with pytest.raises(InvalidArgumentsError):
+        with pytest.raises(TrailingSlashNotAllowedError):
             await s3_storage.save("folder/", b"x")
 
     async def test_save_overwrite_false_raises_when_exists(
@@ -371,14 +373,14 @@ class TestSave:
         self,
         s3_storage: S3Storage,
     ) -> None:
-        """Save raises InvalidArgumentsError for unsupported ref types.
+        """Save raises UnsupportedRefTypeError for unsupported ref types.
 
         Args:
             s3_storage: S3Storage fixture.
 
         """
         bad_ref: Any = 12345
-        with pytest.raises((InvalidArgumentsError, OperationalError)):
+        with pytest.raises(UnsupportedRefTypeError):
             await s3_storage.save("bad.txt", bad_ref)
 
 
@@ -797,18 +799,43 @@ class TestCopy:
         )
         assert len(result.success) == 2
 
+    async def test_copy_folder_non_recursive_excludes_subfolder(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """Non-recursive folder copy skips nested subfolders entirely.
+
+        list(..., recursive=False) mixes real keys with virtual
+        CommonPrefixes folder markers; those markers must never be handed
+        to copy_object (they're not real objects) nor recursed into.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("nr_src/a.txt", b"a")
+        await s3_storage.save("nr_src/sub/b.txt", b"b")
+
+        result = await s3_storage.copy("nr_src/", "nr_dst/", recursive=False)
+
+        assert result.success == ["nr_dst/a.txt"]
+        assert result.failure == []
+        assert not await s3_storage.is_folder("nr_dst/sub")
+        with pytest.raises(ObjectNotFoundError):
+            await s3_storage.stat("nr_dst/sub/b.txt")
+
     async def test_copy_raises_if_src_is_folder_without_slash(
         self,
         s3_storage: S3Storage,
     ) -> None:
-        """Copy raises InvalidArgumentsError when src is folder but lacks '/'.
+        """Copy raises AmbiguousFolderPathError when src is folder w/o '/'.
 
         Args:
             s3_storage: S3Storage fixture.
 
         """
         await s3_storage.save("fold/file.txt", b"x")
-        with pytest.raises(InvalidArgumentsError):
+        with pytest.raises(AmbiguousFolderPathError):
             await s3_storage.copy("fold", "other")
 
     async def test_copy_raises_not_found_for_missing_src(
@@ -905,6 +932,32 @@ class TestMove:
         await s3_storage.get("mv_content_dst.txt", str(dest))
         assert dest.read_bytes() == content
 
+    async def test_move_folder_non_recursive_with_subfolder_present(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """Non-recursive move over a folder with a subfolder does not abort.
+
+        Regression test: copy()'s folder branch used to hand the virtual
+        CommonPrefixes subfolder marker to copy_object, which always failed
+        (no such object), making move() raise MoveCleanupError even though
+        every real file copied fine.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("mv_nr/a.txt", b"a")
+        await s3_storage.save("mv_nr/sub/b.txt", b"b")
+
+        result = await s3_storage.move("mv_nr/", "mv_nr_dst/", recursive=False)
+
+        assert result.copy.success == ["mv_nr_dst/a.txt"]
+        assert result.copy.failure == []
+        with pytest.raises(ObjectNotFoundError):
+            await s3_storage.stat("mv_nr/a.txt")
+        assert (await s3_storage.stat("mv_nr/sub/b.txt")).size == len(b"b")
+
     async def test_move_raises_not_found_for_missing_src(
         self,
         s3_storage: S3Storage,
@@ -938,14 +991,14 @@ class TestMove:
         self,
         s3_storage: S3Storage,
     ) -> None:
-        """Move raises InvalidArgumentsError if folder src lacks '/'.
+        """Move raises AmbiguousFolderPathError if folder src lacks '/'.
 
         Args:
             s3_storage: S3Storage fixture.
 
         """
         await s3_storage.save("fold_mv/x.txt", b"x")
-        with pytest.raises(InvalidArgumentsError):
+        with pytest.raises(AmbiguousFolderPathError):
             await s3_storage.move("fold_mv", "other")
 
 
@@ -981,6 +1034,33 @@ class TestRemove:
         await s3_storage.save("rm_folder/b.txt", b"b")
         result = await s3_storage.remove("rm_folder/")
         assert len(result.success) == 2
+
+    async def test_remove_folder_non_recursive_leaves_subfolder_intact(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """Non-recursive remove only deletes the immediate-level object.
+
+        Regression test: list(path, recursive=False) returns the virtual
+        CommonPrefixes subfolder marker alongside real keys; remove_many
+        used to expand that marker's own children too, over-deleting one
+        level deeper than a non-recursive remove should reach.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("rm_shallow/a.txt", b"a")
+        await s3_storage.save("rm_shallow/sub/b.txt", b"b")
+
+        result = await s3_storage.remove("rm_shallow/", recursive=False)
+
+        assert result.success == ["rm_shallow/a.txt"]
+        assert result.failure == []
+        with pytest.raises(ObjectNotFoundError):
+            await s3_storage.stat("rm_shallow/a.txt")
+        nested = await s3_storage.stat("rm_shallow/sub/b.txt")
+        assert nested.size == len(b"b")
 
     async def test_remove_folder_recursive(
         self,
@@ -1485,10 +1565,7 @@ class TestConcurrency:
         """
         n = 60
         results = await asyncio.gather(
-            *[
-                s3_storage.save(f"conc_save/f{i}.txt", f"c{i}".encode())
-                for i in range(n)
-            ],
+            *[s3_storage.save(f"conc_save/f{i}.txt", f"c{i}".encode()) for i in range(n)],
         )
         assert len(results) == n
 
@@ -1561,3 +1638,29 @@ class TestConcurrencyLimiter:
             max_concurrent_clients=None,
         )
         assert storage._limiter is None
+
+    def test_zero_max_concurrent_clients_raises_value_error(
+        self,
+        s3_endpoint_url: str,
+    ) -> None:
+        """max_concurrent_clients=0 raises InvalidConcurrencyLimitError.
+
+        A ConcurrencyLimiter with max_concurrent=0 would never let any
+        caller acquire it, so it's rejected at construction time.
+
+        Args:
+            s3_endpoint_url: LocalStack S3 endpoint URL.
+
+        """
+        with pytest.raises(
+            InvalidConcurrencyLimitError,
+            match="max_concurrent",
+        ):
+            S3Storage(
+                bucket_name=LocalStackContainer.TEST_BUCKET_NAME,
+                endpoint_url=s3_endpoint_url,
+                access_key=LocalStackContainer.ACCESS_KEY,
+                secret_key=LocalStackContainer.SECRET_KEY,
+                region_name=LocalStackContainer.DEFAULT_REGION,
+                max_concurrent_clients=0,
+            )

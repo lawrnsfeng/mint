@@ -34,8 +34,7 @@ class AzuriteAccount:
 
     name: str = "devstoreaccount1"
     key: str = (
-        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu"
-        "Fq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
     )
 
     @classmethod

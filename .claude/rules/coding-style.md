@@ -146,3 +146,15 @@ Limit global state. Pass dependencies explicitly.
 
 All code must pass `uv run ruff check` and `uv run ruff format --check` and
 `uv run ty check` before a change is considered done.
+
+## No suppression comments
+
+Fix the underlying issue — don't silence the linter/type-checker with
+`# noqa`, `# type: ignore`, or similar. The only exception is a genuine
+limitation of a third-party dependency: a library function/class that is
+itself untyped or incorrectly typed, where no code change on our side can
+make the call typed (e.g. calling a third-party constructor whose
+`__init__` has no return annotation). In that case, suppress with the
+narrowest possible code (e.g. `# type: ignore[no-untyped-call]`, never a
+bare `# type: ignore`) and only on the exact line the third-party gap
+forces.

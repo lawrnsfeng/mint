@@ -36,6 +36,7 @@ test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
+    "pytest-mock>=3.15.1",
     "testcontainers[azurite]>=4.0.0",
     "testcontainers[localstack]>=4.0.0",
 ]
@@ -63,7 +64,7 @@ packages = ["mint"]
 only-include = ["mint"]
 
 [tool.ruff]
-line-length = 79
+line-length = 99
 
 [tool.ruff.lint]
 select = ["ALL"]

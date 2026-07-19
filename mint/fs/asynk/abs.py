@@ -35,12 +35,16 @@ from azure.storage.blob.aio import (
 )
 
 from mint.fs.exc import (
+    AmbiguousFolderPathError,
     FileAlreadyExistsError,
     FileStorageError,
+    FolderAlreadyExistsError,
     InvalidArgumentsError,
     MoveCleanupError,
     ObjectNotFoundError,
     OperationalError,
+    TrailingSlashNotAllowedError,
+    UnsupportedRefTypeError,
 )
 from mint.fs.structs import (
     CopyResult,
@@ -79,21 +83,15 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     """
 
     AzureStorageAccessKey: Final[str] = "AZURE_STORAGE_ACCESS_KEY"
-    AzureStorageConnectionString: Final[str] = (
-        "AZURE_STORAGE_CONNECTION_STRING"
-    )
+    AzureStorageConnectionString: Final[str] = "AZURE_STORAGE_CONNECTION_STRING"
     DefaultPresignedURLExpirationInSeconds: Final[int] = 60 * 60
     TmplBlobSAS: Final[str] = (
         "https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
     )
-    TmplAccountURL: Final[str] = (
-        "https://{self.storage_account_name}.blob.core.windows.net"
-    )
+    TmplAccountURL: Final[str] = "https://{storage_account_name}.blob.core.windows.net"
     SessionRetries: Final[int] = 3
 
-    ContentDispositionFormat: Final[str] = (
-        "attachment; filename*=UTF-8''{filename_utf8}"
-    )
+    ContentDispositionFormat: Final[str] = "attachment; filename*=UTF-8''{filename_utf8}"
 
     def __init__(  # noqa: PLR0913
         self,
@@ -326,17 +324,11 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                         cast("str", self.client_secret),
                     ),
                 )
-            case (
-                AzureCredentialMode.ConnectionString
-                | AzureCredentialMode.EnvVarConnectionString
-            ):
+            case AzureCredentialMode.ConnectionString | AzureCredentialMode.EnvVarConnectionString:
                 return BlobServiceClient.from_connection_string(
                     cast("str", self.connection_string),
                 )
-            case (
-                AzureCredentialMode.SharedAccessKey
-                | AzureCredentialMode.EnvVarSharedAccessKey
-            ):
+            case AzureCredentialMode.SharedAccessKey | AzureCredentialMode.EnvVarSharedAccessKey:
                 return BlobServiceClient(
                     self.account_url,
                     credential=self.shared_access_key,
@@ -450,9 +442,17 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         Raises:
             FileAlreadyExistsError: If blob exists and overwrite is False.
-            InvalidArgumentsError: If ref type is not supported.
+            TrailingSlashNotAllowedError: If path ends with '/'.
+            UnsupportedRefTypeError: If ref type is unsupported.
+            FolderAlreadyExistsError: If path is an existing folder prefix.
 
         """
+        if path.endswith("/"):
+            raise TrailingSlashNotAllowedError(path)
+
+        if await self.is_folder(path):
+            raise FolderAlreadyExistsError(path)
+
         blob = self.container.get_blob_client(blob=path)
 
         if not overwrite and (await blob.exists()):
@@ -471,7 +471,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                         overwrite=overwrite,
                     )
             case _:
-                raise InvalidArgumentsError(detail="{ref = str(type(ref))}")
+                raise UnsupportedRefTypeError(path, type(ref).__name__)
         return path
 
     @_auto_catch_native_exc
@@ -501,7 +501,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             - Empty folder (no children): returns CopyResult with empty lists.
             - Partial failures: CopyResult.failure lists failed paths with
               error messages.
-            - src is folder but missing '/': raises InvalidArgumentsError.
+            - src is folder but missing '/': raises AmbiguousFolderPathError.
 
         Args:
             src: Source path. Add trailing '/' for folder operations.
@@ -513,15 +513,13 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         Raises:
             ObjectNotFoundError: If single file src doesn't exist.
-            InvalidArgumentsError: If src or dst is detected as folder but
-                src doesn't have trailing '/'.
+            AmbiguousFolderPathError: If src or dst is detected as folder
+                but src doesn't have trailing '/'.
 
         """
         if not src.endswith("/"):
             if await self.is_folder(src) or await self.is_folder(dst):
-                raise InvalidArgumentsError(
-                    detail="src or dst is a folder; add trailing '/' to src",
-                )
+                raise AmbiguousFolderPathError(src, dst)
             dst = dst.rstrip("/")
             src_blob = self.container.get_blob_client(blob=src)
             if not await src_blob.exists():
@@ -531,7 +529,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             return CopyResult(success=[dst], failure=[])
 
         src = f"{src.rstrip('/')}/"
-        src_blobs = await self.list(src, recursive=recursive)
+        src_blobs = [
+            blob for blob in await self.list(src, recursive=recursive) if not blob.endswith("/")
+        ]
 
         paths: list[Path] = []
         tasks: list[asyncio.Task[dict[str, str | datetime]]] = []
@@ -586,7 +586,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             - Empty folder: returns MoveResult with empty success lists.
             - Partial copy failures: raises MoveCleanupError (no removal
               attempted to prevent data loss).
-            - src is folder but missing '/': raises InvalidArgumentsError.
+            - src is folder but missing '/': raises AmbiguousFolderPathError.
 
         Args:
             src: Source path. Add trailing '/' for folder operations.
@@ -599,8 +599,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         Raises:
             ObjectNotFoundError: If single file src doesn't exist.
             MoveCleanupError: If copy had failures (removal not attempted).
-            InvalidArgumentsError: If src or dst is detected as folder but
-                src doesn't have trailing '/'.
+            AmbiguousFolderPathError: If src or dst is detected as folder
+                but src doesn't have trailing '/'.
 
         """
         copy_result = await self.copy(src, dst, recursive=recursive)
@@ -653,7 +653,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         """
         if path.endswith("/"):
-            objs = await self.list(path, recursive=recursive)
+            objs = [
+                obj for obj in await self.list(path, recursive=recursive) if not obj.endswith("/")
+            ]
             if len(objs) == 0:
                 return RemoveResult(success=[], failure=[])
             return await self.remove_many(objs, recursive=recursive)
@@ -764,7 +766,9 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                 case None:
                     deleted.append(filepath)
                 case _:
-                    raise OperationalError(result_or_exc)
+                    errors.append(
+                        f"Unexpected error deleting blob {filepath}: {result_or_exc}",
+                    )
 
         if recursive:
             for folderpath in folders:
@@ -837,10 +841,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             Collection of blob names matching the prefix.
 
         """
-        blob_props_list: AsyncItemPaged[BlobProperties] = (
-            self.container.list_blobs(
-                name_starts_with=path,
-            )
+        blob_props_list: AsyncItemPaged[BlobProperties] = self.container.list_blobs(
+            name_starts_with=path,
         )
         results: list[str] = []
         async for blob_props in blob_props_list:
@@ -888,10 +890,8 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             Sequence of ListItem objects with blob details.
 
         """
-        blob_props_list: AsyncItemPaged[BlobProperties] = (
-            self.container.list_blobs(
-                name_starts_with=path,
-            )
+        blob_props_list: AsyncItemPaged[BlobProperties] = self.container.list_blobs(
+            name_starts_with=path,
         )
 
         objs: list[ListItem] = []
@@ -946,17 +946,14 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             raise ObjectNotFoundError(path)
         user_delegation_key = None
         account_key = None
-        if isinstance(self.client.credential, DefaultAzureCredential):
+        if hasattr(self.client.credential, "get_token"):
             # https://learn.microsoft.com/en-us/azure/storage/blobs/storage-blob-user-delegation-sas-create-python?tabs=container#create-a-user-delegation-sas
             # https://stackoverflow.com/questions/73023464/how-to-create-azure-storage-sas-token-using-defaultazurecredential-class
             user_delegation_key = await self.client.get_user_delegation_key(
                 key_start_time=datetime.now(tz=UTC),
                 key_expiry_time=datetime.now(tz=UTC)
                 + timedelta(
-                    seconds=(
-                        expiration_in_seconds
-                        or self.DefaultPresignedURLExpirationInSeconds
-                    ),
+                    seconds=(expiration_in_seconds or self.DefaultPresignedURLExpirationInSeconds),
                 ),
             )
         else:
@@ -971,10 +968,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             permission=BlobSasPermissions(read=True),
             expiry=datetime.now(tz=UTC)
             + timedelta(
-                seconds=(
-                    expiration_in_seconds
-                    or self.DefaultPresignedURLExpirationInSeconds
-                ),
+                seconds=(expiration_in_seconds or self.DefaultPresignedURLExpirationInSeconds),
             ),
             content_disposition=self.ContentDispositionFormat.format(
                 filename_utf8=quote(
@@ -1010,9 +1004,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         """
         results: list[str | BaseException] = []
         for batch in Batch.seq(objects, size=batch_size or Batch.DEFAULT_SIZE):
-            tasks: list[Coroutine[Any, Any, str]] = [
-                self.save(path, ref) for path, ref in batch
-            ]
+            tasks: list[Coroutine[Any, Any, str]] = [self.save(path, ref) for path, ref in batch]
             results.extend(
                 await asyncio.gather(
                     *tasks,
@@ -1060,4 +1052,4 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         except StopAsyncIteration:
             return False
         else:
-            return blob.name != path
+            return blob.name != path_noslash

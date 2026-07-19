@@ -124,9 +124,7 @@ class MyConsoleRenderer(ConsoleRenderer):
                 "location",
                 KeyValueColumnFormatter(
                     key_style=None,
-                    value_style=(
-                        _ColorfulStyles.bright + _ColorfulStyles.level_info
-                    ),
+                    value_style=(_ColorfulStyles.bright + _ColorfulStyles.level_info),
                     reset_style=_ColorfulStyles.reset,
                     value_repr=str,
                     prefix="(",
@@ -173,10 +171,22 @@ def configure_logger(
     *,
     level: str = "INFO",
     enable_json_logs: bool = False,
-    use_rich_traceback_formatter: bool = True,
+    use_rich_traceback_formatter: bool = False,
     timestamper_fmt: str = "%H:%M:%S",
 ) -> None:
-    """Configure global logger with supported configs."""
+    """Configure global logger with supported configs.
+
+    Args:
+        level: Log level for the root logger.
+        enable_json_logs: Render logs as JSON instead of console output.
+        use_rich_traceback_formatter: Opt in to rich's boxed traceback
+            renderer. Defaults to False: rich wraps long class names and
+            variable reprs into narrow boxed columns, which truncates
+            them illegibly on anything but a wide terminal. Plain
+            tracebacks stay readable regardless of terminal width.
+        timestamper_fmt: strftime format for the log timestamp.
+
+    """
     timestamper: Processor = TimeStamper(fmt=timestamper_fmt, utc=True)
     shared_processors: list[Processor] = [
         merge_contextvars,
@@ -213,9 +223,7 @@ def configure_logger(
         else (
             MyConsoleRenderer(
                 exception_formatter=(
-                    RichTracebackFormatter()
-                    if use_rich_traceback_formatter
-                    else plain_traceback
+                    RichTracebackFormatter() if use_rich_traceback_formatter else plain_traceback
                 ),
             )
         ),

@@ -1,17 +1,24 @@
 """Tests for Azure Blob Storage implementation using Azurite testcontainer."""
 
 import asyncio
+import base64
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import aiofiles.tempfile
 import pytest
+from azure.storage.blob import UserDelegationKey
 from azure.storage.blob.aio import BlobServiceClient, ContainerClient
 
 from mint.fs.asynk.abs import AzureBlobStorage
 from mint.fs.exc import (
-    InvalidArgumentsError,
+    AmbiguousFolderPathError,
+    FolderAlreadyExistsError,
     ObjectNotFoundError,
+    TrailingSlashNotAllowedError,
+    UnsupportedRefTypeError,
 )
 from mint.fs.structs import (
     CopyResult,
@@ -20,6 +27,10 @@ from mint.fs.structs import (
     RemoveResult,
     Stat,
 )
+from mint.utils.exc import InvalidConcurrencyLimitError
+
+if TYPE_CHECKING:
+    from pytest_mock.plugin import MockerFixture
 
 # =============================================================================
 # Azurite Container Health Check Test
@@ -61,6 +72,24 @@ async def test_azurite_is_running_and_operational(
 
     blob_exists = await blob_client.exists()
     assert blob_exists is False
+
+
+def test_account_url_uses_storage_account_name() -> None:
+    """account_url builds the public Azure endpoint from the account name.
+
+    Regression test: the underlying template used to reference
+    `{self.storage_account_name}` while `.format()` was called with
+    `storage_account_name=...`, which raised `KeyError('self')` for every
+    credential mode. This is a pure property (no network call), so it's
+    checked directly without an Azurite container.
+    """
+    storage = AzureBlobStorage(
+        container_name="unused",
+        storage_account_name="myaccount",
+        shared_access_key="fake-key",
+    )
+
+    assert storage.account_url == "https://myaccount.blob.core.windows.net"
 
 
 # =============================================================================
@@ -125,6 +154,30 @@ async def test_is_folder_returns_false_for_file(
 
     result = await azure_storage.is_folder("file.txt")
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_is_folder_returns_false_for_exact_name_with_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """is_folder("name/") returns False when "name" is a lone file.
+
+    Regression test: is_folder used to compare the matched blob name
+    against the original (possibly-trailing-slash) `path` argument
+    instead of `path_noslash`, so a lone file named exactly "solo" (no
+    children) was misclassified as a folder when queried as "solo/".
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("solo")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    assert await azure_storage.is_folder("solo") is False
+    assert await azure_storage.is_folder("solo/") is False
 
 
 @pytest.mark.asyncio
@@ -423,6 +476,65 @@ async def test_save_empty_file_from_path(
         blob_client = test_container.get_blob_client("empty-path.txt")
         download = await blob_client.download_blob()
         assert await download.readall() == b""
+
+
+@pytest.mark.asyncio
+async def test_save_raises_for_trailing_slash(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Save raises TrailingSlashNotAllowedError for a path ending with '/'.
+
+    Regression test: save() previously had no guard here at all, so it
+    would silently create a blob literally named "folder/" instead.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    with pytest.raises(TrailingSlashNotAllowedError):
+        await azure_storage.save("folder/", b"x")
+
+
+@pytest.mark.asyncio
+async def test_save_raises_folder_already_exists(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Save raises FolderAlreadyExistsError if path is an existing folder.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    await azure_storage.save("myfolder/child.txt", b"x")
+
+    with pytest.raises(FolderAlreadyExistsError):
+        await azure_storage.save("myfolder", b"x")
+
+
+@pytest.mark.asyncio
+async def test_save_raises_for_unsupported_ref_type(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Save raises UnsupportedRefTypeError naming the actual unsupported type.
+
+    Regression test: the error message used to be the literal,
+    non-interpolated string "{ref = str(type(ref))}" instead of the real
+    type name.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    bad_ref: Any = 12345
+
+    with pytest.raises(UnsupportedRefTypeError, match="int"):
+        await azure_storage.save("bad.txt", bad_ref)
 
 
 # =============================================================================
@@ -1129,10 +1241,10 @@ async def test_copy_raises_error_when_src_is_folder_without_slash(
     azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test copy raises InvalidArgumentsError for folder without '/'.
+    """Test copy raises AmbiguousFolderPathError for folder without '/'.
 
     When src doesn't end with '/' but is actually a folder prefix,
-    copy raises InvalidArgumentsError to prevent ambiguity.
+    copy raises AmbiguousFolderPathError to prevent ambiguity.
 
     Args:
         azure_storage: The AzureBlobStorage instance.
@@ -1142,7 +1254,7 @@ async def test_copy_raises_error_when_src_is_folder_without_slash(
     blob_client = test_container.get_blob_client("folder-src/file.txt")
     await blob_client.upload_blob(b"content", overwrite=True)
 
-    with pytest.raises(InvalidArgumentsError):
+    with pytest.raises(AmbiguousFolderPathError):
         await azure_storage.copy("folder-src", "folder-dst.txt")
 
 
@@ -1151,10 +1263,10 @@ async def test_copy_raises_error_when_dst_is_folder(
     azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
 ) -> None:
-    """Test copy raises InvalidArgumentsError when dst is a folder.
+    """Test copy raises AmbiguousFolderPathError when dst is a folder.
 
     When copying single file but dst is a folder prefix (has children),
-    copy raises InvalidArgumentsError.
+    copy raises AmbiguousFolderPathError.
 
     Args:
         azure_storage: The AzureBlobStorage instance.
@@ -1167,7 +1279,7 @@ async def test_copy_raises_error_when_dst_is_folder(
     dst_blob = test_container.get_blob_client("dst-folder/file.txt")
     await dst_blob.upload_blob(b"dst content", overwrite=True)
 
-    with pytest.raises(InvalidArgumentsError):
+    with pytest.raises(AmbiguousFolderPathError):
         await azure_storage.copy("single-src.txt", "dst-folder")
 
 
@@ -1401,6 +1513,34 @@ async def test_remove_folder_with_trailing_slash(
 
 
 @pytest.mark.asyncio
+async def test_remove_folder_non_recursive_leaves_subfolder_intact(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Non-recursive remove only deletes the immediate-level blob.
+
+    Symmetric with the S3 backend: a non-recursive remove of a folder
+    must not reach into any nested subfolder.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    top_blob = test_container.get_blob_client("shallow/a.txt")
+    await top_blob.upload_blob(b"a", overwrite=True)
+    nested_blob = test_container.get_blob_client("shallow/sub/b.txt")
+    await nested_blob.upload_blob(b"b", overwrite=True)
+
+    result = await azure_storage.remove("shallow/", recursive=False)
+
+    assert result.success == ["shallow/a.txt"]
+    assert result.failure == []
+    assert not await top_blob.exists()
+    assert await nested_blob.exists()
+
+
+@pytest.mark.asyncio
 async def test_remove_empty_folder_returns_empty_result(
     azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
@@ -1534,6 +1674,44 @@ async def test_remove_many_recursive_removes_folders(
 
 
 @pytest.mark.asyncio
+async def test_remove_many_records_unmatched_exception_as_failure(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+    mocker: "MockerFixture",
+) -> None:
+    """remove_many() records an unmatched exception type as a failure.
+
+    Regression test: the `case _:` branch used to re-raise the exception
+    as OperationalError, discarding the deleted/errors lists already
+    accumulated for the other files in the same batch. It must instead
+    keep going and report a partial RemoveResult.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+        mocker: pytest-mock fixture.
+
+    """
+    blob_a = test_container.get_blob_client("um_a.txt")
+    await blob_a.upload_blob(b"a", overwrite=True)
+    blob_b = test_container.get_blob_client("um_b.txt")
+    await blob_b.upload_blob(b"b", overwrite=True)
+
+    mocker.patch.object(
+        azure_storage,
+        "_remove_many_files",
+        autospec=True,
+        return_value=[None, RuntimeError("boom")],
+    )
+
+    result = await azure_storage.remove_many(["um_a.txt", "um_b.txt"])
+
+    assert result.success == ["um_a.txt"]
+    assert len(result.failure) == 1
+    assert "um_b.txt" in result.failure[0]
+
+
+@pytest.mark.asyncio
 async def test_remove_many_empty_list_returns_empty_result(
     azure_storage: AzureBlobStorage,
     test_container: ContainerClient,
@@ -1550,6 +1728,131 @@ async def test_remove_many_empty_list_returns_empty_result(
     assert isinstance(result, RemoveResult)
     assert len(result.success) == 0
     assert len(result.failure) == 0
+
+
+# =============================================================================
+# IFileStorage.gen_presigned_url Method Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_gen_presigned_url_returns_string(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """gen_presigned_url returns a URL string for an existing blob.
+
+    The `azure_storage` fixture uses ConnectionString credential mode,
+    whose credential exposes `.account_key` (not `.get_token`), so this
+    exercises the key-based SAS branch end-to-end against Azurite.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("presign.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    url = await azure_storage.gen_presigned_url("presign.txt")
+
+    assert isinstance(url, str)
+    assert "presign.txt" in url
+
+
+@pytest.mark.asyncio
+async def test_gen_presigned_url_raises_not_found(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """gen_presigned_url raises ObjectNotFoundError for a missing blob.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    with pytest.raises(ObjectNotFoundError):
+        await azure_storage.gen_presigned_url("ghost.txt")
+
+
+@pytest.mark.asyncio
+async def test_gen_presigned_url_custom_filename(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """gen_presigned_url includes a custom filename override.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance.
+        test_container: The test container client.
+
+    """
+    blob_client = test_container.get_blob_client("presign2.txt")
+    await blob_client.upload_blob(b"content", overwrite=True)
+
+    url = await azure_storage.gen_presigned_url(
+        "presign2.txt",
+        file_name="custom-name.txt",
+        expiration_in_seconds=120,
+    )
+
+    assert isinstance(url, str)
+
+
+@pytest.mark.asyncio
+async def test_gen_presigned_url_uses_delegation_key_for_token_credential(
+    azure_storage: AzureBlobStorage,
+    mocker: "MockerFixture",
+) -> None:
+    """gen_presigned_url takes the delegation-key path for any AAD token.
+
+    Regression test: the branch used to check
+    `isinstance(credential, DefaultAzureCredential)`, so a
+    ClientSecretCredential (ClientSecret auth mode) fell into the `else`
+    branch and crashed on `.account_key`, which it doesn't have. The fix
+    duck-types any token credential via `hasattr(credential, "get_token")`.
+    Azurite has no real AAD support, so the client is swapped for a stub
+    exposing exactly that shape.
+
+    Args:
+        azure_storage: The AzureBlobStorage instance (its real client is
+            bypassed for this call via a stub in `_client_ctx`).
+        mocker: pytest-mock fixture.
+
+    """
+    delegation_key = UserDelegationKey()  # type: ignore[no-untyped-call]
+    delegation_key.signed_oid = "oid"
+    delegation_key.signed_tid = "tid"
+    delegation_key.signed_start = datetime.now(tz=UTC).isoformat()
+    delegation_key.signed_expiry = (datetime.now(tz=UTC) + timedelta(hours=1)).isoformat()
+    delegation_key.signed_service = "b"
+    delegation_key.signed_version = "2021-08-06"
+    delegation_key.value = base64.b64encode(b"x" * 32).decode()
+
+    fake_blob = mocker.AsyncMock()
+    fake_blob.exists.return_value = True
+    fake_blob.blob_name = "presign/target.txt"
+
+    fake_container = mocker.Mock()
+    fake_container.get_blob_client.return_value = fake_blob
+
+    fake_client = mocker.Mock()
+    fake_client.credential = mocker.Mock(spec=["get_token"])
+    fake_client.account_name = "devstoreaccount1"
+    fake_client.get_container_client.return_value = fake_container
+    fake_client.get_user_delegation_key = mocker.AsyncMock(
+        return_value=delegation_key,
+    )
+
+    token = azure_storage._client_ctx.set(fake_client)
+    try:
+        url = await azure_storage.gen_presigned_url("presign/target.txt")
+    finally:
+        azure_storage._client_ctx.reset(token)
+
+    fake_client.get_user_delegation_key.assert_awaited_once()
+    assert isinstance(url, str)
 
 
 # =============================================================================
@@ -1730,6 +2033,29 @@ async def test_max_concurrent_clients_creates_limiter(
     assert len(results) == 20
 
     await storage.remove("limited/", recursive=True)
+
+
+def test_zero_max_concurrent_clients_raises_value_error(
+    azurite_connection_string: str,
+    test_container_name: str,
+) -> None:
+    """Test that max_concurrent_clients=0 raises InvalidConcurrencyLimitError.
+
+    A ConcurrencyLimiter with max_concurrent=0 would deadlock every caller
+    forever, so it's rejected at construction time instead.
+
+    Args:
+        azurite_connection_string: Connection string for Azurite.
+        test_container_name: Name of the test container.
+
+    """
+    with pytest.raises(InvalidConcurrencyLimitError, match="max_concurrent"):
+        AzureBlobStorage(
+            container_name=test_container_name,
+            storage_account_name="devstoreaccount1",
+            connection_string=azurite_connection_string,
+            max_concurrent_clients=0,
+        )
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from mint.utils.exc import InvalidConcurrencyLimitError
 from mint.utils.limiter import ConcurrencyLimiter
 
 
@@ -124,6 +125,20 @@ async def test_limiter_custom_max_concurrent() -> None:
     assert limiter.max_concurrent == 42
 
 
+@pytest.mark.parametrize("max_concurrent", [0, -1, -10])
+def test_limiter_rejects_non_positive_max_concurrent(
+    max_concurrent: int,
+) -> None:
+    """Test that max_concurrent<=0 raises InvalidConcurrencyLimitError.
+
+    Args:
+        max_concurrent: A non-positive value that must be rejected.
+
+    """
+    with pytest.raises(InvalidConcurrencyLimitError, match="max_concurrent"):
+        ConcurrencyLimiter(max_concurrent=max_concurrent)
+
+
 @pytest.mark.asyncio
 async def test_limiter_releases_on_exception() -> None:
     """Test that limiter releases semaphore even when exception occurs."""
@@ -216,9 +231,7 @@ async def test_limiter_deep_nesting_releases_only_at_outermost() -> None:
     async def prober() -> None:
         await asyncio.sleep(0.01)
         async with limiter:
-            assert not outermost_active, (
-                "Prober acquired lock before outermost level released it"
-            )
+            assert not outermost_active, "Prober acquired lock before outermost level released it"
 
     await asyncio.gather(level_one(), prober())
 
@@ -265,8 +278,7 @@ async def test_limiter_decorator_and_context_manager_share_depth() -> None:
         await asyncio.sleep(0.01)
         async with limiter:
             assert not critical_section_active, (
-                "Intruder acquired lock while decorated outer call "
-                "was still active"
+                "Intruder acquired lock while decorated outer call was still active"
             )
 
     await asyncio.gather(service.outer(), intruder())

@@ -7,6 +7,8 @@ from functools import wraps
 from types import TracebackType
 from typing import Any, Concatenate, Final, Self
 
+from mint.utils.exc import InvalidConcurrencyLimitError
+
 
 class ConcurrencyLimiter:
     """Reusable concurrency limiter using asyncio.Semaphore.
@@ -42,8 +44,16 @@ class ConcurrencyLimiter:
             max_concurrent: Maximum number of concurrent operations.
                 Defaults to DEFAULT_MAX_CONCURRENT (10).
 
+        Raises:
+            InvalidConcurrencyLimitError: If max_concurrent is not None
+                and is <= 0.
+
         """
-        self._max_concurrent = max_concurrent or self.DEFAULT_MAX_CONCURRENT
+        if max_concurrent is not None and max_concurrent <= 0:
+            raise InvalidConcurrencyLimitError(max_concurrent)
+        self._max_concurrent = (
+            max_concurrent if max_concurrent is not None else self.DEFAULT_MAX_CONCURRENT
+        )
         self._semaphore = asyncio.Semaphore(self._max_concurrent)
         self._acquired_ctx: ContextVar[int] = ContextVar(
             f"_limiter_depth_{id(self)}",

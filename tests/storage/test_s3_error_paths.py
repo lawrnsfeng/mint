@@ -18,6 +18,7 @@ from botocore.exceptions import ClientError
 from mint.fs.asynk.s3 import S3Storage
 from mint.fs.asynk.s3_structs import S3CredentialMode
 from mint.fs.exc import (
+    CopySourceTooLargeError,
     InvalidArgumentsError,
     MoveCleanupError,
     ObjectNotFoundError,
@@ -157,7 +158,7 @@ class TestCopyErrorPaths:
             await storage.copy("src.txt", "dst.txt")
 
     async def test_copy_single_exceeds_five_gb_limit(self) -> None:
-        """Objects larger than 5 GB raise InvalidArgumentsError."""
+        """Objects larger than 5 GB raise CopySourceTooLargeError."""
         client = MagicMock()
         client.list_objects_v2 = AsyncMock(
             return_value={"Contents": []},
@@ -167,7 +168,7 @@ class TestCopyErrorPaths:
         )
         storage = _storage_with_mock_client(client)
 
-        with pytest.raises(InvalidArgumentsError):
+        with pytest.raises(CopySourceTooLargeError):
             await storage.copy("huge.bin", "dst.bin")
 
     async def test_copy_folder_partial_failure_recorded(self) -> None:

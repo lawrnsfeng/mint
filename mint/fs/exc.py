@@ -1,29 +1,7 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar
 
-
-@dataclass
-class TemplatedError(Exception):
-    """Base class for dataclass-style exceptions with templated messages.
-
-    Subclasses define fields + TEMPLATE.
-    """
-
-    TEMPLATE: ClassVar[str]
-    message: str = field(init=False)
-
-    def __post_init__(self) -> None:
-        values = {
-            name: getattr(self, name)
-            for name in self.__dataclass_fields__
-            if name != "message"
-        }
-        self.message = self.TEMPLATE.format(**values)
-        super().__init__(self.message)
-
-    def __str__(self) -> str:
-        return self.message
+from mint.exc import TemplatedError
 
 
 @dataclass
@@ -83,8 +61,42 @@ class FileAlreadyExistsError(FileStorageError):
 class MoveCleanupError(FileStorageError):
     """Move file or folder error."""
 
-    TEMPLATE = (
-        "Cannot remove src path due to failed objects, src = {src}: {failure}"
-    )
+    TEMPLATE = "Cannot remove src path due to failed objects, src = {src}: {failure}"
     src: str | Path
     failure: list[str]
+
+
+@dataclass
+class TrailingSlashNotAllowedError(FileStorageError):
+    """Path must not end with '/' for a single-object operation."""
+
+    TEMPLATE = "path must not end with '/': {path}"
+    path: str
+
+
+@dataclass
+class UnsupportedRefTypeError(FileStorageError):
+    """Content reference passed to save() is of an unsupported type."""
+
+    TEMPLATE = "unsupported ref type for {path}: {ref_type}"
+    path: str
+    ref_type: str
+
+
+@dataclass
+class AmbiguousFolderPathError(FileStorageError):
+    """src or dst is a folder but src lacks the required trailing '/'."""
+
+    TEMPLATE = "src or dst is a folder; add trailing '/' to src (src={src}, dst={dst})"
+    src: str
+    dst: str
+
+
+@dataclass
+class CopySourceTooLargeError(FileStorageError):
+    """Single-object copy source exceeds the backend's size limit."""
+
+    TEMPLATE = "object {path} is {size} bytes; single copy limited to {max_bytes} bytes (5 GB)"
+    path: str
+    size: int
+    max_bytes: int

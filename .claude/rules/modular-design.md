@@ -34,6 +34,32 @@ class FeatureValidationError(FeatureError): ...
 
 Never raise bare `Exception` or `RuntimeError` from module code.
 
+Never build an error message into a local variable and raise a generic
+exception (or a generic field like `detail`) with it:
+
+```python
+# Wrong
+_msg = f"unsupported ref type: {type(ref).__name__}"
+raise InvalidArgumentsError(_msg)
+
+# Correct — dedicated class, typed fields, no pre-formatted string
+@dataclass
+class UnsupportedRefTypeError(FileStorageError):
+    TEMPLATE = "unsupported ref type for {path}: {ref_type}"
+    path: str
+    ref_type: str
+
+raise UnsupportedRefTypeError(path, type(ref).__name__)
+```
+
+Every distinct error condition gets its own `TemplatedError` subclass (see
+`mint/exc.py` for the shared base) with a `TEMPLATE` string and typed
+fields for whatever data the caller already has — never a single opaque
+`msg`/`detail` string assembled at the call site. This keeps exception
+types precise enough to `except` individually and keeps messages complete
+(every relevant value is a named field, not whatever the caller happened
+to interpolate).
+
 ## Separation of concerns
 
 - `models.py` — pure data, no I/O, no side effects

@@ -6,13 +6,20 @@ exactly what test 58 (a non-picklable fn) deliberately exploits.
 """
 
 import asyncio
+import pickle
 import time
 from concurrent.futures import ProcessPoolExecutor as StdlibProcessPoolExecutor
 
 import pytest
+from pydantic import BaseModel
 
+from mint.worker.brokers.memory import MemoryBroker
+from mint.worker.canvas.engine import CanvasEngine
 from mint.worker.exc import UnpicklableTaskError
+from mint.worker.executors.inline import InlineExecutor
 from mint.worker.executors.process_pool import ProcessPoolExecutor
+from mint.worker.stores.memory import MemoryCanvasStore
+from mint.worker.worker import Worker, WorkerBinding
 
 BLOCK_SECONDS = 0.2
 
@@ -113,3 +120,89 @@ class TestAclose:
 
         assert not adopted._shutdown_thread
         adopted.shutdown()
+
+
+class TestRealWorkerBoundMethod:
+    """A Worker's own `process` is what this executor is actually asked to run."""
+
+    def test_a_bound_process_of_an_in_flight_worker_is_picklable(self) -> None:
+        """`Worker._run_task` passes `self.process`, which drags the whole instance.
+
+        `_inflight` always holds the currently-running asyncio.Task while a message
+        is being handled, so before `Worker.__getstate__` existed every message on a
+        process-pool worker failed with `UnpicklableTaskError` — the executor could
+        never run a real worker at all, and the tests here only ever exercised
+        module-level functions.
+        """
+
+        async def check() -> None:
+            worker = PicklableWorker()
+            worker.bind(
+                WorkerBinding(
+                    broker=MemoryBroker(),
+                    store=MemoryCanvasStore(),
+                    engine=CanvasEngine(MemoryCanvasStore()),
+                    executor=InlineExecutor(),
+                ),
+            )
+            current = asyncio.current_task()
+            assert current is not None
+            worker._inflight.add(current)
+
+            ProcessPoolExecutor._ensure_picklable(worker.process, PoolIn(value=1))
+
+        asyncio.run(check())
+
+    def test_the_unpicklable_guard_still_catches_a_real_domain_dependency(self) -> None:
+        """Stripping runtime state must not hide a genuinely unpicklable attribute."""
+        worker = PicklableWorker()
+        worker.connection = _Unpicklable()
+
+        with pytest.raises(UnpicklableTaskError):
+            ProcessPoolExecutor._ensure_picklable(worker.process, PoolIn(value=1))
+
+    async def test_a_round_tripped_process_still_computes(self) -> None:
+        """Surviving pickling is only useful if the child can actually call it."""
+        worker = PicklableWorker()
+
+        restored, payload = pickle.loads(pickle.dumps((worker.process, PoolIn(value=21))))
+
+        assert (await restored(payload)).doubled == 42
+
+
+class _Unpicklable:
+    """Stands in for a live DB client or socket held as a worker attribute."""
+
+    def __reduce__(self) -> tuple[object, ...]:
+        """Refuse to pickle, the way a real connection object does."""
+        detail = "cannot pickle a live connection"
+        raise TypeError(detail)
+
+
+class PoolIn(BaseModel):
+    """Input for the picklable worker."""
+
+    value: int
+
+
+class PoolOut(BaseModel):
+    """Output for the picklable worker."""
+
+    doubled: int
+
+
+class PicklableWorker(Worker[PoolIn, PoolOut]):
+    """A worker whose own attributes are picklable, as a process pool requires."""
+
+    topic = "pool"
+    Input = PoolIn
+    Output = PoolOut
+
+    def __init__(self) -> None:
+        """Start with no extra dependencies."""
+        super().__init__()
+        self.connection: object | None = None
+
+    async def process(self, input_obj: PoolIn) -> PoolOut:
+        """Double the input."""
+        return PoolOut(doubled=input_obj.value * 2)

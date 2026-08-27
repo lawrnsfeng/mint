@@ -17,6 +17,7 @@ same shape the other brokers already use. The cost is that a requeued message
 goes to the back of the queue rather than being redelivered in place.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import ClassVar, Final, Protocol
@@ -136,6 +137,11 @@ class RabbitMQBroker:
         self._connection_pool: ConnectionPool | None = None
         self._channel_pool: ChannelPool | None = None
         self._consumer_connection: AbstractRobustConnection | None = None
+        # WorkerApp starts every worker's run() concurrently and each calls consume(),
+        # so the lazy init below is a genuine race: without this lock all N see None,
+        # all N connect, and the last assignment orphans the rest — still consuming,
+        # and unreachable by close().
+        self._consumer_connection_lock = asyncio.Lock()
 
     def _ensure_connection_pool(self) -> ConnectionPool:
         if self._connection_pool is None:
@@ -257,9 +263,10 @@ class RabbitMQBroker:
 
     async def _ensure_consumer_connection(self) -> AbstractRobustConnection:
         """Return the single connection every consumer opens its own channel on."""
-        if self._consumer_connection is None:
-            self._consumer_connection = await connect_robust(self.uri)
-        return self._consumer_connection
+        async with self._consumer_connection_lock:
+            if self._consumer_connection is None:
+                self._consumer_connection = await connect_robust(self.uri)
+            return self._consumer_connection
 
     async def close(self) -> None:
         """Close the consumer connection and both pools, whichever were ever built."""

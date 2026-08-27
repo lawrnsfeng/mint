@@ -114,6 +114,11 @@ class RedisCanvasStore:
         }
         await self.client.mset(mp_str_bytes)
         await self._track(canvas_id, *(str(key) for key in mp_str_bytes))
+        # Explicitly RUNNING, not merely absent. apply() accepts a caller-supplied
+        # canvas_id for idempotent retries, and a terminal status from a previous
+        # attempt outlives the data by design (see set_canvas_status) — so without
+        # this a retry would short-circuit every completion and never advance.
+        await self.set_canvas_status(canvas_id, CanvasStatus.RUNNING)
 
     async def get_node(self, canvas_id: str, node_id: str) -> AnyNode | None:
         """Look up a single node, or None if it does not exist."""
@@ -184,6 +189,12 @@ class RedisCanvasStore:
             args=[child_id, num_children],
         )
         return GroupProgress(added=bool(added), done_count=int(done_count), fired=bool(fired))
+
+    async def claim_group_terminal(self, canvas_id: str, group_id: str) -> bool:
+        """Claim the right to emit this group's single terminal outcome. True if won."""
+        fired_key = self._group_fired_key(canvas_id, group_id)
+        await self._track(canvas_id, fired_key)
+        return bool(await self.client.setnx(fired_key, b"1"))
 
     async def reset_group_fired(self, canvas_id: str, group_id: str) -> None:
         """Release this group's callback-fired guard so a redelivery can re-fire it."""

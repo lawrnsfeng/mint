@@ -410,3 +410,88 @@ class TestGuaranteeAndClose:
         for consumer in consumers.values():
             consumer.stop.assert_awaited_once()
         assert broker._consumers == {}
+
+
+class TestOutOfOrderCommits:
+    """Concurrent handlers settle out of order, so only a contiguous prefix is safe."""
+
+    def _record(self, mocker: "MockerFixture", offset: int) -> MagicMock:
+        record = mocker.MagicMock()
+        record.value = b"payload"
+        record.topic = TOPIC
+        record.headers = ()
+        record.partition = 0
+        record.offset = offset
+        return record
+
+    async def test_settling_a_later_offset_first_commits_nothing(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """Committing offset 7's `offset + 1` while 5 and 6 run skips past both.
+
+        A restart would resume after them and they would never be redelivered —
+        silent loss, from a broker declaring at-least-once.
+        """
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        deliveries = [
+            KafkaDelivery(broker, self._record(mocker, offset), consumer) for offset in (5, 6, 7)
+        ]
+
+        await deliveries[2].ack()
+
+        consumer.commit.assert_not_awaited()
+
+    async def test_settling_the_blocker_releases_the_whole_run(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """Once the earliest offset settles, everything contiguous behind it commits."""
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        deliveries = [
+            KafkaDelivery(broker, self._record(mocker, offset), consumer) for offset in (5, 6, 7)
+        ]
+
+        await deliveries[2].ack()
+        await deliveries[1].ack()
+        await deliveries[0].ack()
+
+        consumer.commit.assert_awaited_once_with({TopicPartition(TOPIC, 0): 8})
+
+    async def test_in_order_settling_commits_each_offset_as_it_goes(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """The common case must not be delayed by the tracking."""
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        first = KafkaDelivery(broker, self._record(mocker, 5), consumer)
+        second = KafkaDelivery(broker, self._record(mocker, 6), consumer)
+
+        await first.ack()
+        await second.ack()
+
+        assert [call.args[0] for call in consumer.commit.await_args_list] == [
+            {TopicPartition(TOPIC, 0): 6},
+            {TopicPartition(TOPIC, 0): 7},
+        ]
+
+    async def test_partitions_are_tracked_independently(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """A gap on one partition must not hold up another."""
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        blocked = self._record(mocker, 5)
+        other = self._record(mocker, 5)
+        other.partition = 1
+        KafkaDelivery(broker, blocked, consumer)
+        KafkaDelivery(broker, self._record(mocker, 6), consumer)
+        other_delivery = KafkaDelivery(broker, other, consumer)
+
+        await other_delivery.ack()
+
+        consumer.commit.assert_awaited_once_with({TopicPartition(TOPIC, 1): 6})

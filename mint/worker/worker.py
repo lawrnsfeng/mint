@@ -26,6 +26,10 @@ from mint.worker.stores.interface import ICanvasStore
 logger = get_logger(__name__)
 
 DEFAULT_MAX_CONCURRENCY: Final[int] = 32
+# Runtime state a Worker must not carry into a child process; see __getstate__.
+_UNPICKLABLE_RUNTIME_STATE: Final[frozenset[str]] = frozenset(
+    {"_binding", "_inflight", "_stopped", "_slots"},
+)
 DEFAULT_MAX_ATTEMPTS: Final[int] = 5
 
 MALFORMED_INPUT_ERROR: Final[ErrorInfo] = ErrorInfo(
@@ -103,6 +107,34 @@ class Worker[T: BaseModel, RT: BaseModel]:
         # A plain Semaphore rather than mint.utils.ConcurrencyLimiter: this acquires
         # in run() and releases in the handler task, and the limiter's ContextVar
         # reentrancy assumes both happen in the same task.
+        self._slots = asyncio.Semaphore(self.max_concurrency)
+
+    def __getstate__(self) -> dict[str, object]:
+        """Drop this worker's runtime state so ``process`` can cross a process boundary.
+
+        ``ProcessPoolExecutor`` pickles ``(self.process, input_)``, and a bound
+        method drags its whole instance along — including ``_inflight``, which
+        *always* holds the currently-running ``asyncio.Task``, plus the semaphore,
+        the stop event, and ``_binding``'s live broker/store handles. None of those
+        are picklable, so a worker configured with a process pool failed every
+        message with ``UnpicklableTaskError`` before doing any work.
+
+        The child process only ever calls ``process``; it has no use for any of it.
+        A worker's own domain dependencies still have to be picklable, which is the
+        constraint ``UnpicklableTaskError`` exists to report.
+        """
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in _UNPICKLABLE_RUNTIME_STATE
+        }
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        """Restore a worker in the child process, unbound and with fresh primitives."""
+        self.__dict__.update(state)
+        self._binding = None
+        self._inflight = set()
+        self._stopped = asyncio.Event()
         self._slots = asyncio.Semaphore(self.max_concurrency)
 
     async def process(self, input_obj: T) -> RT:
@@ -188,12 +220,15 @@ class Worker[T: BaseModel, RT: BaseModel]:
             # it — on RabbitMQ that republishes the message and acks a second time,
             # which the broker rejects and which reruns a node that already finished.
             if not settled:
-                await self._safe_nack(delivery, requeue=True)
+                await self._safe_retry_or_drop(delivery)
             raise
         except Exception:
             logger.exception("Unhandled error handling a delivery", topic=self.topic)
             if not settled:
-                await self._safe_nack(delivery, requeue=True)
+                # Capped, not an unconditional requeue: a persistently failing ack()
+                # would otherwise re-run the work forever, which is the exact storm
+                # _retry_or_drop exists to stop.
+                await self._safe_retry_or_drop(delivery)
         finally:
             self._slots.release()
 
@@ -224,7 +259,7 @@ class Worker[T: BaseModel, RT: BaseModel]:
                 # The failure couldn't even be recorded. Dead-lettering now would
                 # leave the canvas RUNNING with nothing able to advance it, so retry
                 # instead — bounded by max_attempts, which dead-letters in the end.
-                await self._retry_or_drop(delivery, envelope)
+                await self._retry_or_drop(delivery, envelope.node_id)
                 return DeliveryOutcome(settled=True)
             await delivery.nack(requeue=False)
             return DeliveryOutcome(settled=True)
@@ -232,13 +267,13 @@ class Worker[T: BaseModel, RT: BaseModel]:
         outcome, result = await self._run_task(input_obj, envelope.node_id, binding.executor)
 
         if not await self._advance(envelope, outcome, binding):
-            await self._retry_or_drop(delivery, envelope)
+            await self._retry_or_drop(delivery, envelope.node_id)
             return DeliveryOutcome(settled=True)
 
         await delivery.ack()
         return DeliveryOutcome(settled=True, input_obj=input_obj, result=result)
 
-    async def _retry_or_drop(self, delivery: Delivery, envelope: Envelope) -> None:
+    async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:
         """Requeue this delivery, or dead-letter it once ``max_attempts`` is spent.
 
         Without a cap, a persistently failing store or broker means every failure
@@ -251,18 +286,17 @@ class Worker[T: BaseModel, RT: BaseModel]:
             logger.error(
                 "Giving up on a delivery after repeated failures",
                 topic=self.topic,
-                node_id=envelope.node_id,
-                canvas_id=envelope.canvas_id,
+                node_id=node_id,
                 attempt=delivery.attempt,
             )
             await delivery.nack(requeue=False)
             return
         await delivery.nack(requeue=True)
 
-    async def _safe_nack(self, delivery: Delivery, *, requeue: bool) -> None:
-        """Nack, logging rather than raising — used where nothing is left to catch it."""
+    async def _safe_retry_or_drop(self, delivery: Delivery) -> None:
+        """Retry-or-drop, logging rather than raising — nothing above would catch it."""
         try:
-            await delivery.nack(requeue=requeue)
+            await self._retry_or_drop(delivery, node_id=None)
         except Exception:
             logger.exception("Failed to nack a delivery", topic=self.topic)
 

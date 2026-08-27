@@ -436,3 +436,49 @@ class TestPendingReclaim:
         delivery = await anext(broker.consume(TOPIC))
 
         assert delivery.body == b"old server"
+
+
+class TestReclaimSkipsOwnInFlightWork:
+    """XAUTOCLAIM matches on idle time alone, with no regard for who owns the entry."""
+
+    async def test_a_message_this_consumer_is_still_handling_is_not_re_yielded(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """A handler slower than reclaim_idle_ms had its own message handed back.
+
+        It would then be processed a second time, concurrently with the first —
+        self-duplication rather than the cross-consumer recovery reclaim is for.
+        """
+        entry = (b"5-1", {RedisBroker.BODY_FIELD: b"slow"})
+        mock_client.xautoclaim.return_value = [b"0-0", [entry], []]
+        mock_client.xreadgroup.return_value = [
+            (TOPIC, [(b"9-1", {RedisBroker.BODY_FIELD: b"fresh"})]),
+        ]
+
+        consumer = broker.consume(TOPIC)
+        first = await anext(consumer)
+        assert first.body == b"slow"
+
+        # `5-1` is still unacked, so the next poll must not hand it back.
+        second = await anext(consumer)
+
+        assert second.body == b"fresh"
+
+    async def test_a_settled_message_becomes_reclaimable_again(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """The guard is about *in-flight* work only — acking releases the id."""
+        entry = (b"5-1", {RedisBroker.BODY_FIELD: b"slow"})
+        mock_client.xautoclaim.return_value = [b"0-0", [entry], []]
+
+        consumer = broker.consume(TOPIC)
+        first = await anext(consumer)
+        await first.ack()
+
+        second = await anext(consumer)
+
+        assert second.body == b"slow"

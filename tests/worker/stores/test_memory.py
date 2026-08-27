@@ -144,3 +144,22 @@ class TestCanvasStatus:
         await store.set_canvas_status(CANVAS, CanvasStatus.ERROR)
 
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+
+class TestCanvasIdReuse:
+    """apply(canvas_id=...) exists for idempotent retries, so a reused id must start clean."""
+
+    async def test_recreating_a_canvas_resets_a_terminal_status(self) -> None:
+        """`setdefault` left the retry inheriting the failed attempt's ERROR status.
+
+        Every completion would then short-circuit on the non-RUNNING guard, ack,
+        and the retried canvas would silently never advance at all.
+        """
+        store = MemoryCanvasStore()
+        node = TaskNode(id="t1", canvas_id="c1", topic="t")
+        await store.create_canvas("c1", {"t1": node})
+        await store.set_canvas_status("c1", CanvasStatus.ERROR)
+
+        await store.create_canvas("c1", {"t1": node})
+
+        assert await store.get_canvas_status("c1") == CanvasStatus.RUNNING

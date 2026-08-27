@@ -130,6 +130,8 @@ ignore = [
 ]
 "tests/worker/executors/test_process_pool.py" = [
     "ASYNC251",  # same as test_thread_pool.py, for ProcessPoolExecutor.
+    "S301",  # round-tripping a Worker's own bound process() through pickle is the
+    # property under test — the data is produced by the same test, not untrusted.
 ]
 
 [tool.mypy]

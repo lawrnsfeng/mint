@@ -218,23 +218,14 @@ class CanvasEngine:
         finished_child_id: str,
         outcome: NodeOutcome,
     ) -> tuple[Dispatch | None, NodeOutcome | None]:
-        if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.ABORT:
-            await self._abort_canvas(canvas_id, await self._unfinished(canvas_id, group))
-            return None, None
-
-        if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.PROPAGATE:
-            # Mirrors _advance_chain's PROPAGATE branch. Without this the policy was
-            # only ever consulted on the ABORT pre-check and the callback-less
-            # final_status, so a group *with* a callback treated PROPAGATE exactly
-            # like CONTINUE: the callback fired with the failed leg present, the
-            # group's own outcome became the callback's, and the enclosing container
-            # advanced as though nothing had failed.
-            await self._cancel_group_remainder(canvas_id, group, finished_child_id)
-            return None, NodeOutcome(
-                node_id=group.id,
-                status=NodeStatus.ERROR,
-                error=outcome.error,
-            )
+        terminal = await self._apply_group_error_policy(
+            canvas_id,
+            group,
+            finished_child_id,
+            outcome,
+        )
+        if terminal is not None:
+            return terminal
 
         progress = await self.store.mark_child_done(
             canvas_id,
@@ -338,6 +329,48 @@ class CanvasEngine:
                 canvas_id=canvas_id,
             )
         return node
+
+    async def _apply_group_error_policy(
+        self,
+        canvas_id: str,
+        group: GroupNode,
+        finished_child_id: str,
+        outcome: NodeOutcome,
+    ) -> tuple[Dispatch | None, NodeOutcome | None] | None:
+        """Handle a failed child under ABORT/PROPAGATE, or None if the group continues.
+
+        Both branches end the group early, before ``mark_child_done`` — which is a
+        group's only de-duplication — so each claims the group's single terminal
+        slot first. Two legs failing concurrently would otherwise each act on it:
+        under PROPAGATE both bubble a group-level ERROR and the enclosing container
+        advances twice.
+        """
+        if outcome.status != NodeStatus.ERROR:
+            return None
+        if group.error_policy == ErrorPolicy.ABORT:
+            if not await self.store.claim_group_terminal(canvas_id, group.id):
+                return None, None
+            # Cancels the callback along with the unfinished legs — an aborting group
+            # never dispatches it, so leaving it PENDING misreports it as expected.
+            await self._cancel_group_remainder(canvas_id, group, finished_child_id)
+            await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
+            return None, None
+        if group.error_policy == ErrorPolicy.PROPAGATE:
+            if not await self.store.claim_group_terminal(canvas_id, group.id):
+                return None, None
+            # Mirrors _advance_chain's PROPAGATE branch. Without this the policy was
+            # only ever consulted on the ABORT pre-check and the callback-less
+            # final_status, so a group *with* a callback treated PROPAGATE exactly
+            # like CONTINUE: the callback fired with the failed leg present, the
+            # group's own outcome became the callback's, and the enclosing container
+            # advanced as though nothing had failed.
+            await self._cancel_group_remainder(canvas_id, group, finished_child_id)
+            return None, NodeOutcome(
+                node_id=group.id,
+                status=NodeStatus.ERROR,
+                error=outcome.error,
+            )
+        return None
 
     async def _cancel_group_remainder(
         self,

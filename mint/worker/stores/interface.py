@@ -70,6 +70,16 @@ class ICanvasStore(Protocol):
         """Atomically record one group child as done and report fan-in progress."""
         ...
 
+    async def claim_group_terminal(self, canvas_id: str, group_id: str) -> bool:
+        """Claim the right to emit this group's single terminal outcome. True if won.
+
+        Shares the callback-fired guard, because a group emits exactly one terminal
+        event: either it fires its callback, or it aborts/propagates — never both.
+        Without it, two legs failing concurrently under PROPAGATE both bubble a
+        group-level ERROR and the enclosing container advances twice.
+        """
+        ...
+
     async def reset_group_fired(self, canvas_id: str, group_id: str) -> None:
         """Release a group's callback-fired guard so the next completion can re-fire it.
 

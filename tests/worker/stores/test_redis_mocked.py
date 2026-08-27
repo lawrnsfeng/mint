@@ -488,3 +488,34 @@ class TestStatusKeyOutlivesItsData:
         await store.set_canvas_status(CANVAS, CanvasStatus.RUNNING)
 
         mock_client.expire.assert_not_awaited()
+
+
+class TestCanvasIdReuseResetsStatus:
+    """A terminal status outlives its data by design, so creation must clear it."""
+
+    async def test_create_canvas_writes_a_running_status(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Nothing wrote the status on creation, so a retry inherited the old one."""
+        node = TaskNode(id="t1", canvas_id=CANVAS, topic="t")
+
+        await store.create_canvas(CANVAS, {"t1": node})
+
+        written = {
+            call.args[0]: call.args[1] for call in mock_client.set.await_args_list if call.args
+        }
+        assert written[f"mint-worker:canvas:{CANVAS}:status"] == b"running"
+
+    async def test_create_canvas_does_not_expire_anything(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """A freshly created canvas is live — nothing it owns may carry a TTL."""
+        node = TaskNode(id="t1", canvas_id=CANVAS, topic="t")
+
+        await store.create_canvas(CANVAS, {"t1": node})
+
+        mock_client.expire.assert_not_awaited()

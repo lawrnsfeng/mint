@@ -1192,3 +1192,120 @@ class TestChildNotListedByItsParent:
             await engine.complete(CANVAS, "stray", ok_outcome("stray"))
 
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+
+class TestGroupTerminalBranchesAreNotDeduplicated:
+    """ABORT/PROPAGATE return before mark_child_done, the group's only de-dup."""
+
+    def _group(self, policy: ErrorPolicy) -> GroupNode:
+        return GroupNode(
+            id="g",
+            canvas_id=CANVAS,
+            parent_id=None,
+            children=["leg1", "leg2"],
+            callback="cb",
+            error_policy=policy,
+        )
+
+    async def test_abort_cancels_the_callback_as_well_as_the_legs(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """An aborting group never dispatches its callback, so PENDING misreports it."""
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("leg2", "g"),
+            task("cb", "g", topic="callback"),
+            self._group(ErrorPolicy.ABORT),
+        )
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        callback = await store.get_node(CANVAS, "cb")
+        assert callback is not None
+        assert callback.status == NodeStatus.CANCELLED
+
+    async def test_abort_still_errors_the_canvas(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Cancelling the callback must not lose the canvas-level failure."""
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("leg2", "g"),
+            task("cb", "g", topic="callback"),
+            self._group(ErrorPolicy.ABORT),
+        )
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+
+class TestConcurrentTerminalLegsEmitOnce:
+    """A group emits exactly one terminal outcome, however many legs fail at once."""
+
+    def _group(self, policy: ErrorPolicy) -> GroupNode:
+        return GroupNode(
+            id="g",
+            canvas_id=CANVAS,
+            parent_id="chain",
+            children=["leg1", "leg2"],
+            callback=None,
+            error_policy=policy,
+        )
+
+    async def _seed(self, store: MemoryCanvasStore, policy: ErrorPolicy) -> None:
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("leg2", "g"),
+            self._group(policy),
+            task("after", "chain", topic="after"),
+            ChainNode(
+                id="chain",
+                canvas_id=CANVAS,
+                parent_id=None,
+                children=["g", "after"],
+                error_policy=ErrorPolicy.CONTINUE,
+            ),
+        )
+
+    async def test_two_legs_failing_concurrently_advance_the_parent_once(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """PROPAGATE returns before mark_child_done, the group's only de-duplication.
+
+        Both failing legs took the branch, both bubbled a group-level ERROR, and the
+        enclosing CONTINUE chain dispatched its next step twice.
+        """
+        await self._seed(store, ErrorPolicy.PROPAGATE)
+
+        results = await asyncio.gather(
+            engine.complete(CANVAS, "leg1", err_outcome("leg1")),
+            engine.complete(CANVAS, "leg2", err_outcome("leg2")),
+        )
+
+        assert sum(len(dispatches) for dispatches in results) == 1
+
+    async def test_two_legs_aborting_concurrently_abort_once(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """ABORT has the same shape; it just happened to be masked by the status guard."""
+        await self._seed(store, ErrorPolicy.ABORT)
+
+        results = await asyncio.gather(
+            engine.complete(CANVAS, "leg1", err_outcome("leg1")),
+            engine.complete(CANVAS, "leg2", err_outcome("leg2")),
+        )
+
+        assert all(dispatches == [] for dispatches in results)
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR

@@ -35,7 +35,10 @@ class ErrorPolicy(StrEnum):
     CONTINUE: record the error, keep going as if nothing happened.
     PROPAGATE: stop this container, mark it errored, cancel what has not run yet,
         but still let its own parent decide what to do next.
-    ABORT: cancel every pending sibling and fail the whole canvas immediately.
+    ABORT: cancel this container's remaining children (and a group's callback) and
+        mark the whole canvas ERROR immediately, so nothing further dispatches.
+        Nodes in unrelated branches keep whatever status they had — the canvas
+        status is what stops them, not a per-node sweep.
     """
 
     CONTINUE = "continue"

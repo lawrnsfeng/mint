@@ -31,7 +31,11 @@ class MemoryCanvasStore:
         async with self._lock:
             for node_id, node in nodes.items():
                 self._nodes[(canvas_id, node_id)] = node
-            self._canvas_status.setdefault(canvas_id, CanvasStatus.RUNNING)
+            # Set, not setdefault: apply() accepts a caller-supplied canvas_id for
+            # idempotent retries, and a retry after a failed first attempt would
+            # otherwise inherit that attempt's terminal status — every completion
+            # short-circuits and the canvas never advances at all.
+            self._canvas_status[canvas_id] = CanvasStatus.RUNNING
 
     async def get_node(self, canvas_id: str, node_id: str) -> AnyNode | None:
         """Look up a single node, or None if it does not exist."""
@@ -96,6 +100,15 @@ class MemoryCanvasStore:
                 self._group_fired.add(key)
                 fired = True
             return GroupProgress(added=added, done_count=done_count, fired=fired)
+
+    async def claim_group_terminal(self, canvas_id: str, group_id: str) -> bool:
+        """Claim the right to emit this group's single terminal outcome. True if won."""
+        async with self._lock:
+            key = (canvas_id, group_id)
+            if key in self._group_fired:
+                return False
+            self._group_fired.add(key)
+            return True
 
     async def reset_group_fired(self, canvas_id: str, group_id: str) -> None:
         """Release this group's callback-fired guard so a redelivery can re-fire it."""

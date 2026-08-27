@@ -234,7 +234,10 @@ class Coordinator:
             await delivery.nack(requeue=False)
             return
 
-        self._untrack(envelope.canvas_id, envelope.node_id)
+        # Untracked only once the advance has actually succeeded. Doing it up front
+        # meant a result that then failed and dead-lettered left its node neither
+        # completed nor tracked — so the sweeper, the only thing that would have
+        # failed it, never fired and the canvas stayed RUNNING forever.
         if not await self._advance(
             envelope.canvas_id,
             envelope.node_id,
@@ -243,6 +246,7 @@ class Coordinator:
         ):
             await self._retry_or_drop(delivery, envelope.node_id)
             return
+        self._untrack(envelope.canvas_id, envelope.node_id)
         await delivery.ack()
 
     async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:

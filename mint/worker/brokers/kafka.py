@@ -75,6 +75,10 @@ class KafkaDelivery:
         self._broker = broker
         self._record = record
         self._consumer = consumer
+        # Constructing a delivery *is* what "this offset is in flight" means, so the
+        # broker learns about it here rather than in the consume loop — nothing can
+        # hand out a delivery without its offset being tracked.
+        broker.track(record)
         self.body: bytes = record.value if record.value is not None else b""
         headers = dict(record.headers or ())
         raw_attempt = headers.get(ATTEMPT_HEADER)
@@ -98,17 +102,24 @@ class KafkaDelivery:
         await self._commit()
 
     async def _commit(self) -> None:
-        """Commit exactly this record's partition offset, never the whole position.
+        """Commit only the contiguous run of settled offsets behind this record.
 
-        A bare ``consumer.commit()`` commits every partition's *current* fetch
-        position. ``Worker.run()`` handles several records concurrently, so that
-        would commit past records still in flight — losing them outright if the
-        process dies. Committing ``offset + 1`` for this record's partition only
-        can at worst move the offset backwards under out-of-order acks, which
-        replays (at-least-once) rather than drops.
+        A bare ``consumer.commit()`` commits every partition's current fetch
+        position, and committing this record's own ``offset + 1`` is no better:
+        ``Worker.run()`` settles up to ``max_concurrency`` records concurrently, so
+        they finish out of order. Settling offset 7 while 5 and 6 are still running
+        would move the group past all three, and a restart would never redeliver
+        them — silent loss, from a broker declaring at-least-once.
+
+        The broker therefore tracks what is in flight per partition and hands back
+        the highest offset with nothing unsettled before it, or None when this
+        record was not the blocker.
         """
+        commit_offset = self._broker.settle(self._record)
+        if commit_offset is None:
+            return
         partition = TopicPartition(self._record.topic, self._record.partition)
-        await self._consumer.commit({partition: self._record.offset + 1})
+        await self._consumer.commit({partition: commit_offset})
 
 
 class KafkaBroker:
@@ -129,6 +140,10 @@ class KafkaBroker:
         # across every registered worker, and each worker consumes its own topic.
         self._consumers: dict[str, AIOKafkaConsumer] = {}
         self._admin: AIOKafkaAdminClient | None = None
+        # Per partition: offsets delivered but not yet settled, in delivery order,
+        # plus the settled ones still waiting on an earlier offset. See settle().
+        self._inflight: dict[tuple[str, int], list[int]] = {}
+        self._settled: dict[tuple[str, int], set[int]] = {}
 
     async def _ensure_producer(self) -> AIOKafkaProducer:
         if self._producer is None:
@@ -186,6 +201,33 @@ class KafkaBroker:
         finally:
             self._consumers.pop(topic, None)
             await consumer.stop()
+
+    def track(self, record: "ConsumerRecord") -> None:
+        """Record that ``record``'s offset is delivered and not yet settled."""
+        key = (record.topic, record.partition)
+        self._inflight.setdefault(key, []).append(record.offset)
+        self._settled.setdefault(key, set())
+
+    def settle(self, record: "ConsumerRecord") -> int | None:
+        """Mark ``record`` settled and return the offset that is now safe to commit.
+
+        Safe means every offset before it is settled too. Returns None while an
+        earlier offset is still in flight — committing then would skip past live
+        work. The settled offset is remembered and released later, by whichever
+        record finally unblocks the run.
+        """
+        key = (record.topic, record.partition)
+        inflight = self._inflight.get(key)
+        if inflight is None:
+            return None
+        self._settled[key].add(record.offset)
+
+        commit_offset: int | None = None
+        while inflight and inflight[0] in self._settled[key]:
+            offset = inflight.pop(0)
+            self._settled[key].discard(offset)
+            commit_offset = offset + 1
+        return commit_offset
 
     async def redeliver(self, record: "ConsumerRecord", attempt: int) -> None:
         """Re-publish ``record`` at the given attempt count."""

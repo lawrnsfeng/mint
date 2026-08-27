@@ -61,6 +61,23 @@ is the expanded, "how do I actually fix this" version.
 - [39. Two different NATS topics can still share one stream and cursor](#39-two-different-nats-topics-can-still-share-one-stream-and-cursor)
 - [40. Consuming a NATS dead-letter subject is rejected outright](#40-consuming-a-nats-dead-letter-subject-is-rejected-outright)
 
+**Part 4 — Bugs found by a third review round, after Part 3's fixes landed**
+
+- [41. An unexpected exception strands its delivery, unacked and unlogged](#41-an-unexpected-exception-strands-its-delivery-unacked-and-unlogged)
+- [42. Shutdown can nack a delivery that was already acked](#42-shutdown-can-nack-a-delivery-that-was-already-acked)
+- [43. Nothing reads `Delivery.attempt`, so failures retry forever](#43-nothing-reads-deliveryattempt-so-failures-retry-forever)
+- [44. A dead run loop is never noticed](#44-a-dead-run-loop-is-never-noticed)
+- [45. One bad result kills the coordinator's only result loop](#45-one-bad-result-kills-the-coordinators-only-result-loop)
+- [46. The drain timeout tears the broker down mid-nack](#46-the-drain-timeout-tears-the-broker-down-mid-nack)
+- [47. A result arriving mid-sweep completes its node twice](#47-a-result-arriving-mid-sweep-completes-its-node-twice)
+- [48. A nested container can steal its parent's id and corrupt the graph](#48-a-nested-container-can-steal-its-parents-id-and-corrupt-the-graph)
+- [49. Twenty RabbitMQ consumers deadlock every publish](#49-twenty-rabbitmq-consumers-deadlock-every-publish)
+- [50. The fix for #39 was itself not injective](#50-the-fix-for-39-was-itself-not-injective)
+- [51. A cancelled RPC call leaks its pending entry](#51-a-cancelled-rpc-call-leaks-its-pending-entry)
+- [52. Trace ids die at the first hop](#52-trace-ids-die-at-the-first-hop)
+- [53. `MemoryBroker.close()` wakes only one consumer per topic](#53-memorybrokerclose-wakes-only-one-consumer-per-topic)
+- [54. The package never passed the project's own `make check`](#54-the-package-never-passed-the-projects-own-make-check)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -1890,6 +1907,480 @@ Regression tests: `test_nats_mocked.py::TestDeadLetterStreamOwnership`.
 
 ---
 
+## Part 4 — Bugs found by a third review round, after Part 3's fixes landed
+
+Part 3 fixed everything the second review found. This round reviewed the result
+— and found fourteen more, including one case where Part 3's own fix was wrong.
+That is the point of reviewing the fixes and not just the original code.
+
+### 41. An unexpected exception strands its delivery, unacked and unlogged
+
+**Where:** `mint/worker/worker.py::_handle`
+
+**Symptom:** A message vanishes. It is not acked, not nacked, not dead-lettered,
+and nothing appears in the logs — occasionally accompanied, much later, by a
+bare `Task exception was never retrieved` at GC time.
+
+**Root cause:**
+
+```python
+async def _handle(self, delivery, binding) -> None:
+    try:
+        await self._process_delivery(delivery, binding)
+    except asyncio.CancelledError:      # the ONLY thing caught
+        await delivery.nack(requeue=True)
+        raise
+```
+
+Anything else — a failing `ack()` on a channel blip, a Kafka commit error, a
+driver exception outside the `WorkerError` hierarchy — escapes. And `_handle`
+runs as a fire-and-forget `asyncio.Task` whose only done-callback is
+`self._inflight.discard`, so nothing ever retrieves the exception. The delivery
+is left in limbo: invisible to the broker, to the canvas, and to the operator.
+
+**The practical fix:** Catch it, log it, and settle the delivery.
+
+```python
+except Exception:
+    logger.exception("Unhandled error handling a delivery", topic=self.topic)
+    if not settled:
+        await self._safe_nack(delivery, requeue=True)
+```
+
+`_safe_nack` logs rather than raises, because at that point there is genuinely
+nothing above it left to catch anything.
+
+---
+
+### 42. Shutdown can nack a delivery that was already acked
+
+**Where:** `mint/worker/worker.py::_handle` / `::_process_delivery`
+
+**Symptom:** After a clean shutdown, a node that had already finished runs again
+on restart. On RabbitMQ, the shutdown also logs a channel error.
+
+**Root cause:** The cancellation guard covered more than the unsettled window:
+
+```python
+await delivery.ack()            # settled here
+if result is not None:
+    await self._safe_on_success(input_obj, result)   # ...but still inside the try
+```
+
+A drain-timeout cancellation landing in a slow `on_success` hook — the ordinary
+shutdown path — was caught by `except CancelledError` and nacked a delivery that
+had already been acked. Since issue #35 made RabbitMQ's requeue a
+republish-then-ack, that double-settles: the message is republished *and* acked a
+second time, which the broker rejects.
+
+**The practical fix:** Record settlement before the hook can be interrupted, by
+moving the hook out of the settled region entirely:
+
+```python
+@dataclass(frozen=True)
+class DeliveryOutcome[T: BaseModel, RT: BaseModel]:
+    settled: bool
+    input_obj: T | None = None
+    result: RT | None = None
+```
+
+```python
+handled = await self._process_delivery(delivery, binding)
+settled = handled.settled                       # read before the hook runs
+if handled.input_obj is not None and handled.result is not None:
+    await self._safe_on_success(handled.input_obj, handled.result)
+```
+
+A returned flag rather than one assigned inside the `try`: the first attempt at
+this fix set `settled = await self._process_delivery(...)`, which is only
+assigned *on return* — so a cancellation inside the method still saw `False`.
+The test caught it immediately.
+
+---
+
+### 43. Nothing reads `Delivery.attempt`, so failures retry forever
+
+**Where:** `mint/worker/worker.py::_process_delivery`
+
+**Symptom:** With the store down, one worker pegs a CPU core and the topic makes
+no progress.
+
+**Root cause:** Every failure path returned `False` and nacked for redelivery,
+unconditionally. All five brokers carefully maintain `Delivery.attempt` — and
+grepping the package showed nothing outside the broker modules ever read it.
+There was no poison-message escape at all. On `MemoryBroker`, whose requeue
+redelivers synchronously onto the queue the same consumer is polling, that is a
+tight loop with no `await` boundary long enough to make progress.
+
+**The practical fix:**
+
+```python
+async def _retry_or_drop(self, delivery: Delivery, envelope: Envelope) -> None:
+    if delivery.attempt >= self.max_attempts:      # default 5
+        logger.error("Giving up on a delivery after repeated failures", ...)
+        await delivery.nack(requeue=False)         # dead-letter
+        return
+    await delivery.nack(requeue=True)
+```
+
+This also gave issue #27's fix somewhere sane to fall back to: a node whose
+*failure* can't even be recorded is now retried under the same cap rather than
+dead-lettered into a permanently stalled canvas.
+
+---
+
+### 44. A dead run loop is never noticed
+
+**Where:** `mint/worker/app.py::run`, `mint/worker/coordinator.py::run`
+
+**Symptom:** A deployment stops processing one topic. The process is up, the
+health check passes, and nothing is logged.
+
+**Root cause:** Both `run()` methods create their background tasks and then only
+await `_stop_event`. Nothing ever observes those tasks. A consume loop that died
+— a dropped broker connection propagating out of `consume()`, or issue #41's
+escaping exception — leaves the process alive and healthy-looking while doing
+none of its work, forever.
+
+**The practical fix:** Observe them, and fail loudly.
+
+```python
+for topic, task in self._tasks.items():
+    task.add_done_callback(partial(self._on_worker_exit, topic))
+```
+
+```python
+def _on_worker_exit(self, topic: str, task: asyncio.Task[None]) -> None:
+    if task.cancelled() or self._stop_event.is_set():
+        return                                   # an ordinary shutdown
+    logger.error("Worker consume loop failed", topic=topic, error=repr(task.exception()))
+    self._stop_event.set()
+```
+
+A dead loop isn't recoverable in place, so the app comes down and the supervisor
+restarts it — rather than degrading silently.
+
+---
+
+### 45. One bad result kills the coordinator's only result loop
+
+**Where:** `mint/worker/coordinator.py::_consume_results`
+
+**Symptom:** Every canvas in a centralized-mode deployment stalls at once. The
+coordinator process is up and its sweeper keeps timing nodes out on schedule.
+
+**Root cause:** Same shape as issue #41, in the one place with no redundancy:
+the loop guarded only `CancelledError`, so a single unexpected exception — most
+plausibly a failing `ack()` — terminated it permanently. Combined with issue #44,
+nothing noticed.
+
+**The practical fix:** Log it, requeue that one delivery, keep consuming.
+
+```python
+except Exception:
+    logger.exception("Unhandled error handling a result", topic=self.results_topic)
+    await self._safe_nack(delivery)
+```
+
+---
+
+### 46. The drain timeout tears the broker down mid-nack
+
+**Where:** `mint/worker/app.py::_shutdown`
+
+**Symptom:** Work in flight past the drain timeout is lost rather than
+redelivered — the exact outcome `Worker.drain`'s docstring says the design
+prevents.
+
+**Root cause:**
+
+```python
+with contextlib.suppress(TimeoutError):
+    async with asyncio.timeout(self.drain_timeout):
+        await asyncio.gather(*(w.drain() for w in self._workers.values()))
+await self.broker.close()      # immediately
+```
+
+The timeout *requests* cancellation of the handler tasks; it does not wait for
+it to complete. Those handlers are still inside `await delivery.nack(requeue=True)`
+when `broker.close()` tears the connection down underneath them, so the nack
+raises and the delivery is stranded.
+
+**The practical fix:** Drain twice — once with the deadline, then again without
+one, so the cancellations actually land before anything closes.
+
+```python
+drains = [worker.drain() for worker in self._workers.values()]
+with contextlib.suppress(TimeoutError):
+    async with asyncio.timeout(self.drain_timeout):
+        await asyncio.gather(*drains)
+        return
+await asyncio.gather(*(w.drain() for w in self._workers.values()), return_exceptions=True)
+```
+
+---
+
+### 47. A result arriving mid-sweep completes its node twice
+
+**Where:** `mint/worker/coordinator.py::_sweep_once` / `::_timeout_node`
+
+**Symptom:** Occasionally a chain's next step is dispatched twice, or a group
+counts one leg twice — only ever on a canvas that was near its `max_age`.
+
+**Root cause:** `_sweep_once` snapshots the stale entries and then `await`s per
+entry:
+
+```python
+stale = [entry for entry in list(self._in_flight.values()) if ...]
+for entry in stale:
+    await self._timeout_node(entry)    # each await is a window
+```
+
+A genuine result landing on `results_topic` during that sequence is handled
+concurrently by `_handle_result`, which completes the node — and then
+`_timeout_node`, holding a now-stale snapshot, completes it *again* with a
+synthetic `TimeoutError` outcome.
+
+**The practical fix:** Make untracking the claim. Whichever path removes the
+entry first is the one that gets to complete the node.
+
+```python
+if (entry.canvas_id, entry.node_id) not in self._in_flight:
+    return
+self._untrack(entry.canvas_id, entry.node_id)
+```
+
+---
+
+### 48. A nested container can steal its parent's id and corrupt the graph
+
+**Where:** `mint/worker/canvas/builder.py::Chord.build`, `::Chain.build`
+
+**Symptom:** No error at all — and a persisted graph in which a group is listed
+as its own child.
+
+**Root cause:** A container checks its id *before* building children but writes
+its own node *after* (it needs its children's ids first):
+
+```python
+if self.id in nodes:            # inner container doesn't exist yet
+    raise DuplicateNodeIdError(node_id=self.id)
+for leg in self.legs:
+    leg.build(canvas_id, self.id, nodes)     # inner writes nodes["x"] here
+...
+nodes[self.id] = GroupNode(...)              # and this silently overwrites it
+```
+
+Verified concretely: `Chord([Chord([...], id="x"), Node(...)], id="x")` builds
+without raising and yields `GroupNode(id="x", children=["x", <t3>])`. The inner
+group is gone entirely, its legs' `parent_id` points at a group that no longer
+holds them, `mark_child_done` is called with ids absent from `children`, and
+`get_results(children)` finds nothing for them. Every *other* duplicate-id shape
+raised properly; this one corrupted the graph in silence.
+
+**The practical fix:** Check again after building children, before writing.
+
+```python
+def _reject_duplicate(nodes: dict[str, AnyNode], node_id: str) -> None:
+    if node_id in nodes:
+        raise DuplicateNodeIdError(node_id=node_id)
+```
+
+---
+
+### 49. Twenty RabbitMQ consumers deadlock every publish
+
+**Where:** `mint/worker/brokers/rabbitmq.py::consume`
+
+**Symptom:** An app with enough registered workers starts up, consumes nothing,
+publishes nothing, and reports no error whatsoever.
+
+**Root cause:** `consume()` took its channel from the shared pool and held it for
+the consumer's entire lifetime:
+
+```python
+async with self._ensure_channel_pool().acquire() as channel:   # held until the generator ends
+    ...
+    async for message in iterator:
+        yield RabbitMQDelivery(self, topic, message)
+```
+
+`WorkerApp` shares one broker across every registered worker, and `_publish`
+(used by both `publish` and `redeliver`) draws from that same pool of
+`DEFAULT_CHANNEL_POOL_SIZE = 20`. With 20 workers consuming, every pooled channel
+is permanently held and the first dispatch publish blocks forever on
+`pool.acquire()`. `AMQPRPCExecutor` shares the acquire-a-pooled-channel pattern
+but releases per call, so only this broker deadlocks.
+
+**The practical fix:** Consumers get their own channels on one dedicated
+connection, outside the pool.
+
+```python
+connection = await self._ensure_consumer_connection()
+channel = await connection.channel()
+try:
+    ...
+finally:
+    await channel.close()
+```
+
+**This changed what's safe in tests, and the container lane caught it.** A
+consumer now owns its channel and closes it on finalization, so the
+fire-and-forget `anext(broker.consume(topic))` shape closes the channel out from
+under a delivery still waiting to be acked — a real `ChannelInvalidStateError`.
+The Kafka container tests already documented holding the generator for the test's
+lifetime; the RabbitMQ ones now do the same.
+
+---
+
+### 50. The fix for #39 was itself not injective
+
+**Where:** `mint/worker/brokers/nats.py::_stream_name`
+
+**Symptom:** Same as #39 — two topics sharing a stream and a durable cursor —
+just reached through a less obvious pair of inputs.
+
+**Root cause:** #39's fix escaped `-` as `--` before mapping `.` to `-`:
+
+```python
+return topic.replace("-", "--").replace(".", "-")
+```
+
+That makes *runs of dashes* ambiguous. `a-.b` encodes to `a--` + `-b` = `a---b`;
+`a.-b` encodes to `a-` + `--b` = `a---b`. Identical. Escaping into the same
+character you are escaping *to* cannot be injective, and the docstring claiming
+injectivity made it read as settled.
+
+**The practical fix:** Give each source character its own distinct escape, so
+every `-` in the output is unambiguously a marker followed by exactly one tag:
+
+```python
+DASH_ESCAPE: Final[str] = "-h"
+DOT_ESCAPE: Final[str] = "-d"
+
+return topic.replace("-", self.DASH_ESCAPE).replace(".", self.DOT_ESCAPE)
+```
+
+Regression test: rather than a couple of hand-picked pairs, an exhaustive check
+over *every* topic up to length 5 in the alphabet that actually interacts
+(`.`, `-`, `h`, `d`, and one ordinary letter). Hand-picked examples are what let
+the first fix look correct.
+
+---
+
+### 51. A cancelled RPC call leaks its pending entry
+
+**Where:** `mint/worker/executors/amqp_rpc.py::_await_reply`
+
+**Symptom:** Bug #11's memory leak, back again, in a long-running worker that
+restarts often.
+
+**Root cause:** Cleanup lived only in the timeout branch:
+
+```python
+except TimeoutError as exc:
+    self._pending.pop(correlation_id, None)
+    ...
+```
+
+A *cancelled* call — the ordinary shutdown path, via `Worker._handle` — never
+touches that branch, so its correlation id and future stayed in `_pending` for
+the executor's lifetime.
+
+**The practical fix:** A `finally`, which covers every exit including
+cancellation. Note that `execute()`'s own `finally` already handled the queue
+side correctly — only the map side was missed.
+
+---
+
+### 52. Trace ids die at the first hop
+
+**Where:** `mint/worker/canvas/dispatch.py::Dispatch.to_envelope`
+
+**Symptom:** A canvas started with a trace id is impossible to correlate in logs
+past its entry node.
+
+**Root cause:** Every non-entry message in a canvas is built here, and the field
+simply wasn't carried:
+
+```python
+return Envelope(node_id=self.node_id, canvas_id=self.canvas_id, body=self.body)
+```
+
+`Envelope.trace_id` existed and `Worker._report_result` propagated it, so the
+field looked wired — it just died on the one path every dispatched message takes.
+
+**The practical fix:** `to_envelope(trace_id)`, threaded through by both
+`Worker._advance_canvas` and `Coordinator.dispatch`.
+
+---
+
+### 53. `MemoryBroker.close()` wakes only one consumer per topic
+
+**Where:** `mint/worker/brokers/memory.py::close`
+
+**Symptom:** A test or single-process deployment with two consumers on one topic
+hangs on shutdown.
+
+**Root cause:** `close()` pushes exactly one `None` sentinel per queue. The first
+consumer takes it and returns; every other consumer stays blocked on
+`queue.get()` forever. A `Coordinator` alongside a worker on the same topic is
+exactly that shape.
+
+**The practical fix:** Put the sentinel back on the way out.
+
+```python
+if item is None:
+    await queue.put(None)
+    return
+```
+
+This also keeps a queue drainable after close, which is what makes "was this
+nacked rather than dropped?" checkable at all — a property two existing tests
+depended on, and which a first attempt at this fix (short-circuiting `consume`
+on a `_closed` flag) broke immediately.
+
+---
+
+### 54. The package never passed the project's own `make check`
+
+**Where:** the whole package, plus `pyproject.toml`
+
+**Symptom:** `make check` fails on a repo that is otherwise clean.
+
+**Root cause, two independent halves.**
+
+`make tc` runs `mypy .`, and this package contributed all 65 of the repo's mypy
+errors. The apparent blocker looked structural — `Variable "Input" is not valid
+as a type`, pointing straight at `Worker`'s central `Input`/`Output` class
+attributes. It wasn't. The *tests* named their models `Input`/`Output` at module
+scope and then wrote `Input = Input`, so every later annotation in those class
+bodies resolved to the attribute instead of the model. The usage docs already
+used distinct names (`SyncRefIn`/`SyncRefOut`); the tests just didn't. Renaming
+them removed 31 errors and confirmed the design was never the problem.
+
+`make lint` failed on all 116 files with `CPY001` (missing copyright notice).
+This looked pre-existing — it fires repo-wide, on files this change never touched
+— but master lints clean. The cause was this branch's own lock file, which bumps
+ruff 0.15.22 to 0.16.3, where `CPY001` joins `ALL`. The same bump splits
+`PLR0913` into a second `PLR0917` and adds a `None`-not-last union check.
+
+**The practical fix:** `CPY001` ignored in config (this project carries no
+copyright headers on any file, deliberately); the two storage constructors that
+already carried a `PLR0913` noqa name `PLR0917` alongside it; the one flagged
+union reordered. On the mypy side: a named `TerminalStatus` alias so the engine's
+status ternaries can be annotated, parameterized `ITaskExecutor`/`Worker`,
+`Redis[bytes]`, and stream fields built key by key rather than by `**mapping`
+unpacking (`dict` is invariant in both parameters, so a `Mapping[str, str]` never
+satisfied the widened field type). `RedisBroker.ack` turned out to be
+byte-identical to `_retire` and now delegates, which removed one of the two
+`types-redis` suppressions along with the duplication.
+
+**The lesson worth keeping:** "this failure is pre-existing" is a claim to verify
+against the base branch, not to infer from where the errors appear.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -1944,3 +2435,21 @@ adding a new broker, executor, or engine transition:
 - **When a fix lands on one broker, check its siblings for the same shape.**
   Bug #21's DLQ-terminates-the-chain rule was fixed in RabbitMQ and left broken
   in NATS for exactly as long as nobody looked (issue #40).
+- **Every path out of a handler must settle its delivery exactly once.** Catch
+  more than `CancelledError`, and make sure the "not settled yet" window ends
+  where the ack happens, not where the function returns (issues #41, #42).
+- **A background task nobody awaits needs a done-callback.** Otherwise its
+  exception is never retrieved and the process keeps looking healthy while doing
+  none of its work (issues #44, #45).
+- **A retry path needs a cap.** `Delivery.attempt` is maintained by every broker
+  precisely so something can read it (issue #43).
+- **A cancellation deadline only *requests* cancellation.** Wait for it to land
+  before tearing down anything those tasks are still using (issue #46).
+- **A snapshot plus an `await` per item is a race.** Re-check the claim inside
+  the loop; whoever removes the entry first owns the work (issue #47).
+- **Prove an encoding injective exhaustively, not with examples.** Hand-picked
+  pairs are exactly what let a non-injective fix look correct twice in a row
+  (issues #39, #50).
+- **"Pre-existing" is a claim to verify against the base branch.** A repo-wide
+  lint failure introduced by a lock-file bump looks identical to one that was
+  always there (issue #54).

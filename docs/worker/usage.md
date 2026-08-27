@@ -96,7 +96,14 @@ await app.run()   # consumes every registered topic; SIGTERM/SIGINT -> drain -> 
 Each worker handles at most `Worker.max_concurrency` deliveries at once (32 by
 default; set it as a class attribute). The consume loop stops pulling while that
 many are in flight — the only backpressure Kafka and `MemoryBroker` get, since
-neither has a prefetch of its own.
+neither has a prefetch of its own. A delivery that keeps failing is retried until
+`Worker.max_attempts` (5 by default) is spent, then dead-lettered rather than
+requeued forever.
+
+If a worker's consume loop dies on its own — a dropped broker connection, say —
+the app shuts down rather than staying up while silently consuming nothing from
+that topic. Restarting is the supervisor's job; a dead loop is not recoverable
+in place.
 
 `register()` rejects two workers claiming the same topic, and validates
 `Input`/`Output`/`topic` exist before the app ever starts consuming.
@@ -174,7 +181,7 @@ originating request, a tenant id); it's `None` if you didn't pass one.
 | Broker | `DeliveryGuarantee` | Notes |
 |---|---|---|
 | `brokers.memory.MemoryBroker` | at-least-once | In-process `asyncio.Queue`; for tests and single-process use. |
-| `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. `nack(requeue=True)` republishes with `attempt` bumped rather than using AMQP's native requeue, so the counter is observable — at the cost of ordering on that path. |
+| `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. `nack(requeue=True)` republishes with `attempt` bumped rather than using AMQP's native requeue, so the counter is observable — at the cost of ordering on that path. Consumers hold their own channels on a dedicated connection, never the shared publish pool. |
 | `brokers.redis.RedisBroker` | at-least-once | Streams + consumer groups (`XADD`/`XREADGROUP`/`XACK`). |
 | `brokers.nats.NatsBroker` | at-least-once | JetStream pull consumers with a per-topic durable name. |
 | `brokers.kafka.KafkaBroker` | at-least-once | `auto_offset_reset="earliest"` — a new consumer group sees a topic's backlog, never skips it. |
@@ -196,6 +203,15 @@ standalone and memory-capped.
 Construction never requires a running event loop — every broker builds its
 connection pool lazily, on first actual use, so ordinary synchronous
 DI/container setup works.
+
+**Hold a `consume()` generator for as long as you need its deliveries.** A
+consumer owns broker resources (a RabbitMQ channel, a Kafka consumer) and
+releases them when the generator is finalized, so `await anext(broker.consume(t))`
+as a throwaway expression can close the channel out from under a delivery you
+still intend to ack. `Worker.run()` does the right thing by construction
+(`async for delivery in broker.consume(self.topic):`, held for the loop's
+lifetime); anything driving a broker directly should keep the generator in a
+variable and pull every delivery from that same one.
 
 ## Executors
 

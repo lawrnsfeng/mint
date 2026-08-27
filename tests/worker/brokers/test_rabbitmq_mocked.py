@@ -222,7 +222,7 @@ class TestPublish:
 
 
 class TestDelivery:
-    """RabbitMQDelivery: ack/nack map directly onto the underlying message."""
+    """RabbitMQDelivery: ack maps onto the message; requeue republishes with attempt bumped."""
 
     def _message(self, mocker: "MockerFixture", headers: dict | None = None) -> AsyncMock:
         message = mocker.AsyncMock()
@@ -230,44 +230,72 @@ class TestDelivery:
         message.headers = headers
         return message
 
+    def _delivery(
+        self,
+        mocker: "MockerFixture",
+        headers: dict | None = None,
+    ) -> tuple[RabbitMQDelivery, AsyncMock, AsyncMock]:
+        broker = mocker.AsyncMock()
+        message = self._message(mocker, headers)
+        return RabbitMQDelivery(broker, TOPIC, message), broker, message
+
     async def test_ack_calls_message_ack(self, mocker: "MockerFixture") -> None:
         """ack() must call the underlying message's ack()."""
-        message = self._message(mocker)
-        delivery = RabbitMQDelivery(message)
+        delivery, _, message = self._delivery(mocker)
 
         await delivery.ack()
 
         message.ack.assert_awaited_once()
 
-    async def test_nack_requeue_true_calls_reject_with_requeue_true(
+    async def test_nack_requeue_true_republishes_with_the_attempt_incremented(
         self,
         mocker: "MockerFixture",
     ) -> None:
-        """A requeued nack must call reject(requeue=True), not the dangerous default."""
-        message = self._message(mocker)
-        delivery = RabbitMQDelivery(message)
+        """AMQP's native requeue can't touch headers, so attempt stayed 1 here forever.
+
+        Every other broker increments it and ``IBroker``'s documented contract
+        says it does, so a requeue republishes with the count bumped instead.
+        """
+        delivery, broker, message = self._delivery(mocker, headers={ATTEMPT_HEADER: 2})
 
         await delivery.nack(requeue=True)
 
-        message.reject.assert_awaited_once_with(requeue=True)
+        broker.redeliver.assert_awaited_once_with(TOPIC, message, 3)
+        message.reject.assert_not_awaited()
+
+    async def test_nack_requeue_true_acks_the_original_only_after_republishing(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """Publish first, ack second — a crash mid-sequence must duplicate, never drop."""
+        delivery, broker, message = self._delivery(mocker)
+        order: list[str] = []
+        broker.redeliver.side_effect = lambda *_: order.append("redeliver")
+        message.ack.side_effect = lambda: order.append("ack")
+
+        await delivery.nack(requeue=True)
+
+        assert order == ["redeliver", "ack"]
 
     async def test_nack_requeue_false_calls_reject_with_requeue_false(
         self,
         mocker: "MockerFixture",
     ) -> None:
-        """Regression for bug #9: requeue=False must be explicit, routed to the DLQ by the DLX."""
-        message = self._message(mocker)
-        delivery = RabbitMQDelivery(message)
+        """Regression for bug #9: requeue=False must be explicit, routed to the DLQ by the DLX.
+
+        Still a native reject — that is what actually engages the queue's
+        dead-letter exchange; only the requeue path changed.
+        """
+        delivery, broker, message = self._delivery(mocker)
 
         await delivery.nack(requeue=False)
 
         message.reject.assert_awaited_once_with(requeue=False)
+        broker.redeliver.assert_not_awaited()
 
     async def test_attempt_defaults_to_one_with_no_headers(self, mocker: "MockerFixture") -> None:
         """A message with no headers at all must default to attempt 1."""
-        message = self._message(mocker, headers=None)
-
-        delivery = RabbitMQDelivery(message)
+        delivery, _, _ = self._delivery(mocker, headers=None)
 
         assert delivery.attempt == 1
 
@@ -276,9 +304,7 @@ class TestDelivery:
         mocker: "MockerFixture",
     ) -> None:
         """A well-formed attempt header must be honored."""
-        message = self._message(mocker, headers={ATTEMPT_HEADER: 3})
-
-        delivery = RabbitMQDelivery(message)
+        delivery, _, _ = self._delivery(mocker, headers={ATTEMPT_HEADER: 3})
 
         assert delivery.attempt == 3
 
@@ -287,11 +313,53 @@ class TestDelivery:
         mocker: "MockerFixture",
     ) -> None:
         """A malformed attempt header must not raise — fall back to 1."""
-        message = self._message(mocker, headers={ATTEMPT_HEADER: "not-an-int"})
-
-        delivery = RabbitMQDelivery(message)
+        delivery, _, _ = self._delivery(mocker, headers={ATTEMPT_HEADER: "not-an-int"})
 
         assert delivery.attempt == 1
+
+
+class TestAttemptHeaderIsPublished:
+    """The attempt header has to actually be written, or reading it back is meaningless."""
+
+    async def test_publish_stamps_attempt_one(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+    ) -> None:
+        """Nothing wrote ATTEMPT_HEADER before, so every delivery read the default of 1."""
+        await broker.publish(TOPIC, b"body")
+
+        (message,), _ = mock_channel.declare_exchange.return_value.publish.await_args
+        assert message.headers[ATTEMPT_HEADER] == 1
+
+    async def test_publish_keeps_caller_headers_alongside_the_attempt(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+    ) -> None:
+        """Stamping the attempt must not clobber whatever the caller passed."""
+        await broker.publish(TOPIC, b"body", headers={"trace": "abc"})
+
+        (message,), _ = mock_channel.declare_exchange.return_value.publish.await_args
+        assert message.headers["trace"] == "abc"
+        assert message.headers[ATTEMPT_HEADER] == 1
+
+    async def test_redeliver_replaces_rather_than_duplicates_the_attempt_header(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """The bumped count must overwrite the old one, with other headers preserved."""
+        original = mocker.AsyncMock()
+        original.body = b"body"
+        original.headers = {ATTEMPT_HEADER: 1, "trace": "abc"}
+
+        await broker.redeliver(TOPIC, original, 2)
+
+        (message,), _ = mock_channel.declare_exchange.return_value.publish.await_args
+        assert message.headers[ATTEMPT_HEADER] == 2
+        assert message.headers["trace"] == "abc"
 
 
 class TestGuaranteeAndClose:

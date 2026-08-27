@@ -6,6 +6,11 @@ simply lost, with no record it ever existed. Redis Streams with a consumer group
 keep every read message in that group's Pending Entries List until ``XACK``
 removes it, so a crash before ack leaves it recoverable rather than gone.
 
+``redeliver``/``deadletter`` write the replacement entry *before* retiring the
+original, so a crash mid-sequence duplicates a message rather than losing one —
+the reverse order reintroduced exactly the at-most-once hole this rewrite exists
+to close.
+
 Not yet implemented: reclaiming PEL entries abandoned by a crashed consumer
 (``XAUTOCLAIM``) — today a message survives a crash but needs another consumer
 to eventually re-read it via ``XREADGROUP``'s own-pending-first semantics or an
@@ -145,25 +150,40 @@ class RedisBroker:
         await self.client.xdel(entry.topic, entry.message_id)
 
     async def redeliver(self, entry: StreamEntry) -> None:
-        """Ack the old message and re-append ``entry`` (already bumped) in its place."""
-        await self.client.xack(entry.topic, self.group, entry.message_id)
-        await self.client.xdel(entry.topic, entry.message_id)
+        """Re-append ``entry`` (already bumped), then retire the original.
+
+        The new entry is written *before* the old one is acked and deleted. The
+        reverse order left a window where a crash between the delete and the add
+        lost the message outright — exactly the at-most-once behaviour bug #8's
+        Streams rewrite existed to eliminate. This way a crash mid-sequence
+        duplicates instead, which the canvas engine's idempotent fan-in already
+        handles.
+        """
         fields: dict[bytes | str, bytes | float | str] = {
             self.BODY_FIELD: entry.body,
             self.ATTEMPT_FIELD: entry.attempt,
             **(entry.headers or {}),
         }
         await self.client.xadd(entry.topic, fields)
+        await self._retire(entry)
 
     async def deadletter(self, entry: StreamEntry) -> None:
-        """Ack the old message and append it to its topic's dead-letter stream."""
-        await self.client.xack(entry.topic, self.group, entry.message_id)
-        await self.client.xdel(entry.topic, entry.message_id)
+        """Append ``entry`` to its topic's dead-letter stream, then retire the original.
+
+        Same ordering as ``redeliver``, for the same reason: write first, retire
+        second, so a crash duplicates rather than drops.
+        """
         fields: dict[bytes | str, bytes | float | str] = {
             self.BODY_FIELD: entry.body,
             **(entry.headers or {}),
         }
         await self.client.xadd(f"{entry.topic}{self.DLQ_SUFFIX}", fields)
+        await self._retire(entry)
+
+    async def _retire(self, entry: StreamEntry) -> None:
+        """Ack ``entry`` out of the pending list and delete it from its stream."""
+        await self.client.xack(entry.topic, self.group, entry.message_id)
+        await self.client.xdel(entry.topic, entry.message_id)
 
     async def close(self) -> None:
         """Release the underlying Redis connection."""

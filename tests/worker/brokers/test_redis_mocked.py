@@ -306,3 +306,41 @@ class TestGuaranteeAndClose:
 
         mock_from_url.assert_called_once_with("redis://example:6379/0")
         assert client is broker.client  # cached, not reconstructed
+
+
+class TestRedeliveryOrdering:
+    """The replacement entry must be written before the original is retired."""
+
+    @staticmethod
+    def _call_order(mock_client: AsyncMock) -> list[str]:
+        """Return the client method names in the order they were awaited."""
+        return [name for name, *_ in mock_client.mock_calls if name in {"xadd", "xack", "xdel"}]
+
+    async def test_requeue_adds_the_new_entry_before_acking_the_old(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """XACK/XDEL first left a window where a crash lost the message outright.
+
+        That is precisely the at-most-once behaviour bug #8's Streams rewrite
+        exists to eliminate; writing first means a crash duplicates instead, which
+        the engine's idempotent fan-in already absorbs.
+        """
+        delivery = RedisStreamDelivery(broker, StreamEntry(TOPIC, b"1-1", b"body", 1))
+
+        await delivery.nack(requeue=True)
+
+        assert self._call_order(mock_client) == ["xadd", "xack", "xdel"]
+
+    async def test_dead_letter_adds_to_the_dlq_before_acking_the_old(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Same ordering on the dead-letter path — evidence must be written before it's dropped."""
+        delivery = RedisStreamDelivery(broker, StreamEntry(TOPIC, b"1-1", b"body", 1))
+
+        await delivery.nack(requeue=False)
+
+        assert self._call_order(mock_client) == ["xadd", "xack", "xdel"]

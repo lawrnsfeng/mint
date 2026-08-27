@@ -72,17 +72,26 @@ class TestDeadLetterRegression:
         assert dead.body == b"doomed payload"
         await dead.ack()
 
-    async def test_nack_requeue_true_redelivers_on_the_same_topic(
+    async def test_nack_requeue_true_redelivers_with_an_incremented_attempt(
         self,
         broker: RabbitMQBroker,
     ) -> None:
-        """A requeued nack must bring the message back on its original topic."""
+        """A requeued nack must come back on its own topic with the attempt bumped.
+
+        Only a real broker proves this: AMQP's native ``reject(requeue=True)``
+        redelivers the original frame, so its headers can't be rewritten and
+        ``attempt`` stayed 1 forever — while Redis, Kafka and MemoryBroker all
+        increment it and ``IBroker``'s contract says so. A mock accepts either
+        shape without complaint.
+        """
         topic = unique_topic()
         await broker.publish(topic, b"retry me")
         first = await anext(broker.consume(topic))
+        assert first.attempt == 1
 
         await first.nack(requeue=True)
 
         second = await asyncio.wait_for(anext(broker.consume(topic)), timeout=10)
         assert second.body == b"retry me"
+        assert second.attempt == 2
         await second.ack()

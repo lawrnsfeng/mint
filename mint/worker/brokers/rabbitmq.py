@@ -6,6 +6,15 @@ dead-letter exchange, so every rejected message vanished — RabbitMQ drops a
 non-requeued message with nowhere configured to route it to. Here, every queue is
 declared with ``x-dead-letter-exchange`` pointing at its own DLX, so
 ``nack(requeue=False)`` reliably lands in ``{topic}.dlq`` instead of disappearing.
+
+Found by review: ``ATTEMPT_HEADER`` was read off incoming messages but never
+written by anything, and AMQP's native ``reject(requeue=True)`` redelivers the
+original frame with its headers untouchable — so ``attempt`` was permanently 1
+here while Redis, Kafka and ``MemoryBroker`` all increment it, and
+``docs/worker/usage.md`` documented the incrementing behaviour as universal.
+``publish`` now stamps the header and a requeue republishes with it bumped, the
+same shape the other brokers already use. The cost is that a requeued message
+goes to the back of the queue rather than being redelivered in place.
 """
 
 from collections.abc import AsyncIterator, Mapping
@@ -19,6 +28,7 @@ from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractQueue,
     AbstractRobustConnection,
+    FieldValue,
 )
 from aio_pika.pool import Pool
 
@@ -49,8 +59,15 @@ ATTEMPT_HEADER: Final[str] = "x-mint-attempt"
 class RabbitMQDelivery:
     """One delivered message, wrapping aio_pika's incoming message with ack/nack."""
 
-    def __init__(self, message: AbstractIncomingMessage) -> None:
+    def __init__(
+        self,
+        broker: "RabbitMQBroker",
+        topic: str,
+        message: AbstractIncomingMessage,
+    ) -> None:
         """Wrap ``message``, reading its attempt count from headers (default 1)."""
+        self._broker = broker
+        self._topic = topic
         self._message = message
         self.body = message.body
         headers = message.headers or {}
@@ -62,8 +79,27 @@ class RabbitMQDelivery:
         await self._message.ack()
 
     async def nack(self, *, requeue: bool) -> None:
-        """Reject this message. requeue=False routes it to the topic's dead-letter queue."""
-        await self._message.reject(requeue=requeue)
+        """Republish with an incremented attempt, or reject into the topic's DLQ.
+
+        A requeue is a republish-then-ack rather than ``reject(requeue=True)``.
+        AMQP's native requeue redelivers the *original* frame, so its headers
+        can't be touched and ``attempt`` stayed 1 forever — while every other
+        broker here increments it, and ``IBroker``'s documented contract says it
+        does. The message is published before the original is acked, so a crash
+        mid-sequence duplicates rather than drops.
+
+        The tradeoff, deliberately taken for a uniform and observable attempt
+        counter: a requeued message goes to the back of the queue instead of
+        being redelivered in place, so requeue no longer preserves ordering.
+
+        ``requeue=False`` still uses a native reject, which is what routes the
+        message through the queue's dead-letter exchange (bug #9).
+        """
+        if not requeue:
+            await self._message.reject(requeue=False)
+            return
+        await self._broker.redeliver(self._topic, self._message, self.attempt + 1)
+        await self._message.ack()
 
 
 class RabbitMQBroker:
@@ -163,13 +199,35 @@ class RabbitMQBroker:
         headers: Mapping[str, str] | None = None,
     ) -> None:
         """Publish ``message`` to ``topic``, declaring it (and its DLX) if needed."""
+        await self._publish(topic, message, headers or {}, attempt=1)
+
+    async def redeliver(
+        self,
+        topic: str,
+        message: AbstractIncomingMessage,
+        attempt: int,
+    ) -> None:
+        """Republish ``message`` to ``topic`` carrying ``attempt`` as its new count."""
+        kept = {
+            key: value for key, value in (message.headers or {}).items() if key != ATTEMPT_HEADER
+        }
+        await self._publish(topic, message.body, kept, attempt=attempt)
+
+    async def _publish(
+        self,
+        topic: str,
+        body: bytes,
+        headers: Mapping[str, FieldValue],
+        *,
+        attempt: int,
+    ) -> None:
         async with self._ensure_channel_pool().acquire() as channel:
             exchange, _ = await self._declare_topic(channel, topic)
             await exchange.publish(
                 Message(
-                    body=message,
+                    body=body,
                     delivery_mode=DeliveryMode.PERSISTENT,
-                    headers=dict(headers) if headers else None,
+                    headers={**headers, ATTEMPT_HEADER: attempt},
                 ),
                 routing_key=topic,
             )
@@ -181,7 +239,7 @@ class RabbitMQBroker:
             _, queue = await self._declare_topic(channel, topic)
             async with queue.iterator() as iterator:
                 async for message in iterator:
-                    yield RabbitMQDelivery(message)
+                    yield RabbitMQDelivery(self, topic, message)
 
     async def close(self) -> None:
         """Close both the channel and connection pools, if they were ever built."""

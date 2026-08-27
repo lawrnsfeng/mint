@@ -1,6 +1,6 @@
 ---
 site_name: mint
-site_description: File storage, concurrency, and a Postgres repository layer
+site_description: File storage, concurrency, a Postgres repository layer, and an async canvas worker
 site_url: https://lawrnsfeng.github.io/mint/
 repo_url: https://github.com/lawrnsfeng/mint
 repo_name: lawrnsfeng/mint
@@ -31,6 +31,10 @@ nav:
       - Usage: db/usage.md
       - API Reference: db/api.md
       - Implementation Notes: db-repository-implementation-notes.md
+  - Worker:
+      - Usage: worker/usage.md
+      - API Reference: worker/api.md
+      - Implementation Notes: worker-implementation-notes.md
   - Utils:
       - Usage: utils/usage.md
       - API Reference: utils/api.md

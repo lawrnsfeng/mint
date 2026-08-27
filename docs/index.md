@@ -1,8 +1,9 @@
 # mint
 
 Practical utility library: async file storage backends behind a common
-protocol, the concurrency primitives they're built on, and a generic
-SQLModel-based repository layer for Postgres.
+protocol, the concurrency primitives they're built on, a generic
+SQLModel-based repository layer for Postgres, and an async canvas worker for
+chain/chord task orchestration over a broker.
 
 ## What's in here
 
@@ -17,6 +18,15 @@ SQLModel-based repository layer for Postgres.
   hand-written custom queries), single-query pagination-with-count,
   insert-or-update (`upsert`), multi-repository atomic transactions, and
   read-only materialized-view-backed tables.
+- **[Worker](worker/usage.md)** — `Worker[T, RT]`/`WorkerApp` for chain
+  (sequence) and chord (fan-out/fan-in) task orchestration, fully async and
+  by default with no orchestrator process (each worker advances the canvas
+  itself, right after finishing its own task). Four broker implementations
+  (RabbitMQ, Redis, NATS, Kafka) behind one `IBroker` Protocol, all
+  at-least-once and tested against a shared contract suite; five executor
+  strategies (inline, thread pool, process pool, gRPC, AMQP-RPC) behind one
+  `ITaskExecutor` Protocol; an opt-in centralized `Coordinator` mode adding
+  `cancel(canvas_id)` and a timeout sweeper on top of the same engine.
 - **[Utils](utils/usage.md)** — `ConcurrencyLimiter` (reentrant async
   semaphore wrapper) and `Batch` (splitting a sequence/iterator into sized
   batches for bounded concurrent fan-out).
@@ -38,6 +48,7 @@ only what you need:
 uv sync --group azure   # AzureBlobStorage
 uv sync --group s3      # S3Storage
 uv sync --group db      # mint.db (SQLModel + asyncpg + psycopg2)
+uv sync --group worker  # mint.worker (redis, aio-pika, nats-py, aiokafka, grpcio)
 ```
 
 ## Where to go next
@@ -45,6 +56,11 @@ uv sync --group db      # mint.db (SQLModel + asyncpg + psycopg2)
 - **[File Storage usage](fs/usage.md)** / **[API reference](fs/api.md)**
   — construction options for both backends, recursive copy/remove via
   `sprout.Executor`, known behavioral gaps between them.
+- **[Worker usage](worker/usage.md)** / **[API reference](worker/api.md)**
+  / **[Implementation Notes](worker-implementation-notes.md)** — the
+  `Chain`/`Chord` DSL, embedded vs. centralized deployment modes, every
+  broker/executor, and a 17-bug catalogue with a migration mapping from an
+  internal predecessor.
 - **[DB Repository Layer usage](db/usage.md)** / **[API
   reference](db/api.md)** — the deepest guide in this site: design
   rationale, every method and option, real-world schema shapes, and

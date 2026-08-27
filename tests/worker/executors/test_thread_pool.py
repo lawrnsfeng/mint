@@ -38,7 +38,7 @@ class TestExecute:
 
     async def test_execute_returns_the_coroutines_result(self) -> None:
         """The executor must return exactly what the function returns."""
-        executor = ThreadPoolExecutor()
+        executor: ThreadPoolExecutor[int, int] = ThreadPoolExecutor()
 
         result = await executor.execute(double, 21)
 
@@ -47,7 +47,7 @@ class TestExecute:
 
     async def test_execute_propagates_exceptions(self) -> None:
         """A failing function's exception must propagate, not be swallowed."""
-        executor = ThreadPoolExecutor()
+        executor: ThreadPoolExecutor[int, int] = ThreadPoolExecutor()
 
         with pytest.raises(ValueError, match="boom: 5"):
             await executor.execute(boom, 5)
@@ -61,7 +61,7 @@ class TestExecute:
         heartbeat would be starved for the whole ``BLOCK_SECONDS`` and this count
         would come back at (or near) zero.
         """
-        executor = ThreadPoolExecutor()
+        executor: ThreadPoolExecutor[int, int] = ThreadPoolExecutor()
         ticks = 0
         stop = asyncio.Event()
 
@@ -85,7 +85,7 @@ class TestAclose:
 
     async def test_aclose_shuts_down_a_pool_it_built_itself(self) -> None:
         """An executor-built pool must actually be shut down."""
-        executor = ThreadPoolExecutor(max_workers=1)
+        executor: ThreadPoolExecutor[int, int] = ThreadPoolExecutor(max_workers=1)
 
         await executor.aclose()
 
@@ -94,7 +94,7 @@ class TestAclose:
     async def test_aclose_does_not_shut_down_an_adopted_pool(self) -> None:
         """A pool passed in by the caller is owned by the caller, not this executor."""
         adopted = StdlibThreadPoolExecutor(max_workers=1)
-        executor = ThreadPoolExecutor(pool=adopted)
+        executor: ThreadPoolExecutor[int, int] = ThreadPoolExecutor(pool=adopted)
 
         await executor.aclose()
 

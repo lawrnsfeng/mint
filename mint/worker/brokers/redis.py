@@ -29,6 +29,28 @@ from mint.worker.enums import DeliveryGuarantee
 
 BUSYGROUP_MARKER: Final[str] = "BUSYGROUP"
 
+type StreamFields = dict[bytes | str, bytes | float | str]
+
+
+def _stream_fields(
+    body: bytes,
+    headers: Mapping[bytes, bytes] | Mapping[str, str] | None,
+    attempt: int | None = None,
+) -> StreamFields:
+    """Build one stream entry's field map, with headers copied in one key at a time.
+
+    Built explicitly rather than with ``**headers``: a ``Mapping[str, str]`` is not
+    a ``SupportsKeysAndGetItem[bytes | str, bytes | float | str]``, because ``dict``
+    is invariant in its key and value types. Copying key by key widens each entry
+    where it's actually added.
+    """
+    fields: StreamFields = {RedisBroker.BODY_FIELD: body}
+    if attempt is not None:
+        fields[RedisBroker.ATTEMPT_FIELD] = attempt
+    for key, value in (headers or {}).items():
+        fields[key] = value
+    return fields
+
 
 @dataclass(frozen=True)
 class StreamEntry:
@@ -87,10 +109,10 @@ class RedisBroker:
         self.group = group
         self.consumer_name = consumer_name or str(uuid4())
         self.block_ms = block_ms
-        self._client: Redis | None = None
+        self._client: Redis[bytes] | None = None
 
     @property
-    def client(self) -> Redis:
+    def client(self) -> "Redis[bytes]":
         """Return the lazily-connected Redis client."""
         if self._client is None:
             self._client = Redis.from_url(self.uri)
@@ -112,12 +134,7 @@ class RedisBroker:
     ) -> None:
         """Publish ``message`` to ``topic``'s stream, creating the stream/group if needed."""
         await self._ensure_group(topic)
-        fields: dict[bytes | str, bytes | float | str] = {
-            self.BODY_FIELD: message,
-            self.ATTEMPT_FIELD: 1,
-            **(headers or {}),
-        }
-        await self.client.xadd(topic, fields)
+        await self.client.xadd(topic, _stream_fields(message, headers, attempt=1))
 
     async def consume(self, topic: str) -> AsyncIterator[RedisStreamDelivery]:
         """Yield deliveries from ``topic``'s stream via this broker's consumer group."""
@@ -146,8 +163,7 @@ class RedisBroker:
 
     async def ack(self, entry: StreamEntry) -> None:
         """Acknowledge and remove ``entry`` from its stream."""
-        await self.client.xack(entry.topic, self.group, entry.message_id)
-        await self.client.xdel(entry.topic, entry.message_id)
+        await self._retire(entry)
 
     async def redeliver(self, entry: StreamEntry) -> None:
         """Re-append ``entry`` (already bumped), then retire the original.
@@ -159,11 +175,7 @@ class RedisBroker:
         duplicates instead, which the canvas engine's idempotent fan-in already
         handles.
         """
-        fields: dict[bytes | str, bytes | float | str] = {
-            self.BODY_FIELD: entry.body,
-            self.ATTEMPT_FIELD: entry.attempt,
-            **(entry.headers or {}),
-        }
+        fields = _stream_fields(entry.body, entry.headers, attempt=entry.attempt)
         await self.client.xadd(entry.topic, fields)
         await self._retire(entry)
 
@@ -173,16 +185,19 @@ class RedisBroker:
         Same ordering as ``redeliver``, for the same reason: write first, retire
         second, so a crash duplicates rather than drops.
         """
-        fields: dict[bytes | str, bytes | float | str] = {
-            self.BODY_FIELD: entry.body,
-            **(entry.headers or {}),
-        }
+        fields = _stream_fields(entry.body, entry.headers)
         await self.client.xadd(f"{entry.topic}{self.DLQ_SUFFIX}", fields)
         await self._retire(entry)
 
     async def _retire(self, entry: StreamEntry) -> None:
         """Ack ``entry`` out of the pending list and delete it from its stream."""
-        await self.client.xack(entry.topic, self.group, entry.message_id)
+        # types-redis declares xack() without annotations, so mypy sees an untyped
+        # call in a typed context. Nothing on our side can make it typed.
+        await self.client.xack(  # type: ignore[no-untyped-call]
+            entry.topic,
+            self.group,
+            entry.message_id,
+        )
         await self.client.xdel(entry.topic, entry.message_id)
 
     async def close(self) -> None:
@@ -191,4 +206,4 @@ class RedisBroker:
             # redis-py's own .close() is deprecated in favor of .aclose() since
             # 5.0.1, but the installed stub package doesn't declare aclose() on
             # Redis (verified) even though it exists and works at runtime.
-            await self._client.aclose()  # ty: ignore[unresolved-attribute]
+            await self._client.aclose()  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]

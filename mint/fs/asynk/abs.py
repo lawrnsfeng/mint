@@ -93,7 +93,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
     ContentDispositionFormat: Final[str] = "attachment; filename*=UTF-8''{filename_utf8}"
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         container_name: str,
         storage_account_name: str,
@@ -669,7 +669,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
     async def _remove_many_files(
         self,
         filepaths: Sequence[str],
-    ) -> list[None | BaseException]:
+    ) -> list[BaseException | None]:
         """Remove multiple files in batches.
 
         Args:
@@ -679,7 +679,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             List of results (None for success, exception for failure).
 
         """
-        results: list[None | BaseException] = []
+        results: list[BaseException | None] = []
         for batch in Batch.seq(filepaths):
             results.extend(
                 await asyncio.gather(

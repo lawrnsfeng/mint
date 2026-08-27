@@ -304,13 +304,21 @@ class TestAclose:
 
     async def test_aclose_before_any_pool_is_built_is_a_no_op(self) -> None:
         """An executor that never touched RabbitMQ must not construct pools to close them."""
-        instance = AMQPRPCExecutor(QUEUE, "amqp://fake", EchoOutput)
+        instance: AMQPRPCExecutor[EchoInput, EchoOutput] = AMQPRPCExecutor(
+            QUEUE,
+            "amqp://fake",
+            EchoOutput,
+        )
 
         await instance.aclose()  # must not raise
 
     async def test_aclose_closes_both_pools(self, mocker: "MockerFixture") -> None:
         """close() must release the channel pool and the connection pool."""
-        instance = AMQPRPCExecutor(QUEUE, "amqp://fake", EchoOutput)
+        instance: AMQPRPCExecutor[EchoInput, EchoOutput] = AMQPRPCExecutor(
+            QUEUE,
+            "amqp://fake",
+            EchoOutput,
+        )
         fake_channel_pool = FakePool(mocker.create_autospec(AbstractChannel, instance=True))
         fake_connection_pool = FakePool(mocker.MagicMock())
         instance._channel_pool = fake_channel_pool

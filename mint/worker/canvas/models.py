@@ -6,6 +6,9 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 from mint.worker.enums import ErrorPolicy, NodeStatus, NodeType
 
+type TerminalStatus = Literal[NodeStatus.FINISHED, NodeStatus.ERROR]
+"""The only two statuses a NodeOutcome can carry: a node either finished or errored."""
+
 
 class ErrorInfo(BaseModel):
     """Serializable snapshot of a failure."""
@@ -69,7 +72,7 @@ class NodeOutcome(BaseModel):
     """Recorded result of a node (or a compound chain/group) reaching a terminal state."""
 
     node_id: str
-    status: Literal[NodeStatus.FINISHED, NodeStatus.ERROR]
+    status: TerminalStatus
     result: str | None = None
     error: ErrorInfo | None = None
 

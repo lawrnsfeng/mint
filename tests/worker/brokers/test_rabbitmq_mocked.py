@@ -243,7 +243,11 @@ class TestPublish:
 class TestDelivery:
     """RabbitMQDelivery: ack maps onto the message; requeue republishes with attempt bumped."""
 
-    def _message(self, mocker: "MockerFixture", headers: dict | None = None) -> AsyncMock:
+    def _message(
+        self,
+        mocker: "MockerFixture",
+        headers: dict[str, object] | None = None,
+    ) -> AsyncMock:
         message = mocker.AsyncMock()
         message.body = b"body"
         message.headers = headers
@@ -252,7 +256,7 @@ class TestDelivery:
     def _delivery(
         self,
         mocker: "MockerFixture",
-        headers: dict | None = None,
+        headers: dict[str, object] | None = None,
     ) -> tuple[RabbitMQDelivery, AsyncMock, AsyncMock]:
         broker = mocker.AsyncMock()
         message = self._message(mocker, headers)

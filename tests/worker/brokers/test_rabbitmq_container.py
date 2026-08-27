@@ -5,6 +5,15 @@ lands in the dead-letter queue instead of vanishing. Run standalone, memory-capp
 per the project's standing rule: ``make test-worker-capped
 TARGET=tests/worker/brokers/test_rabbitmq_container.py``. Never bundled with
 another broker's container test.
+
+Every test here keeps its ``consume()`` async generator alive in a named local for
+the whole test and pulls every delivery from that *same* generator — mirroring how
+``Worker.run()`` drives it (``async for delivery in broker.consume(topic):``, held
+for the loop's lifetime), and never the fire-and-forget ``anext(broker.consume(t))``
+shape. A consumer owns its channel and closes it when the generator is finalized,
+so a dropped generator closes the channel out from under any delivery still
+waiting to be acked — a real ``ChannelInvalidStateError``, caught live here. The
+Kafka container tests carry the same rule for the same underlying reason.
 """
 
 import asyncio
@@ -63,12 +72,14 @@ class TestDeadLetterRegression:
         """The exact scenario that used to silently drop messages."""
         topic = unique_topic()
         await broker.publish(topic, b"doomed payload")
-        delivery = await anext(broker.consume(topic))
+        consumer = broker.consume(topic)
+        delivery = await anext(consumer)
 
         await delivery.nack(requeue=False)
 
         dlq_topic = f"{topic}{RabbitMQBroker.DLQ_SUFFIX}"
-        dead = await asyncio.wait_for(anext(broker.consume(dlq_topic)), timeout=10)
+        dlq_consumer = broker.consume(dlq_topic)
+        dead = await asyncio.wait_for(anext(dlq_consumer), timeout=10)
         assert dead.body == b"doomed payload"
         await dead.ack()
 
@@ -86,12 +97,13 @@ class TestDeadLetterRegression:
         """
         topic = unique_topic()
         await broker.publish(topic, b"retry me")
-        first = await anext(broker.consume(topic))
+        consumer = broker.consume(topic)
+        first = await anext(consumer)
         assert first.attempt == 1
 
         await first.nack(requeue=True)
 
-        second = await asyncio.wait_for(anext(broker.consume(topic)), timeout=10)
+        second = await asyncio.wait_for(anext(consumer), timeout=10)
         assert second.body == b"retry me"
         assert second.attempt == 2
         await second.ack()

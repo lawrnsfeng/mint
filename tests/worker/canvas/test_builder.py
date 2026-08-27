@@ -120,7 +120,7 @@ class TestFlattening:
         inner = Chain([Node(topic="a", id="a"), Node(topic="b", id="b")])
         outer = Chain([Node(topic="z", id="z", input="{}"), inner, Node(topic="c", id="c")])
 
-        nodes: dict = {}
+        nodes: dict[str, AnyNode] = {}
         outer.build("canvas1", None, nodes)
 
         chain_node = nodes[outer.id]
@@ -151,7 +151,7 @@ class TestDuplicateIds:
 
     def test_a_chain_whose_own_id_collides_with_an_existing_node_is_rejected(self) -> None:
         """The chain's *own* id, not just a step's, must be checked against the graph so far."""
-        nodes: dict = {}
+        nodes: dict[str, AnyNode] = {}
         Node(topic="other", id="dup").build("canvas1", None, nodes)
         chain = Chain([Node(topic="t1", id="n1")], id="dup")
 
@@ -160,7 +160,7 @@ class TestDuplicateIds:
 
     def test_a_chord_whose_own_id_collides_with_an_existing_node_is_rejected(self) -> None:
         """The chord's *own* id, not just a leg's, must be checked against the graph so far."""
-        nodes: dict = {}
+        nodes: dict[str, AnyNode] = {}
         Node(topic="other", id="dup").build("canvas1", None, nodes)
         chord = Chord([Node(topic="t1", id="n1")], callback=None, id="dup")
 
@@ -255,7 +255,7 @@ class TestCanvasIdPropagation:
             id="group1",
         )
 
-        nodes: dict = {}
+        nodes: dict[str, AnyNode] = {}
         group.build("canvas-x", None, nodes)
 
         assert set(nodes) == {"a", "b", "c", inner_chain.id, "group1", "cb"}

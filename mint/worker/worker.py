@@ -9,7 +9,7 @@ than leaving its delivery stranded unacked.
 
 import asyncio
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 from pydantic import BaseModel, ValidationError
 
@@ -64,7 +64,7 @@ class WorkerBinding:
     broker: IBroker
     store: ICanvasStore
     engine: CanvasEngine
-    executor: ITaskExecutor
+    executor: ITaskExecutor[Any, Any]
     results_topic: str | None = None
 
 
@@ -368,7 +368,7 @@ class Worker[T: BaseModel, RT: BaseModel]:
         self,
         input_obj: T,
         node_id: str,
-        executor: ITaskExecutor,
+        executor: ITaskExecutor[Any, Any],
     ) -> tuple[NodeOutcome, RT | None]:
         try:
             await self.before_start(input_obj)

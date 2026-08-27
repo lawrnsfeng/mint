@@ -6,7 +6,7 @@ and with what arguments — that a crashed consumer's message is actually still
 recoverable is a real-concurrency property, covered in test_redis_container.py.
 """
 
-from dataclasses import replace
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
@@ -213,9 +213,23 @@ class TestConsume:
 class TestAckNack:
     """RedisStreamDelivery.ack()/nack() must map onto XACK/XDEL/XADD correctly."""
 
-    def _entry(self, **overrides: object) -> StreamEntry:
-        default = StreamEntry(topic=TOPIC, message_id=b"1-0", body=b"payload", attempt=1)
-        return replace(default, **overrides)
+    def _entry(
+        self,
+        *,
+        topic: str = TOPIC,
+        message_id: bytes = b"1-0",
+        body: bytes = b"payload",
+        attempt: int = 1,
+        headers: Mapping[bytes, bytes] | None = None,
+    ) -> StreamEntry:
+        """Build a StreamEntry, overriding whichever fields a test cares about."""
+        return StreamEntry(
+            topic=topic,
+            message_id=message_id,
+            body=body,
+            attempt=attempt,
+            headers=headers,
+        )
 
     async def test_ack_acks_and_deletes(self, broker: RedisBroker, mock_client: AsyncMock) -> None:
         """ack() must XACK then XDEL the same entry, and nothing else."""

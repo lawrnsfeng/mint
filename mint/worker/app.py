@@ -10,7 +10,7 @@ import asyncio
 import contextlib
 import signal
 from functools import partial
-from typing import Final
+from typing import Any, Final
 
 from mint.logger import get_logger
 from mint.worker.brokers.interface import IBroker
@@ -36,7 +36,7 @@ class WorkerApp:
         broker: IBroker,
         store: ICanvasStore,
         *,
-        executor: ITaskExecutor | None = None,
+        executor: ITaskExecutor[Any, Any] | None = None,
         drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
         results_topic: str | None = None,
     ) -> None:
@@ -50,15 +50,15 @@ class WorkerApp:
         self.broker = broker
         self.store = store
         self.engine = CanvasEngine(store)
-        self.executor: ITaskExecutor = executor or InlineExecutor()
+        self.executor: ITaskExecutor[Any, Any] = executor or InlineExecutor()
         self.drain_timeout = drain_timeout
         self.results_topic = results_topic
-        self._workers: dict[str, Worker] = {}
+        self._workers: dict[str, Worker[Any, Any]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._running = False
         self._stop_event = asyncio.Event()
 
-    def register(self, worker: Worker) -> None:
+    def register(self, worker: Worker[Any, Any]) -> None:
         """Validate and wire a worker into this app's topic registry."""
         cls = type(worker)
         for attr in REQUIRED_WORKER_ATTRS:

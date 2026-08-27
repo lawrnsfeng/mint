@@ -22,6 +22,7 @@ from mint.worker.canvas.models import (
     GroupNode,
     NodeOutcome,
     TaskNode,
+    TerminalStatus,
 )
 from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.exc import (
@@ -180,7 +181,7 @@ class CanvasEngine:
 
         next_id = chain.next_id(finished_child_id)
         if next_id is None:
-            final_status = (
+            final_status: TerminalStatus = (
                 NodeStatus.ERROR if outcome.status == NodeStatus.ERROR else NodeStatus.FINISHED
             )
             return None, NodeOutcome(
@@ -253,7 +254,7 @@ class CanvasEngine:
             )
 
         any_error = any(not child.ok for child in children)
-        final_status = (
+        final_status: TerminalStatus = (
             NodeStatus.ERROR
             if any_error and group.error_policy != ErrorPolicy.CONTINUE
             else NodeStatus.FINISHED

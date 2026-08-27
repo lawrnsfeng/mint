@@ -94,6 +94,8 @@ line-length = 99
 select = ["ALL"]
 exclude = ["*mock*.py"]
 ignore = [
+    "CPY001",  # missing-copyright-notice — new in ruff 0.16 and part of ALL; this
+    # project carries no copyright headers on any file, by choice.
     "D100",  # undocumented-public-module
     "D104",  # undocumented-public-package
     "D105",  # undocumented-magic-method

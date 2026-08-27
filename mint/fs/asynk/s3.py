@@ -94,7 +94,7 @@ class S3Storage(IFileStorage["S3Client"]):
     DefaultChunkSizeNoMultipartInBytes: Final[int] = 4 * _1KB
     ContentDispositionFormat: Final[str] = "attachment; filename*=UTF-8''{filename_utf8}"
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         bucket_name: str,
         endpoint_url: str | None = None,

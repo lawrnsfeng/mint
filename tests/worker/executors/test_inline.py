@@ -21,7 +21,7 @@ class TestInlineExecutor:
 
     async def test_execute_returns_the_coroutines_result(self) -> None:
         """The executor must return exactly what the function returns."""
-        executor = InlineExecutor()
+        executor: InlineExecutor[int, int] = InlineExecutor()
 
         result = await executor.execute(double, 21)
 
@@ -29,7 +29,7 @@ class TestInlineExecutor:
 
     async def test_execute_propagates_exceptions(self) -> None:
         """A failing function's exception must propagate, not be swallowed."""
-        executor = InlineExecutor()
+        executor: InlineExecutor[int, int] = InlineExecutor()
 
         with pytest.raises(ValueError, match="boom: 5"):
             await executor.execute(boom, 5)

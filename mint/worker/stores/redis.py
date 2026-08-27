@@ -58,11 +58,11 @@ class RedisCanvasStore:
         self.uri = uri
         self.namespace = namespace
         self.terminal_ttl_seconds = terminal_ttl_seconds
-        self._client: Redis | None = None
+        self._client: Redis[bytes] | None = None
         self._fan_in_script: AsyncScript | None = None
 
     @property
-    def client(self) -> Redis:
+    def client(self) -> "Redis[bytes]":
         """Return the lazily-connected Redis client."""
         if self._client is None:
             self._client = Redis.from_url(self.uri)
@@ -212,4 +212,4 @@ class RedisCanvasStore:
             # redis-py's own .close() is deprecated in favor of .aclose() since
             # 5.0.1, but the installed stub package doesn't declare aclose() on
             # Redis (verified) even though it exists and works at runtime.
-            await self._client.aclose()  # ty: ignore[unresolved-attribute]
+            await self._client.aclose()  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import pytest
 from pydantic import BaseModel
@@ -18,19 +19,19 @@ from mint.worker.worker import Worker
 CANVAS = "c1"
 
 
-class Input(BaseModel):
+class SignalingIn(BaseModel):
     """Test input: one integer."""
 
     value: int
 
 
-class Output(BaseModel):
+class SignalingOut(BaseModel):
     """Test output: the doubled integer."""
 
     doubled: int
 
 
-class SignalingWorker(Worker[Input, Output]):
+class SignalingWorker(Worker[SignalingIn, SignalingOut]):
     """Doubles its input; sets ``processed`` once on_success fires, for deterministic waits.
 
     ``unblock`` lets a test hold ``process`` open indefinitely to exercise drain/cancel
@@ -38,8 +39,8 @@ class SignalingWorker(Worker[Input, Output]):
     """
 
     topic = "signaling"
-    Input = Input
-    Output = Output
+    Input = SignalingIn
+    Output = SignalingOut
 
     def __init__(self) -> None:
         """Start unblocked (process() returns immediately) and unprocessed."""
@@ -49,16 +50,16 @@ class SignalingWorker(Worker[Input, Output]):
         self.processed = asyncio.Event()
         self.was_cancelled = False
 
-    async def process(self, input_obj: Input) -> Output:
+    async def process(self, input_obj: SignalingIn) -> SignalingOut:
         """Wait for ``unblock``, then double the input — cancellable while waiting."""
         try:
             await self.unblock.wait()
         except asyncio.CancelledError:
             self.was_cancelled = True
             raise
-        return Output(doubled=input_obj.value * 2)
+        return SignalingOut(doubled=input_obj.value * 2)
 
-    async def on_success(self, input_obj: Input, result: Output) -> None:
+    async def on_success(self, input_obj: SignalingIn, result: SignalingOut) -> None:
         """Signal that this message was fully processed."""
         self.last_call = (input_obj, result)
         self.processed.set()
@@ -77,7 +78,11 @@ class SpyCloseExecutor:
         """Start with no calls recorded."""
         self.close_count = 0
 
-    async def execute(self, fn: Callable[[Input], Awaitable[Output]], input_: Input) -> Output:
+    async def execute(
+        self,
+        fn: Callable[[SignalingIn], Awaitable[SignalingOut]],
+        input_: SignalingIn,
+    ) -> SignalingOut:
         """Delegate straight through, like InlineExecutor."""
         return await fn(input_)
 
@@ -125,7 +130,12 @@ class SpyCloseStore(MemoryCanvasStore):
         await super().close()
 
 
-async def publish_one(broker: MemoryBroker, worker: Worker, node_id: str, value: int) -> None:
+async def publish_one(
+    broker: MemoryBroker,
+    worker: Worker[Any, Any],
+    node_id: str,
+    value: int,
+) -> None:
     """Publish one well-formed message for ``worker`` to consume."""
     envelope = Envelope(node_id=node_id, canvas_id=CANVAS, body=f'{{"value": {value}}}')
     await broker.publish(worker.topic, envelope.to_bytes())
@@ -147,7 +157,7 @@ class TestRegister:
     def test_worker_missing_a_required_class_attribute_is_rejected(self) -> None:
         """A worker missing Input/Output/topic must fail at register(), not on first message."""
 
-        class Incomplete(Worker):
+        class Incomplete(Worker[Any, Any]):
             pass
 
         broker = MemoryBroker()
@@ -172,7 +182,7 @@ class TestRegister:
         """A worker declaring its own executor must be bound to it, not the app's default."""
         broker = MemoryBroker()
         store = MemoryCanvasStore()
-        app_default = InlineExecutor()
+        app_default: InlineExecutor[Any, Any] = InlineExecutor()
         own_executor = SpyCloseExecutor()
         app = WorkerApp(broker, store, executor=app_default)
         worker = WorkerWithOwnExecutor(own_executor)
@@ -187,7 +197,7 @@ class TestRegister:
         """A worker that never sets its own executor must fall back to the app's."""
         broker = MemoryBroker()
         store = MemoryCanvasStore()
-        app_default = InlineExecutor()
+        app_default: InlineExecutor[Any, Any] = InlineExecutor()
         app = WorkerApp(broker, store, executor=app_default)
         worker = SignalingWorker()
 

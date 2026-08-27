@@ -85,7 +85,7 @@ class TestExecute:
         mock_insecure_channel: MagicMock,
     ) -> None:
         """The inverted check used to reject exactly this case."""
-        executor = GRPCExecutor(URI, AsyncStub, "Call")
+        executor: GRPCExecutor[object, str] = GRPCExecutor(URI, AsyncStub, "Call")
 
         result = await executor.execute(unused_fn, "hello")
 
@@ -97,7 +97,7 @@ class TestExecute:
         mock_insecure_channel: MagicMock,
     ) -> None:
         """grpc.aio's real stub methods are sync callables returning an awaitable Call."""
-        executor = GRPCExecutor(URI, MultiCallableStub, "Call")
+        executor: GRPCExecutor[object, str] = GRPCExecutor(URI, MultiCallableStub, "Call")
 
         result = await executor.execute(unused_fn, "world")
 
@@ -113,7 +113,7 @@ class TestMissingMethod:
         mock_insecure_channel: MagicMock,
     ) -> None:
         """The exact bug #12 gap: a bad method name used to go undetected until the call."""
-        executor = GRPCExecutor(URI, AsyncStub, "DoesNotExist")
+        executor: GRPCExecutor[object, str] = GRPCExecutor(URI, AsyncStub, "DoesNotExist")
 
         with pytest.raises(RemoteMethodNotFoundError):
             await executor.execute(unused_fn, "hello")

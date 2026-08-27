@@ -10,6 +10,7 @@ that test now against the current interface would test nothing meaningful.
 
 import asyncio
 from collections.abc import Mapping
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
@@ -48,65 +49,68 @@ async def next_envelope(broker: MemoryBroker, topic: str) -> Envelope:
     return Envelope.from_bytes((await next_delivery(broker, topic)).body)
 
 
-class Input(BaseModel):
+class DoublingIn(BaseModel):
     """Test input: one integer."""
 
     value: int
 
 
-class Output(BaseModel):
+class DoublingOut(BaseModel):
     """Test output: the doubled integer."""
 
     doubled: int
 
 
-class DoublingWorker(Worker[Input, Output]):
+class DoublingWorker(Worker[DoublingIn, DoublingOut]):
     """Doubles its input; records every hook call for assertions."""
 
     topic = TOPIC
-    Input = Input
-    Output = Output
+    Input = DoublingIn
+    Output = DoublingOut
 
     def __init__(self) -> None:
         """Start with no recorded hook calls and no forced failure."""
         super().__init__()
-        self.before_start_calls: list[Input] = []
-        self.on_success_calls: list[tuple[Input, Output]] = []
-        self.on_failure_calls: list[tuple[Input, Exception]] = []
+        self.before_start_calls: list[DoublingIn] = []
+        self.on_success_calls: list[tuple[DoublingIn, DoublingOut]] = []
+        self.on_failure_calls: list[tuple[DoublingIn, Exception]] = []
         self.should_fail = False
 
-    async def process(self, input_obj: Input) -> Output:
+    async def process(self, input_obj: DoublingIn) -> DoublingOut:
         """Double the input, or raise if ``should_fail`` is set."""
         if self.should_fail:
             raise RuntimeError("boom")
-        return Output(doubled=input_obj.value * 2)
+        return DoublingOut(doubled=input_obj.value * 2)
 
-    async def before_start(self, input_obj: Input) -> None:
+    async def before_start(self, input_obj: DoublingIn) -> None:
         """Record the call."""
         self.before_start_calls.append(input_obj)
 
-    async def on_success(self, input_obj: Input, result: Output) -> None:
+    async def on_success(self, input_obj: DoublingIn, result: DoublingOut) -> None:
         """Record the call."""
         self.on_success_calls.append((input_obj, result))
 
-    async def on_failure(self, input_obj: Input, exc: Exception) -> None:
+    async def on_failure(self, input_obj: DoublingIn, exc: Exception) -> None:
         """Record the call."""
         self.on_failure_calls.append((input_obj, exc))
 
 
 class BadOutputWorker(DoublingWorker):
-    """A worker whose process() returns something Output can never validate."""
+    """A worker whose process() returns something DoublingOut can never validate."""
 
-    async def process(self, input_obj: Input) -> Output:
-        """Return a shape Output rejects, to prove bad output is treated as failure."""
+    async def process(self, input_obj: DoublingIn) -> DoublingOut:
+        """Return a shape DoublingOut rejects, to prove bad output is treated as failure."""
         self.received_input = input_obj
-        return {"totally": "wrong"}  # ty: ignore[invalid-return-type]
+        # Deliberately the wrong shape: proving that a bad return is treated as a
+        # failure requires returning something DoublingOut rejects, which no honest
+        # annotation can express.
+        return cast("DoublingOut", {"totally": "wrong"})
 
 
 class ExplodingBeforeStartWorker(DoublingWorker):
     """A DoublingWorker whose before_start() always raises."""
 
-    async def before_start(self, input_obj: Input) -> None:
+    async def before_start(self, input_obj: DoublingIn) -> None:
         """Record then raise."""
         await super().before_start(input_obj)
         raise RuntimeError("before_start failed")
@@ -115,12 +119,12 @@ class ExplodingBeforeStartWorker(DoublingWorker):
 class RaisingHooksWorker(DoublingWorker):
     """A DoublingWorker whose success/failure hooks always raise, after recording the call."""
 
-    async def on_success(self, input_obj: Input, result: Output) -> None:
+    async def on_success(self, input_obj: DoublingIn, result: DoublingOut) -> None:
         """Record then raise."""
         await super().on_success(input_obj, result)
         raise RuntimeError("on_success exploded")
 
-    async def on_failure(self, input_obj: Input, exc: Exception) -> None:
+    async def on_failure(self, input_obj: DoublingIn, exc: Exception) -> None:
         """Record then raise."""
         await super().on_failure(input_obj, exc)
         raise RuntimeError("on_failure exploded")
@@ -213,7 +217,7 @@ def envelope_delivery(
 
 
 def bind_worker(
-    worker: Worker,
+    worker: Worker[Any, Any],
     broker: MemoryBroker,
     store: MemoryCanvasStore,
     *,
@@ -251,7 +255,7 @@ class TestMalformedMessages:
         assert dead.body == b"not json at all"
 
     async def test_body_that_fails_input_validation_is_dead_lettered_not_acked(self) -> None:
-        """A well-formed Envelope whose body doesn't satisfy Input must also be nacked."""
+        """A well-formed Envelope whose body doesn't satisfy DoublingIn must also be nacked."""
         worker = DoublingWorker()
         broker = MemoryBroker()
         store = MemoryCanvasStore()
@@ -266,7 +270,7 @@ class TestMalformedMessages:
 
 
 class TestUndeliverableInputFailsItsNode:
-    """A body this worker's Input can never validate must fail the node, not strand it."""
+    """A body this worker's DoublingIn can never validate must fail the node, not strand it."""
 
     async def test_an_undecodable_input_records_an_error_outcome(self) -> None:
         """Retrying can't help, so the node must be failed rather than left PENDING forever.
@@ -368,13 +372,13 @@ class TestConcurrencyBound:
         class SlowWorker(DoublingWorker):
             max_concurrency = 2
 
-            async def process(self, input_obj: Input) -> Output:
+            async def process(self, input_obj: DoublingIn) -> DoublingOut:
                 nonlocal peak
                 peak = max(peak, len(self._inflight))
                 if peak >= SlowWorker.max_concurrency:
                     at_bound.set()
                 await gate.wait()
-                return Output(doubled=input_obj.value * 2)
+                return DoublingOut(doubled=input_obj.value * 2)
 
         worker = SlowWorker()
         broker = MemoryBroker()
@@ -407,7 +411,7 @@ class TestConcurrencyBound:
         class SingleSlotWorker(DoublingWorker):
             max_concurrency = 1
 
-            async def on_success(self, input_obj: Input, result: Output) -> None:
+            async def on_success(self, input_obj: DoublingIn, result: DoublingOut) -> None:
                 await super().on_success(input_obj, result)
                 if len(self.on_success_calls) == expected:
                     all_done.set()
@@ -445,14 +449,14 @@ class TestTaskExecution:
         await worker._process_delivery(delivery, binding)
 
         assert len(worker.on_failure_calls) == 1
-        assert worker.on_failure_calls[0][0] == Input(value=5)
+        assert worker.on_failure_calls[0][0] == DoublingIn(value=5)
         assert isinstance(worker.on_failure_calls[0][1], RuntimeError)
         stored = await store.get_result(CANVAS, "t1")
         assert stored is not None
         assert stored.status == NodeStatus.ERROR
 
     async def test_output_failing_validation_is_treated_as_a_failure(self) -> None:
-        """process() returning something Output can't validate must be a failure, not a success."""
+        """A process() result that Output can't validate must be a failure, not a success."""
         worker = BadOutputWorker()
         broker = MemoryBroker()
         store = MemoryCanvasStore()
@@ -797,7 +801,7 @@ class TestDeliveryIsAlwaysSettled:
         acked_then_cancelled = asyncio.Event()
 
         class CancelInHookWorker(DoublingWorker):
-            async def on_success(self, input_obj: Input, result: Output) -> None:
+            async def on_success(self, input_obj: DoublingIn, result: DoublingOut) -> None:
                 del input_obj, result
                 acked_then_cancelled.set()
                 await asyncio.sleep(3600)
@@ -882,15 +886,15 @@ class TestBaseProcessNotImplemented:
     async def test_base_process_raises_not_implemented(self) -> None:
         """The base Worker.process() must raise, proving subclasses must override it."""
 
-        class Incomplete(Worker[Input, Output]):
+        class Incomplete(Worker[DoublingIn, DoublingOut]):
             topic = TOPIC
-            Input = Input
-            Output = Output
+            Input = DoublingIn
+            Output = DoublingOut
 
         worker = Incomplete()
 
         with pytest.raises(NotImplementedError):
-            await worker.process(Input(value=1))
+            await worker.process(DoublingIn(value=1))
 
 
 class TestRunStoppedBranch:

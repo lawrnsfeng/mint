@@ -23,7 +23,11 @@ from uuid import uuid4
 from mint.worker.canvas.models import AnyNode, ChainNode, GroupNode, TaskNode
 from mint.worker.enums import CanvasStatus, ErrorPolicy
 from mint.worker.envelope import Envelope
-from mint.worker.exc import DuplicateNodeIdError, MissingInputError
+from mint.worker.exc import (
+    ConflictingErrorPolicyError,
+    DuplicateNodeIdError,
+    MissingInputError,
+)
 from mint.worker.stores.interface import ICanvasStore
 
 type PublishFn = Callable[[str, bytes], Awaitable[None]]
@@ -72,12 +76,25 @@ class Chain:
         error_policy: ErrorPolicy = ErrorPolicy.PROPAGATE,
         id: str | None = None,
     ) -> None:
-        """Build a chain from ``steps``, flattening any nested chains in order."""
+        """Build a chain from ``steps``, flattening any nested chains in order.
+
+        Flattening means a nested chain stops existing as a node, so it cannot
+        keep an ``error_policy`` of its own — its steps run under this chain's.
+        A nested chain that asked for a *different* policy is rejected rather
+        than silently reversed.
+        """
         self.id = id or str(uuid4())
         self.error_policy = error_policy
         self.steps: list[Node] = []
         for step in steps:
             if isinstance(step, Chain):
+                if step.error_policy != error_policy:
+                    raise ConflictingErrorPolicyError(
+                        chain_id=self.id,
+                        nested_id=step.id,
+                        policy=error_policy,
+                        nested_policy=step.error_policy,
+                    )
                 self.steps.extend(step.steps)
             else:
                 self.steps.append(step)
@@ -132,13 +149,20 @@ class Chord:
         legs: list[Union[Node, Chain, "Chord"]],
         callback: Node | Chain | None = None,
         *,
+        input: str | None = None,
         error_policy: ErrorPolicy = ErrorPolicy.CONTINUE,
         id: str | None = None,
     ) -> None:
-        """Build a chord fanning out to ``legs``, optionally aggregated by ``callback``."""
+        """Build a chord fanning out to ``legs``, optionally aggregated by ``callback``.
+
+        ``input`` is carried through to the callback as ``FanIn.input``, alongside
+        every leg's result — for whatever context the aggregation step needs that
+        isn't any single leg's output (the originating request, a tenant id).
+        """
         self.id = id or str(uuid4())
         self.legs = legs
         self.callback = callback
+        self.input = input
         self.error_policy = error_policy
 
     def build(self, canvas_id: str, parent_id: str | None, nodes: dict[str, AnyNode]) -> None:
@@ -159,6 +183,7 @@ class Chord:
             parent_id=parent_id,
             children=leg_ids,
             callback=self.callback.id if self.callback is not None else None,
+            input=self.input,
             error_policy=self.error_policy,
         )
 

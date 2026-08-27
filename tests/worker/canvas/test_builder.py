@@ -5,9 +5,13 @@ import pytest
 from mint.worker.canvas.builder import Chain, Chord, Node
 from mint.worker.canvas.engine import CanvasEngine
 from mint.worker.canvas.models import ChainNode, FanIn, GroupNode, NodeOutcome
-from mint.worker.enums import CanvasStatus, NodeStatus
+from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.envelope import Envelope
-from mint.worker.exc import DuplicateNodeIdError, MissingInputError
+from mint.worker.exc import (
+    ConflictingErrorPolicyError,
+    DuplicateNodeIdError,
+    MissingInputError,
+)
 from mint.worker.stores.memory import MemoryCanvasStore
 from tests.worker.conftest import FailingPublishSpy, OrderSpy, PublishSpy, SpiedMemoryCanvasStore
 
@@ -256,3 +260,69 @@ class TestCanvasIdPropagation:
 
         assert set(nodes) == {"a", "b", "c", inner_chain.id, "group1", "cb"}
         assert all(node.canvas_id == "canvas-x" for node in nodes.values())
+
+
+class TestChordInput:
+    """A chord's own input must reach its callback as FanIn.input."""
+
+    async def test_chord_input_is_persisted_on_the_group_node(
+        self,
+        store: MemoryCanvasStore,
+        publish_spy: PublishSpy,
+    ) -> None:
+        """GroupNode.input was never populated, so FanIn.input was always None."""
+        chord = Chord(
+            [Node(topic="leg", input="{}", id="leg1")],
+            callback=Node(topic="cb", id="cb"),
+            input='{"tenant": "acme"}',
+            id="g",
+        )
+
+        canvas_id = await chord.apply(store, publish_spy)
+
+        group = await store.get_node(canvas_id, "g")
+        assert isinstance(group, GroupNode)
+        assert group.input == '{"tenant": "acme"}'
+
+    async def test_chord_input_defaults_to_none(
+        self,
+        store: MemoryCanvasStore,
+        publish_spy: PublishSpy,
+    ) -> None:
+        """Not passing an input keeps the previous behaviour rather than inventing one."""
+        chord = Chord([Node(topic="leg", input="{}", id="leg1")], id="g")
+
+        canvas_id = await chord.apply(store, publish_spy)
+
+        group = await store.get_node(canvas_id, "g")
+        assert isinstance(group, GroupNode)
+        assert group.input is None
+
+
+class TestNestedChainErrorPolicy:
+    """Flattening dissolves a nested chain, so it cannot keep a policy of its own."""
+
+    def test_a_nested_chain_with_a_conflicting_policy_is_rejected(self) -> None:
+        """Silently reversing the caller's explicit choice is the failure mode being closed.
+
+        `Chain([a, Chain([b, c], error_policy=CONTINUE)], error_policy=PROPAGATE)`
+        used to run b and c under PROPAGATE with no warning at all.
+        """
+        inner = Chain([Node(topic="b"), Node(topic="c")], error_policy=ErrorPolicy.CONTINUE)
+
+        with pytest.raises(ConflictingErrorPolicyError):
+            Chain([Node(topic="a"), inner], error_policy=ErrorPolicy.PROPAGATE)
+
+    def test_a_nested_chain_agreeing_on_the_policy_still_flattens(self) -> None:
+        """The guard is about conflict only — matching policies flatten exactly as before."""
+        inner = Chain([Node(topic="b"), Node(topic="c")], error_policy=ErrorPolicy.CONTINUE)
+
+        outer = Chain([Node(topic="a"), inner], error_policy=ErrorPolicy.CONTINUE)
+
+        assert [step.topic for step in outer.steps] == ["a", "b", "c"]
+
+    def test_nesting_under_the_shared_default_needs_no_ceremony(self) -> None:
+        """Both chains defaulting to PROPAGATE must keep working with no explicit argument."""
+        outer = Chain([Node(topic="a"), Chain([Node(topic="b")])])
+
+        assert [step.topic for step in outer.steps] == ["a", "b"]

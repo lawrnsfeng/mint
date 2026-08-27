@@ -641,6 +641,77 @@ class TestGroup:
         assert result[0].node_id == "cb"
 
 
+class TestGroupAbortPreservesFinishedLegs:
+    """ABORT must cancel only what never ran, never overwrite a real outcome."""
+
+    def _group(self, children: list[str]) -> GroupNode:
+        return GroupNode(
+            id="g",
+            canvas_id=CANVAS,
+            parent_id=None,
+            children=children,
+            callback=None,
+            error_policy=ErrorPolicy.ABORT,
+        )
+
+    async def test_abort_leaves_an_already_finished_sibling_finished(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """A leg that already succeeded really ran — CANCELLED would erase that record."""
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("leg2", "g"),
+            task("leg3", "g"),
+            self._group(["leg1", "leg2", "leg3"]),
+        )
+        await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+
+        await engine.complete(CANVAS, "leg2", err_outcome("leg2"))
+
+        finished = await store.get_node(CANVAS, "leg1")
+        assert finished is not None
+        assert finished.status == NodeStatus.FINISHED
+
+    async def test_abort_still_cancels_the_legs_that_never_ran(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Preserving finished legs must not stop the genuinely pending ones being cancelled."""
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("leg2", "g"),
+            task("leg3", "g"),
+            self._group(["leg1", "leg2", "leg3"]),
+        )
+        await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+
+        await engine.complete(CANVAS, "leg2", err_outcome("leg2"))
+
+        pending = await store.get_node(CANVAS, "leg3")
+        assert pending is not None
+        assert pending.status == NodeStatus.CANCELLED
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+    async def test_abort_does_not_cancel_the_failed_leg_itself(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """The leg that triggered the abort has its own ERROR outcome to keep."""
+        await seed(store, task("leg1", "g"), task("leg2", "g"), self._group(["leg1", "leg2"]))
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        failed = await store.get_node(CANVAS, "leg1")
+        assert failed is not None
+        assert failed.status == NodeStatus.ERROR
+
+
 class TestMalformedGraph:
     """Lookup failures against a corrupted or incomplete graph."""
 

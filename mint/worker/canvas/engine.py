@@ -211,8 +211,7 @@ class CanvasEngine:
         outcome: NodeOutcome,
     ) -> tuple[Dispatch | None, NodeOutcome | None]:
         if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.ABORT:
-            pending = [child_id for child_id in group.children if child_id != finished_child_id]
-            await self._abort_canvas(canvas_id, pending)
+            await self._abort_canvas(canvas_id, await self._unfinished(canvas_id, group))
             return None, None
 
         progress = await self.store.mark_child_done(
@@ -317,6 +316,18 @@ class CanvasEngine:
                 canvas_id=canvas_id,
             )
         return node
+
+    async def _unfinished(self, canvas_id: str, group: GroupNode) -> list[str]:
+        """Return the group's children that have no recorded outcome yet.
+
+        Cancelling every sibling indiscriminately would overwrite legs that already
+        FINISHED with CANCELLED, destroying the record that they ran — legs whose
+        side effects really happened. Only what never completed can be cancelled.
+        ``_chain_remaining`` gets the equivalent right by slicing the not-yet-run
+        tail; a group has no ordering to slice, so it asks the store instead.
+        """
+        results = await self.store.get_results(canvas_id, group.children)
+        return [child_id for child_id in group.children if child_id not in results]
 
     @staticmethod
     def _chain_remaining(chain: ChainNode, finished_child_id: str) -> list[str]:

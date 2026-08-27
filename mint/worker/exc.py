@@ -3,19 +3,12 @@
 from dataclasses import dataclass
 
 from mint.exc import TemplatedError
+from mint.worker.enums import ErrorPolicy
 
 
 @dataclass
 class WorkerError(TemplatedError):
     """Generic mint.worker error."""
-
-
-@dataclass
-class MalformedMessageError(WorkerError):
-    """A consumed message could not be parsed or validated."""
-
-    TEMPLATE = "Malformed message: {detail}"
-    detail: str
 
 
 @dataclass
@@ -62,6 +55,25 @@ class DuplicateNodeIdError(WorkerError):
 
     TEMPLATE = "Duplicate node id {node_id} in canvas graph"
     node_id: str
+
+
+@dataclass
+class ConflictingErrorPolicyError(WorkerError):
+    """A nested chain declared an error policy the chain flattening it does not share.
+
+    Flattening dissolves the nested chain into its parent's step list, so it keeps
+    no policy of its own — raising here is what stops the caller's explicit choice
+    from being silently reversed.
+    """
+
+    TEMPLATE = (
+        "Nested chain {nested_id} declares error policy {nested_policy}, "
+        "but chain {chain_id} flattening it uses {policy}"
+    )
+    chain_id: str
+    nested_id: str
+    policy: ErrorPolicy
+    nested_policy: ErrorPolicy
 
 
 @dataclass

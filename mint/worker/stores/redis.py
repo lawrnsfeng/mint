@@ -46,6 +46,11 @@ class RedisCanvasStore:
     """Canvas graph store over Redis: namespaced keys, atomic fan-in, TTL on terminal canvases."""
 
     DEFAULT_TERMINAL_TTL_SECONDS: Final[int] = 86_400  # 24h
+    # The status key is a canvas's tombstone, and outlives the data it describes.
+    # Expiring it *with* the data destroyed the one fact CanvasEngine.complete()'s
+    # short-circuit depends on: once gone, get_canvas_status defaults back to
+    # RUNNING, so a finished canvas reads as live and a late replay walks into it.
+    STATUS_TTL_MULTIPLIER: Final[int] = 7
 
     def __init__(
         self,
@@ -53,11 +58,20 @@ class RedisCanvasStore:
         *,
         namespace: str = "mint-worker",
         terminal_ttl_seconds: int = DEFAULT_TERMINAL_TTL_SECONDS,
+        status_ttl_seconds: int | None = None,
     ) -> None:
-        """Configure a store over ``uri``; keys are namespaced under ``namespace``."""
+        """Configure a store over ``uri``; keys are namespaced under ``namespace``.
+
+        ``status_ttl_seconds`` defaults to ``STATUS_TTL_MULTIPLIER`` times
+        ``terminal_ttl_seconds`` — a canvas's status must outlive its data so that
+        "this already finished" stays answerable after the graph itself is gone.
+        """
         self.uri = uri
         self.namespace = namespace
         self.terminal_ttl_seconds = terminal_ttl_seconds
+        self.status_ttl_seconds = status_ttl_seconds or (
+            terminal_ttl_seconds * self.STATUS_TTL_MULTIPLIER
+        )
         self._client: Redis[bytes] | None = None
         self._fan_in_script: AsyncScript | None = None
 
@@ -194,6 +208,13 @@ class RedisCanvasStore:
         this canvas — nodes, results, and fan-in bookkeeping alike — so a completed
         canvas doesn't linger in Redis forever. A RUNNING canvas gets no TTL: its
         data must survive for as long as the canvas is actually in flight.
+
+        The status key itself gets a longer TTL than the data. It is the canvas's
+        tombstone: ``CanvasEngine.complete`` short-circuits on a non-RUNNING status,
+        and ``get_canvas_status`` reports RUNNING for a key that isn't there — so
+        expiring the status alongside the data made a finished canvas read as live
+        again, and a late replay would then fail on its long-deleted nodes and mark
+        the finished canvas ERROR. Outliving the data closes that window.
         """
         key = self._status_key(canvas_id)
         await self.client.set(key, status.value.encode())
@@ -204,7 +225,7 @@ class RedisCanvasStore:
         for tracked_key in tracked:
             await self.client.expire(tracked_key, self.terminal_ttl_seconds)
         await self.client.expire(registry_key, self.terminal_ttl_seconds)
-        await self.client.expire(key, self.terminal_ttl_seconds)
+        await self.client.expire(key, self.status_ttl_seconds)
 
     async def close(self) -> None:
         """Release the underlying Redis connection."""

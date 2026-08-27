@@ -26,6 +26,7 @@ from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.exc import (
     CallbackNotFoundError,
     CanvasCycleError,
+    ChildNotInParentError,
     InvalidParentTypeError,
     NodeNotFoundError,
     ParentNotFoundError,
@@ -641,6 +642,120 @@ class TestGroup:
         assert result[0].node_id == "cb"
 
 
+class TestGroupPropagatePolicy:
+    """PROPAGATE must actually propagate for a group, callback or not."""
+
+    def _group(self, *, callback: str | None) -> GroupNode:
+        return GroupNode(
+            id="g",
+            canvas_id=CANVAS,
+            parent_id="chain",
+            children=["leg1", "leg2"],
+            callback=callback,
+            error_policy=ErrorPolicy.PROPAGATE,
+        )
+
+    async def _seed(self, store: MemoryCanvasStore, *, callback: str | None) -> None:
+        nodes: list[AnyNode] = [
+            task("leg1", "g"),
+            task("leg2", "g"),
+            self._group(callback=callback),
+            task("after", "chain", topic="after"),
+            ChainNode(id="chain", canvas_id=CANVAS, parent_id=None, children=["g", "after"]),
+        ]
+        if callback is not None:
+            nodes.append(task(callback, "g", topic="callback"))
+        await seed(store, *nodes)
+
+    async def test_a_failed_leg_does_not_dispatch_the_callback(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """error_policy was only read on the ABORT pre-check and the no-callback path.
+
+        A group *with* a callback therefore treated PROPAGATE exactly like
+        CONTINUE — the callback fired with the failed leg present as ok=False.
+        """
+        await self._seed(store, callback="cb")
+
+        dispatches = await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        assert dispatches == []
+
+    async def test_a_failed_leg_records_the_group_as_errored(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """The group's own outcome used to become the callback's — a success."""
+        await self._seed(store, callback="cb")
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        recorded = await store.get_result(CANVAS, "g")
+        assert recorded is not None
+        assert recorded.status == NodeStatus.ERROR
+
+    async def test_a_failed_leg_cancels_the_pending_legs_and_the_callback(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Nothing in a propagating group runs after the failure, so nothing stays PENDING."""
+        await self._seed(store, callback="cb")
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        for node_id in ("leg2", "cb"):
+            node = await store.get_node(CANVAS, node_id)
+            assert node is not None
+            assert node.status == NodeStatus.CANCELLED
+
+    async def test_the_failure_reaches_the_enclosing_chain(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """The enclosing chain used to advance to its next step as if nothing failed."""
+        await self._seed(store, callback="cb")
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        after = await store.get_node(CANVAS, "after")
+        assert after is not None
+        assert after.status == NodeStatus.CANCELLED
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+    async def test_a_callback_less_group_still_propagates(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """The no-callback path already honoured the policy; it must keep doing so."""
+        await self._seed(store, callback=None)
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        recorded = await store.get_result(CANVAS, "g")
+        assert recorded is not None
+        assert recorded.status == NodeStatus.ERROR
+
+    async def test_a_successful_leg_under_propagate_is_unaffected(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """PROPAGATE only changes what an *error* means — success still fans in."""
+        await self._seed(store, callback="cb")
+
+        await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+        dispatches = await engine.complete(CANVAS, "leg2", ok_outcome("leg2"))
+
+        assert len(dispatches) == 1
+        assert dispatches[0].node_id == "cb"
+
+
 class TestGroupAbortPreservesFinishedLegs:
     """ABORT must cancel only what never ran, never overwrite a real outcome."""
 
@@ -1039,4 +1154,41 @@ class TestResultSizeGuard:
             )
 
         assert await store.get_result(CANVAS, "only") is None
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+
+class TestChildNotListedByItsParent:
+    """A node whose parent doesn't list it must fail as a WorkerError, not a ValueError."""
+
+    async def test_a_chain_that_does_not_list_the_finished_node_raises_a_worker_error(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """`list.index` raised a bare ValueError that escaped every `except WorkerError`.
+
+        It landed in the driver's generic handler instead, so the delivery burned
+        its retries and dead-lettered while the canvas stayed RUNNING with no
+        status recorded — the exact stall the error handling exists to prevent.
+        Reachable by reusing a canvas id for a different graph, which
+        `apply(canvas_id=...)` supports.
+        """
+        chain = ChainNode(id="chain", canvas_id=CANVAS, parent_id=None, children=["other"])
+        await seed(store, task("stray", "chain"), task("other", "chain"), chain)
+
+        with pytest.raises(ChildNotInParentError):
+            await engine.complete(CANVAS, "stray", ok_outcome("stray"))
+
+    async def test_that_failure_marks_the_canvas_errored(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Routing through WorkerError is what gets the canvas a terminal status."""
+        chain = ChainNode(id="chain", canvas_id=CANVAS, parent_id=None, children=["other"])
+        await seed(store, task("stray", "chain"), task("other", "chain"), chain)
+
+        with pytest.raises(ChildNotInParentError):
+            await engine.complete(CANVAS, "stray", ok_outcome("stray"))
+
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR

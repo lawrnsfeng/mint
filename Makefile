@@ -47,6 +47,7 @@ test-worker-capped:
 .PHONY: test-worker-containers
 test-worker-containers:
 	@$(MAKE) test-worker-capped TARGET=tests/worker/stores/test_redis_container.py MEM=1G
+	@$(MAKE) test-worker-capped TARGET=tests/worker/brokers/test_redis_container.py MEM=1G
 	@$(MAKE) test-worker-capped TARGET=tests/worker/brokers/test_rabbitmq_container.py MEM=1G
 	@$(MAKE) test-worker-capped TARGET=tests/worker/brokers/test_kafka_container.py MEM=2G
 

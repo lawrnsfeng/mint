@@ -14,10 +14,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from mint.worker.brokers.interface import Delivery
-from mint.worker.brokers.memory import MemoryBroker
+from mint.worker.brokers.memory import MemoryBroker, MemoryDelivery
 from mint.worker.canvas.dispatch import Dispatch
 from mint.worker.canvas.models import ChainNode, ErrorInfo, NodeOutcome, TaskNode
-from mint.worker.coordinator import Coordinator, InFlightNode
+from mint.worker.coordinator import Coordinator, CoordinatorConfig, InFlightNode
 from mint.worker.enums import CanvasStatus, NodeStatus
 from mint.worker.envelope import Envelope
 from mint.worker.exc import CoordinatorAlreadyRunningError
@@ -260,7 +260,12 @@ class TestSweep:
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id=None, topic="topic-t1")},
         )
         broker = MemoryBroker()
-        coordinator = Coordinator(broker, store, RESULTS_TOPIC, max_age=60.0)
+        coordinator = Coordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(max_age=60.0),
+        )
         stale_time = datetime.now(UTC) - timedelta(seconds=120)
         coordinator._in_flight[CANVAS, "t1"] = InFlightNode(CANVAS, "t1", stale_time)
         coordinator._by_canvas[CANVAS] = {"t1"}
@@ -281,7 +286,12 @@ class TestSweep:
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id=None, topic="topic-t1")},
         )
         broker = MemoryBroker()
-        coordinator = Coordinator(broker, store, RESULTS_TOPIC, max_age=3600.0)
+        coordinator = Coordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(max_age=3600.0),
+        )
         coordinator._track(CANVAS, "t1")
 
         await coordinator._sweep_once()
@@ -321,7 +331,12 @@ class TestRunStopLifecycle:
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id=None, topic="topic-t1")},
         )
         broker = MemoryBroker()
-        coordinator = Coordinator(broker, store, RESULTS_TOPIC, sweep_interval=100.0)
+        coordinator = Coordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(sweep_interval=100.0),
+        )
         await publish_result(broker, "t1", ok_outcome("t1"))
 
         run_task = asyncio.create_task(coordinator.run())
@@ -350,7 +365,12 @@ class TestRunStopLifecycle:
             },
         )
         broker = MemoryBroker()
-        coordinator = Coordinator(broker, store, RESULTS_TOPIC, sweep_interval=100.0)
+        coordinator = Coordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(sweep_interval=100.0),
+        )
 
         run_task = asyncio.create_task(coordinator.run())
         await publish_result(broker, "t1", ok_outcome("t1", '{"v":1}'))
@@ -384,7 +404,12 @@ class TestRunStopLifecycle:
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id=None, topic="topic-t1")},
         )
         broker = MemoryBroker()
-        coordinator = Coordinator(broker, store, RESULTS_TOPIC, sweep_interval=0.01, max_age=0.0)
+        coordinator = Coordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(sweep_interval=0.01, max_age=0.0),
+        )
         coordinator._track(CANVAS, "t1")
 
         run_task = asyncio.create_task(coordinator.run())
@@ -459,7 +484,12 @@ class TestCrossCanvasTracking:
     async def test_a_stale_node_in_one_canvas_does_not_time_out_the_other(self) -> None:
         """The sweeper must fail only the canvas whose node actually went stale."""
         store = MemoryCanvasStore()
-        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        coordinator = Coordinator(
+            MemoryBroker(),
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(max_age=1.0),
+        )
         for canvas in (CANVAS, self.OTHER_CANVAS):
             await store.create_canvas(
                 canvas,
@@ -538,10 +568,15 @@ class FailFirstResultCoordinator(Coordinator):
         store: MemoryCanvasStore,
         results_topic: str,
         *,
-        sweep_interval: float = Coordinator.DEFAULT_SWEEP_INTERVAL_SECONDS,
+        sweep_interval: float = CoordinatorConfig().sweep_interval,
     ) -> None:
         """Start with an empty call log."""
-        super().__init__(broker, store, results_topic, sweep_interval=sweep_interval)
+        super().__init__(
+            broker,
+            store,
+            results_topic,
+            config=CoordinatorConfig(sweep_interval=sweep_interval),
+        )
         self.handled: list[str] = []
         self.second_call = asyncio.Event()
 
@@ -603,7 +638,12 @@ class TestSweepDoesNotRaceARealResult:
             CANVAS,
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
         )
-        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        coordinator = Coordinator(
+            MemoryBroker(),
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(max_age=1.0),
+        )
         stale = datetime.now(UTC) - timedelta(seconds=99)
         entry = InFlightNode(CANVAS, "t1", stale)
         coordinator._in_flight[CANVAS, "t1"] = entry
@@ -622,7 +662,12 @@ class TestSweepDoesNotRaceARealResult:
             CANVAS,
             {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
         )
-        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        coordinator = Coordinator(
+            MemoryBroker(),
+            store,
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(max_age=1.0),
+        )
         stale = datetime.now(UTC) - timedelta(seconds=99)
         coordinator._in_flight[CANVAS, "t1"] = InFlightNode(CANVAS, "t1", stale)
 
@@ -631,3 +676,53 @@ class TestSweepDoesNotRaceARealResult:
         recorded = await store.get_result(CANVAS, "t1")
         assert recorded is not None
         assert recorded.status == NodeStatus.ERROR
+
+
+class TestResultRetryCap:
+    """The coordinator needs the same poison-message escape Worker has."""
+
+    async def _failing_delivery(self, attempt: int) -> MemoryBroker:
+        """Complete t1 of a two-step chain against a broker that can't publish t2."""
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {
+                "t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id="chain", topic="topic-t1"),
+                "t2": TaskNode(id="t2", canvas_id=CANVAS, parent_id="chain", topic="topic-t2"),
+                "chain": ChainNode(
+                    id="chain",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["t1", "t2"],
+                ),
+            },
+        )
+        broker = RaisingOnTopicBroker(raises_for="topic-t2")
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        envelope = Envelope(
+            node_id="t1",
+            canvas_id=CANVAS,
+            body=ok_outcome("t1").model_dump_json(),
+        )
+        delivery = MemoryDelivery(broker, RESULTS_TOPIC, envelope.to_bytes(), attempt=attempt)
+        await coordinator._handle_result(delivery)
+        return broker
+
+    async def test_a_dispatch_failure_under_the_cap_is_requeued(self) -> None:
+        """A transient publish failure must still retry."""
+        broker = await self._failing_delivery(attempt=1)
+
+        async with asyncio.timeout(1.0):
+            assert (await anext(broker.consume(RESULTS_TOPIC))).attempt == 2
+
+    async def test_a_dispatch_failure_at_the_cap_is_dead_lettered(self) -> None:
+        """An unconditional requeue is an unbounded retry storm with no escape.
+
+        A WorkerError self-heals (the engine marks the canvas ERROR first, so the
+        replay short-circuits), but a dispatch-publish failure does not.
+        """
+        broker = await self._failing_delivery(attempt=CoordinatorConfig().max_attempts)
+
+        async with asyncio.timeout(1.0):
+            dead = await anext(broker.consume(f"{RESULTS_TOPIC}{MemoryBroker.DLQ_SUFFIX}"))
+        assert dead.attempt == CoordinatorConfig().max_attempts

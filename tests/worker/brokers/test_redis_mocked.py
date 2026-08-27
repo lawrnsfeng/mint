@@ -358,3 +358,81 @@ class TestRedeliveryOrdering:
         await delivery.nack(requeue=False)
 
         assert self._call_order(mock_client) == ["xadd", "xack", "xdel"]
+
+
+class TestPendingReclaim:
+    """A message whose consumer died before acking must be redelivered to someone."""
+
+    async def test_consume_reclaims_before_reading_new_work(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """XREADGROUP with `>` returns only never-delivered entries.
+
+        A consumer's own pending list is reachable only via an explicit id or
+        XAUTOCLAIM, so without this a message read by a consumer that then crashed
+        sat in its PEL forever — at-most-once, in a broker declaring at-least-once.
+        """
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"5-1", {RedisBroker.BODY_FIELD: b"abandoned", RedisBroker.ATTEMPT_FIELD: b"2"})],
+            [],
+        ]
+
+        delivery = await anext(broker.consume(TOPIC))
+
+        assert delivery.body == b"abandoned"
+        assert delivery.attempt == 2
+        mock_client.xreadgroup.assert_not_awaited()
+
+    async def test_reclaim_asks_for_this_consumer_and_the_configured_idle_window(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Claiming transfers ownership, so it must name this consumer explicitly."""
+        mock_client.xautoclaim.return_value = [b"0-0", [], []]
+        mock_client.xreadgroup.return_value = [
+            (TOPIC, [(b"9-1", {RedisBroker.BODY_FIELD: b"fresh"})]),
+        ]
+
+        await anext(broker.consume(TOPIC))
+
+        args, kwargs = mock_client.xautoclaim.await_args
+        assert args[0] == TOPIC
+        assert args[1] == broker.group
+        assert args[2] == broker.consumer_name
+        assert args[3] == RedisBroker.DEFAULT_RECLAIM_IDLE_MS
+        assert kwargs["count"] == 1
+
+    async def test_nothing_to_reclaim_falls_through_to_a_normal_read(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """The common case must not cost a delivery — reclaim returning empty is normal."""
+        mock_client.xautoclaim.return_value = [b"0-0", [], []]
+        mock_client.xreadgroup.return_value = [
+            (TOPIC, [(b"9-1", {RedisBroker.BODY_FIELD: b"fresh"})]),
+        ]
+
+        delivery = await anext(broker.consume(TOPIC))
+
+        assert delivery.body == b"fresh"
+        mock_client.xreadgroup.assert_awaited_once()
+
+    async def test_a_two_element_reply_from_redis_6_is_handled(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """XAUTOCLAIM only gained its third `deleted` element in Redis 7."""
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"5-1", {RedisBroker.BODY_FIELD: b"old server"})],
+        ]
+
+        delivery = await anext(broker.consume(TOPIC))
+
+        assert delivery.body == b"old server"

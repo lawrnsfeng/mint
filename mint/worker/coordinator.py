@@ -20,7 +20,6 @@ import contextlib
 import signal
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final
 
 from pydantic import ValidationError
 
@@ -35,6 +34,19 @@ from mint.worker.exc import CoordinatorAlreadyRunningError, WorkerError
 from mint.worker.stores.interface import ICanvasStore
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class CoordinatorConfig:
+    """Tunables for a ``Coordinator``: sweep cadence, timeout window, retry cap.
+
+    Bundled rather than passed individually, matching ``AMQPRPCConfig`` — the
+    three of them are one policy decision about how patient the coordinator is.
+    """
+
+    sweep_interval: float = 30.0
+    max_age: float = 300.0
+    max_attempts: int = 5
 
 
 @dataclass(frozen=True)
@@ -57,25 +69,23 @@ class Coordinator:
     canvas's entry node(s) were dispatched at all.
     """
 
-    DEFAULT_SWEEP_INTERVAL_SECONDS: Final[float] = 30.0
-    DEFAULT_MAX_AGE_SECONDS: Final[float] = 300.0
-
     def __init__(
         self,
         broker: IBroker,
         store: ICanvasStore,
         results_topic: str,
         *,
-        sweep_interval: float = DEFAULT_SWEEP_INTERVAL_SECONDS,
-        max_age: float = DEFAULT_MAX_AGE_SECONDS,
+        config: CoordinatorConfig | None = None,
     ) -> None:
         """Build a coordinator over ``broker``/``store``, consuming ``results_topic``."""
+        cfg = config or CoordinatorConfig()
         self.broker = broker
         self.store = store
         self.engine = CanvasEngine(store)
         self.results_topic = results_topic
-        self.sweep_interval = sweep_interval
-        self.max_age = max_age
+        self.sweep_interval = cfg.sweep_interval
+        self.max_age = cfg.max_age
+        self.max_attempts = cfg.max_attempts
         # Keyed by (canvas_id, node_id), never node_id alone: Node(..., id=...) and
         # apply(canvas_id=...) both let a caller fix ids, so the same node id running
         # in two canvases at once is supported usage — and a bare node_id key means
@@ -203,9 +213,14 @@ class Coordinator:
                 await self._safe_nack(delivery)
 
     async def _safe_nack(self, delivery: Delivery) -> None:
-        """Requeue a delivery, logging rather than raising — nothing above would catch it."""
+        """Retry-or-drop this delivery, logging rather than raising.
+
+        Used where nothing above would catch an exception — the consume loop's own
+        guards. Capped like every other retry path here, so a delivery that keeps
+        blowing up the loop eventually dead-letters instead of cycling forever.
+        """
         try:
-            await delivery.nack(requeue=True)
+            await self._retry_or_drop(delivery, node_id=None)
         except Exception:
             logger.exception("Failed to nack a result", topic=self.results_topic)
 
@@ -226,9 +241,30 @@ class Coordinator:
             outcome,
             trace_id=envelope.trace_id,
         ):
-            await delivery.nack(requeue=True)
+            await self._retry_or_drop(delivery, envelope.node_id)
             return
         await delivery.ack()
+
+    async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:
+        """Requeue this result, or dead-letter it once ``max_attempts`` is spent.
+
+        The same cap ``Worker`` has, for the same reason: an unconditional
+        ``nack(requeue=True)`` on every failure is an unbounded retry storm with
+        no poison-message escape, and a tight CPU-burning loop on a broker that
+        redelivers synchronously. A ``WorkerError`` self-heals (``complete()``
+        marks the canvas ERROR first, so the replay short-circuits), but a
+        dispatch-publish failure or a failing ``ack()`` does not.
+        """
+        if delivery.attempt >= self.max_attempts:
+            logger.error(
+                "Giving up on a result after repeated failures",
+                topic=self.results_topic,
+                node_id=node_id,
+                attempt=delivery.attempt,
+            )
+            await delivery.nack(requeue=False)
+            return
+        await delivery.nack(requeue=True)
 
     async def _advance(
         self,

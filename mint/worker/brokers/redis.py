@@ -11,10 +11,17 @@ original, so a crash mid-sequence duplicates a message rather than losing one �
 the reverse order reintroduced exactly the at-most-once hole this rewrite exists
 to close.
 
-Not yet implemented: reclaiming PEL entries abandoned by a crashed consumer
-(``XAUTOCLAIM``) — today a message survives a crash but needs another consumer
-to eventually re-read it via ``XREADGROUP``'s own-pending-first semantics or an
-external sweep. Tracked as a known follow-up, not silently skipped.
+Crashed-consumer recovery is what actually makes the at-least-once claim true, so
+``consume`` reclaims before it reads. ``XREADGROUP`` with ``>`` returns only
+never-delivered entries — a consumer's own pending list is reachable only via an
+explicit id or ``XAUTOCLAIM`` — so a message read by a consumer that dies before
+acking sat in that consumer's PEL forever and was redelivered to nobody. That is
+at-most-once for exactly the crash window, in a broker declaring
+``AT_LEAST_ONCE``. (An earlier version of this docstring claimed
+``XREADGROUP``'s "own-pending-first semantics" covered it; ``>`` has no such
+behaviour, so the stated mitigation did not exist.) Each poll now first runs
+``XAUTOCLAIM`` for entries idle beyond ``reclaim_idle_ms``, which transfers them
+to this consumer and redelivers them.
 """
 
 from collections.abc import AsyncIterator, Mapping
@@ -95,6 +102,7 @@ class RedisBroker:
     BODY_FIELD: Final[bytes] = b"body"
     ATTEMPT_FIELD: Final[bytes] = b"attempt"
     DEFAULT_BLOCK_MS: Final[int] = 5_000
+    DEFAULT_RECLAIM_IDLE_MS: Final[int] = 60_000
 
     def __init__(
         self,
@@ -103,12 +111,20 @@ class RedisBroker:
         group: str = DEFAULT_GROUP,
         consumer_name: str | None = None,
         block_ms: int = DEFAULT_BLOCK_MS,
+        reclaim_idle_ms: int = DEFAULT_RECLAIM_IDLE_MS,
     ) -> None:
-        """Configure a broker over ``uri``; nothing connects until first use."""
+        """Configure a broker over ``uri``; nothing connects until first use.
+
+        ``reclaim_idle_ms`` is how long a delivered-but-unacked message may sit in
+        another consumer's pending list before this one takes it over. It bounds
+        how long a crashed consumer's in-flight work stays stuck, so it should
+        comfortably exceed the slowest expected handler.
+        """
         self.uri = uri
         self.group = group
         self.consumer_name = consumer_name or str(uuid4())
         self.block_ms = block_ms
+        self.reclaim_idle_ms = reclaim_idle_ms
         self._client: Redis[bytes] | None = None
 
     @property
@@ -137,9 +153,18 @@ class RedisBroker:
         await self.client.xadd(topic, _stream_fields(message, headers, attempt=1))
 
     async def consume(self, topic: str) -> AsyncIterator[RedisStreamDelivery]:
-        """Yield deliveries from ``topic``'s stream via this broker's consumer group."""
+        """Yield deliveries from ``topic``'s stream via this broker's consumer group.
+
+        Each pass reclaims abandoned work before reading new work, so a message
+        whose consumer died before acking is redelivered here rather than sitting
+        in that consumer's pending list forever.
+        """
         await self._ensure_group(topic)
         while True:
+            reclaimed = await self._reclaim(topic)
+            if reclaimed is not None:
+                yield RedisStreamDelivery(self, reclaimed)
+                continue
             response = await self.client.xreadgroup(
                 groupname=self.group,
                 consumername=self.consumer_name,
@@ -151,15 +176,45 @@ class RedisBroker:
                 continue
             for _stream, messages in response:
                 for message_id, fields in messages:
-                    body = fields.get(self.BODY_FIELD, b"")
-                    attempt = int(fields.get(self.ATTEMPT_FIELD, b"1"))
-                    headers = {
-                        key: value
-                        for key, value in fields.items()
-                        if key not in (self.BODY_FIELD, self.ATTEMPT_FIELD)
-                    }
-                    entry = StreamEntry(topic, message_id, body, attempt, headers or None)
-                    yield RedisStreamDelivery(self, entry)
+                    yield RedisStreamDelivery(self, self._entry(topic, message_id, fields))
+
+    async def _reclaim(self, topic: str) -> StreamEntry | None:
+        """Take over one message abandoned by a consumer that never acked it.
+
+        Returns None when there is nothing idle enough to claim, which is the
+        normal case — the cost of this is one ``XAUTOCLAIM`` per poll.
+        """
+        response = await self.client.xautoclaim(
+            topic,
+            self.group,
+            self.consumer_name,
+            self.reclaim_idle_ms,
+            start_id="0-0",
+            count=1,
+        )
+        # XAUTOCLAIM replies (next_cursor, entries[, deleted]) — the third element
+        # only exists on Redis >= 7, so unpack positionally rather than by arity.
+        entries = response[1] if len(response) > 1 else []
+        if not entries:
+            return None
+        message_id, fields = entries[0]
+        return self._entry(topic, message_id, fields)
+
+    def _entry(
+        self,
+        topic: str,
+        message_id: bytes,
+        fields: Mapping[bytes, bytes],
+    ) -> StreamEntry:
+        """Build a StreamEntry from one raw stream reply."""
+        body = fields.get(self.BODY_FIELD, b"")
+        attempt = int(fields.get(self.ATTEMPT_FIELD, b"1"))
+        headers = {
+            key: value
+            for key, value in fields.items()
+            if key not in (self.BODY_FIELD, self.ATTEMPT_FIELD)
+        }
+        return StreamEntry(topic, message_id, body, attempt, headers or None)
 
     async def ack(self, entry: StreamEntry) -> None:
         """Acknowledge and remove ``entry`` from its stream."""

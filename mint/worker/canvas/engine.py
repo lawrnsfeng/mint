@@ -68,6 +68,13 @@ class CanvasEngine:
         guard via ``rollback()``, and the redelivery that follows *does* produce
         the callback dispatch again. Without that, a single failed publish loses
         a chord's callback permanently.
+
+        Note the limit of that guarantee: only *group fan-in* is deduplicated, by
+        the fired guard. **Chain sequencing is not.** Replaying a chain step's
+        outcome dispatches the next step again — so a step whose ack fails after
+        the canvas advanced re-runs its successor. That is inherent to
+        at-least-once without an idempotency key on the work itself; a chain step
+        that must not run twice needs to be idempotent in its own right.
         """
         if await self.store.get_canvas_status(canvas_id) != CanvasStatus.RUNNING:
             return []
@@ -215,6 +222,20 @@ class CanvasEngine:
             await self._abort_canvas(canvas_id, await self._unfinished(canvas_id, group))
             return None, None
 
+        if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.PROPAGATE:
+            # Mirrors _advance_chain's PROPAGATE branch. Without this the policy was
+            # only ever consulted on the ABORT pre-check and the callback-less
+            # final_status, so a group *with* a callback treated PROPAGATE exactly
+            # like CONTINUE: the callback fired with the failed leg present, the
+            # group's own outcome became the callback's, and the enclosing container
+            # advanced as though nothing had failed.
+            await self._cancel_group_remainder(canvas_id, group, finished_child_id)
+            return None, NodeOutcome(
+                node_id=group.id,
+                status=NodeStatus.ERROR,
+                error=outcome.error,
+            )
+
         progress = await self.store.mark_child_done(
             canvas_id,
             group.id,
@@ -318,6 +339,27 @@ class CanvasEngine:
             )
         return node
 
+    async def _cancel_group_remainder(
+        self,
+        canvas_id: str,
+        group: GroupNode,
+        finished_child_id: str,
+    ) -> None:
+        """Cancel everything in ``group`` that will now never run: legs and callback.
+
+        The callback is included because a propagating group never dispatches it —
+        leaving it PENDING would misreport it as still expected.
+        """
+        remaining = [
+            child_id
+            for child_id in await self._unfinished(canvas_id, group)
+            if child_id != finished_child_id
+        ]
+        if group.callback is not None:
+            remaining.append(group.callback)
+        if remaining:
+            await self.store.cancel_nodes(canvas_id, remaining)
+
     async def _unfinished(self, canvas_id: str, group: GroupNode) -> list[str]:
         """Return the group's children that have no recorded outcome yet.
 
@@ -332,5 +374,4 @@ class CanvasEngine:
 
     @staticmethod
     def _chain_remaining(chain: ChainNode, finished_child_id: str) -> list[str]:
-        idx = chain.children.index(finished_child_id)
-        return chain.children[idx + 1 :]
+        return chain.children[chain.index_of(finished_child_id) + 1 :]

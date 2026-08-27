@@ -460,3 +460,51 @@ class TestPendingMapIsAlwaysCleared:
             await executor.execute(None, EchoInput(value="hi"))
 
         assert executor._pending == {}
+
+
+class TestReplyConsumerDoesNotAck:
+    """The reply consumer is registered no_ack=True, so it must never try to ack."""
+
+    async def test_handling_a_reply_never_calls_process_or_ack(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """`message.process()` and `no_ack=True` are mutually exclusive in aio-pika.
+
+        `IncomingMessage.__init__` presets `processed` when `no_ack` is set, but
+        `ProcessContext.__aexit__` calls `ack()` on a clean exit regardless, and
+        `ack()` raises `TypeError` unconditionally under `no_ack`. aiormq
+        dispatches consumer callbacks with a bare `create_task` and never
+        retrieves the result, so this produced a "Task exception was never
+        retrieved" traceback on every single reply.
+        """
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-noack"
+        call = asyncio.ensure_future(executor.execute(None, EchoInput(value="hi")))
+        await asyncio.sleep(0)
+        correlation_id = next(iter(executor._pending))
+        message = fake_incoming_message(
+            mocker,
+            correlation_id=correlation_id,
+            body=EchoOutput(value="hi").model_dump_json().encode(),
+        )
+
+        await queue.consume.await_args.args[0](message)
+        await call
+
+        message.process.assert_not_called()
+        message.ack.assert_not_awaited()
+
+    async def test_the_reply_consumer_is_registered_with_no_ack(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """Replies are fire-and-forget; the guard above only holds while this does."""
+        with pytest.raises(RemoteCallTimeoutError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+        _, kwargs = mock_channel.declare_queue.return_value.consume.await_args
+        assert kwargs["no_ack"] is True

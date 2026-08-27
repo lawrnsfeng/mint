@@ -85,6 +85,22 @@ class MissingInputError(WorkerError):
 
 
 @dataclass
+class ChildNotInParentError(WorkerError):
+    """A node's parent does not list it as one of its children.
+
+    Reachable when a canvas id is reused for a different graph — which
+    ``Chain.apply``/``Chord.apply``'s ``canvas_id`` argument makes possible — so it
+    has to raise as a ``WorkerError`` and route through the engine's normal error
+    handling rather than escaping as a bare ``ValueError``.
+    """
+
+    TEMPLATE = "Node {node_id} is not a child of {parent_id} in canvas {canvas_id}"
+    node_id: str
+    parent_id: str
+    canvas_id: str
+
+
+@dataclass
 class CanvasCycleError(WorkerError):
     """A cycle was detected while walking a canvas graph."""
 

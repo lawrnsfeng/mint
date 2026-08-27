@@ -444,3 +444,47 @@ class TestGetCanvasStatus:
         mock_client.get.return_value = CanvasStatus.FINISHED.value.encode()
 
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.FINISHED
+
+
+class TestStatusKeyOutlivesItsData:
+    """A canvas's status is its tombstone and must survive longer than the graph."""
+
+    async def test_terminal_status_key_gets_the_longer_ttl(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Expiring the status with the data made a finished canvas read RUNNING again.
+
+        `get_canvas_status` reports RUNNING for a missing key, so once the status
+        expired a late replay walked into a canvas whose nodes were long gone and
+        marked the finished canvas ERROR.
+        """
+        await store.set_canvas_status(CANVAS, CanvasStatus.FINISHED)
+
+        expiries = {call.args[0]: call.args[1] for call in mock_client.expire.await_args_list}
+        assert expiries[f"mint-worker:canvas:{CANVAS}:status"] == store.status_ttl_seconds
+        assert store.status_ttl_seconds > store.terminal_ttl_seconds
+
+    async def test_data_keys_keep_the_shorter_terminal_ttl(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Only the status is long-lived — the graph itself must still be reclaimed."""
+        mock_client.smembers.return_value = {b"mint-worker:canvas:c1:node:t1"}
+
+        await store.set_canvas_status(CANVAS, CanvasStatus.FINISHED)
+
+        expiries = {call.args[0]: call.args[1] for call in mock_client.expire.await_args_list}
+        assert expiries[b"mint-worker:canvas:c1:node:t1"] == store.terminal_ttl_seconds
+
+    async def test_a_running_canvas_still_gets_no_ttl_at_all(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """In-flight data must never expire underneath a live canvas."""
+        await store.set_canvas_status(CANVAS, CanvasStatus.RUNNING)
+
+        mock_client.expire.assert_not_awaited()

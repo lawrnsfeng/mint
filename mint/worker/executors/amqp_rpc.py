@@ -119,22 +119,33 @@ class AMQPRPCExecutor[T: BaseModel, RT: BaseModel]:
             return await connection.channel()
 
     async def _on_reply(self, message: AbstractIncomingMessage) -> None:
-        async with message.process():
-            correlation_id = message.correlation_id
-            if correlation_id is None:
-                logger.warning("AMQP RPC reply without a correlation_id")
-                return
-            future = self._pending.pop(correlation_id, None)
-            if future is None or future.done():
-                return
-            try:
-                future.set_result(self.output_type.model_validate_json(message.body))
-            except ValidationError as exc:
-                # The future is already popped, so letting this escape into aio-pika's
-                # consumer callback would leave the caller blocked for the full timeout
-                # and then raise RemoteCallTimeoutError — reporting "no reply" for a
-                # reply that did arrive and simply didn't match output_type.
-                future.set_exception(exc)
+        """Resolve the pending call this reply belongs to.
+
+        Deliberately no ``async with message.process()``. The reply consumer is
+        registered with ``no_ack=True``, and the two are mutually exclusive:
+        aio-pika presets ``processed`` on a no-ack message, then
+        ``ProcessContext.__aexit__`` calls ``ack()`` anyway on a clean exit, and
+        ``ack()`` raises ``TypeError`` unconditionally under ``no_ack``. Since
+        aiormq dispatches consumer callbacks with a bare
+        ``create_task`` and never retrieves the result, that produced a "Task
+        exception was never retrieved" traceback for *every* RPC reply — the call
+        itself still returned, because the future is resolved before the exit.
+        """
+        correlation_id = message.correlation_id
+        if correlation_id is None:
+            logger.warning("AMQP RPC reply without a correlation_id")
+            return
+        future = self._pending.pop(correlation_id, None)
+        if future is None or future.done():
+            return
+        try:
+            future.set_result(self.output_type.model_validate_json(message.body))
+        except ValidationError as exc:
+            # The future is already popped, so letting this escape into aio-pika's
+            # consumer callback would leave the caller blocked for the full timeout
+            # and then raise RemoteCallTimeoutError — reporting "no reply" for a
+            # reply that did arrive and simply didn't match output_type.
+            future.set_exception(exc)
 
     async def _declare_reply_queue(
         self,

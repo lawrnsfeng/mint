@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, TypeAdapter
 
 from mint.worker.enums import ErrorPolicy, NodeStatus, NodeType
+from mint.worker.exc import ChildNotInParentError
 
 type TerminalStatus = Literal[NodeStatus.FINISHED, NodeStatus.ERROR]
 """The only two statuses a NodeOutcome can carry: a node either finished or errored."""
@@ -41,9 +42,25 @@ class ChainNode(BaseNode):
     children: list[str] = Field(min_length=1)
     error_policy: ErrorPolicy = ErrorPolicy.PROPAGATE
 
+    def index_of(self, node_id: str) -> int:
+        """Return ``node_id``'s position among this chain's children.
+
+        Raises ``ChildNotInParentError`` rather than ``list.index``'s bare
+        ``ValueError``, which escaped every ``except WorkerError`` in the engine
+        and both drivers and left the canvas RUNNING with no status recorded.
+        """
+        try:
+            return self.children.index(node_id)
+        except ValueError as exc:
+            raise ChildNotInParentError(
+                node_id=node_id,
+                parent_id=self.id,
+                canvas_id=self.canvas_id,
+            ) from exc
+
     def next_id(self, node_id: str) -> str | None:
         """Return the id of the node after ``node_id``, or None if it was last."""
-        idx = self.children.index(node_id) + 1
+        idx = self.index_of(node_id) + 1
         if idx >= len(self.children):
             return None
         return self.children[idx]

@@ -29,13 +29,22 @@ A fifth issue, also only reachable against a real broker: a real ``ConsumerRecor
 ``TypeError: Expected list, got tuple``). ``deadletter`` passed the tuple straight
 through; a mocked producer never enforces the type difference, so this only ever
 surfaced against the real broker. Fixed by copying into a ``list`` before publishing.
+
+A sixth, found by review: the broker kept a single ``self._consumer`` slot even
+though ``WorkerApp`` deliberately shares one broker across every registered
+worker. A second ``consume()`` overwrote the first, so worker A's ack committed
+worker B's consumer — A replayed everything on restart while B's offsets
+advanced past records still in flight. Consumers are now keyed by topic, each
+``KafkaDelivery`` carries the consumer it came from, and a commit names that
+record's own partition offset instead of the consumer's whole fetch position
+(which ``Worker.run()``'s concurrent handling would otherwise commit past).
 """
 
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
 from typing import TYPE_CHECKING, Final
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
 
@@ -50,18 +59,30 @@ ATTEMPT_HEADER: Final[str] = "x-mint-attempt"
 class KafkaDelivery:
     """One delivered Kafka record, with ack/nack via manual commit + republish."""
 
-    def __init__(self, broker: "KafkaBroker", record: "ConsumerRecord") -> None:
-        """Wrap ``record``, reading its attempt count from headers (default 1)."""
+    def __init__(
+        self,
+        broker: "KafkaBroker",
+        record: "ConsumerRecord",
+        consumer: AIOKafkaConsumer,
+    ) -> None:
+        """Wrap ``record``, reading its attempt count from headers (default 1).
+
+        ``consumer`` is the one this record was actually fetched from, carried
+        explicitly rather than looked up on the broker: a single ``KafkaBroker``
+        is shared across every worker in a ``WorkerApp``, so there is no single
+        "current" consumer to commit against.
+        """
         self._broker = broker
         self._record = record
+        self._consumer = consumer
         self.body: bytes = record.value if record.value is not None else b""
         headers = dict(record.headers or ())
         raw_attempt = headers.get(ATTEMPT_HEADER)
         self.attempt = int(raw_attempt) if raw_attempt else 1
 
     async def ack(self) -> None:
-        """Commit this record's offset."""
-        await self._broker.commit()
+        """Commit past this record's offset, on this record's own consumer."""
+        await self._commit()
 
     async def nack(self, *, requeue: bool) -> None:
         """Republish with an incremented attempt, or dead-letter — then commit either way.
@@ -74,7 +95,20 @@ class KafkaDelivery:
             await self._broker.redeliver(self._record, self.attempt + 1)
         else:
             await self._broker.deadletter(self._record)
-        await self._broker.commit()
+        await self._commit()
+
+    async def _commit(self) -> None:
+        """Commit exactly this record's partition offset, never the whole position.
+
+        A bare ``consumer.commit()`` commits every partition's *current* fetch
+        position. ``Worker.run()`` handles several records concurrently, so that
+        would commit past records still in flight — losing them outright if the
+        process dies. Committing ``offset + 1`` for this record's partition only
+        can at worst move the offset backwards under out-of-order acks, which
+        replays (at-least-once) rather than drops.
+        """
+        partition = TopicPartition(self._record.topic, self._record.partition)
+        await self._consumer.commit({partition: self._record.offset + 1})
 
 
 class KafkaBroker:
@@ -91,7 +125,9 @@ class KafkaBroker:
         self.bootstrap_servers = bootstrap_servers
         self.group_id = group_id
         self._producer: AIOKafkaProducer | None = None
-        self._consumer: AIOKafkaConsumer | None = None
+        # One consumer per topic, not one slot: a WorkerApp shares a single broker
+        # across every registered worker, and each worker consumes its own topic.
+        self._consumers: dict[str, AIOKafkaConsumer] = {}
         self._admin: AIOKafkaAdminClient | None = None
 
     async def _ensure_producer(self) -> AIOKafkaProducer:
@@ -143,17 +179,13 @@ class KafkaBroker:
             auto_offset_reset="earliest",
         )
         await consumer.start()
-        self._consumer = consumer
+        self._consumers[topic] = consumer
         try:
             async for record in consumer:
-                yield KafkaDelivery(self, record)
+                yield KafkaDelivery(self, record, consumer)
         finally:
+            self._consumers.pop(topic, None)
             await consumer.stop()
-
-    async def commit(self) -> None:
-        """Commit the current consumer's offsets."""
-        if self._consumer is not None:
-            await self._consumer.commit()
 
     async def redeliver(self, record: "ConsumerRecord", attempt: int) -> None:
         """Re-publish ``record`` at the given attempt count."""
@@ -171,18 +203,21 @@ class KafkaBroker:
         a real, container-test-only-catchable bug (bug #17), since a mocked
         producer never enforces the type at all.
         """
+        dlq_topic = f"{record.topic}{self.DLQ_SUFFIX}"
+        await self._ensure_topic(dlq_topic)
         producer = await self._ensure_producer()
         await producer.send_and_wait(
-            f"{record.topic}{self.DLQ_SUFFIX}",
+            dlq_topic,
             value=record.value,
             headers=list(record.headers or ()),
         )
 
     async def close(self) -> None:
-        """Stop the producer/consumer and close the admin client, whichever were started."""
+        """Stop the producer and every consumer, and close the admin client, if started."""
         if self._producer is not None:
             await self._producer.stop()
-        if self._consumer is not None:
-            await self._consumer.stop()
+        for consumer in list(self._consumers.values()):
+            await consumer.stop()
+        self._consumers.clear()
         if self._admin is not None:
             await self._admin.close()

@@ -16,6 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiokafka.errors import TopicAlreadyExistsError
 
+from aiokafka import TopicPartition
+
 from mint.worker.brokers.kafka import ATTEMPT_HEADER, KafkaBroker, KafkaDelivery
 from mint.worker.enums import DeliveryGuarantee
 
@@ -237,36 +239,60 @@ class TestConsume:
 
 
 class TestAckNack:
-    """KafkaDelivery.ack()/nack() must commit, and republish/dead-letter as appropriate."""
+    """KafkaDelivery.ack()/nack() must commit its own consumer, and republish/dead-letter."""
 
     def _record(self, mocker: "MockerFixture", **overrides: object) -> MagicMock:
         record = mocker.MagicMock()
         record.value = overrides.get("value", b"payload")
         record.topic = overrides.get("topic", TOPIC)
         record.headers = overrides.get("headers", ())
+        record.partition = overrides.get("partition", 0)
+        record.offset = overrides.get("offset", 41)
         return record
 
-    async def test_ack_commits(self, mocker: "MockerFixture") -> None:
-        """ack() must commit the consumer's offset."""
-        broker = KafkaBroker("localhost:9092")
-        broker._consumer = mocker.AsyncMock()
-        record = self._record(mocker)
-        delivery = KafkaDelivery(broker, record)
-
-        await delivery.ack()
-
-        broker._consumer.commit.assert_awaited_once()
-
-    async def test_ack_before_any_consumer_started_is_a_no_op(
+    async def test_ack_commits_this_records_own_partition_offset(
         self,
         mocker: "MockerFixture",
     ) -> None:
-        """ack() on a broker whose consumer never started must not raise."""
-        broker = KafkaBroker("localhost:9092")
-        record = self._record(mocker)
-        delivery = KafkaDelivery(broker, record)
+        """ack() must commit `offset + 1` for this record's partition, nothing wider.
 
-        await delivery.ack()  # must not raise
+        A bare ``commit()`` commits every partition's current fetch position,
+        which ``Worker.run()``'s concurrent handling would push past records
+        still in flight — losing them if the process then dies.
+        """
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        record = self._record(mocker, partition=3, offset=41)
+        delivery = KafkaDelivery(broker, record, consumer)
+
+        await delivery.ack()
+
+        consumer.commit.assert_awaited_once_with({TopicPartition(TOPIC, 3): 42})
+
+    async def test_each_delivery_commits_the_consumer_it_came_from(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """One broker serves many workers, so a delivery must never commit a sibling's consumer.
+
+        With a single shared ``_consumer`` slot, worker A's ack committed worker
+        B's consumer: A replayed everything on restart while B's offsets advanced
+        past records it was still processing.
+        """
+        broker = KafkaBroker("localhost:9092")
+        consumer_a, consumer_b = mocker.AsyncMock(), mocker.AsyncMock()
+        delivery_a = KafkaDelivery(broker, self._record(mocker, topic="a"), consumer_a)
+        delivery_b = KafkaDelivery(broker, self._record(mocker, topic="b"), consumer_b)
+
+        await delivery_a.ack()
+
+        consumer_a.commit.assert_awaited_once()
+        consumer_b.commit.assert_not_awaited()
+
+        await delivery_b.ack()
+
+        consumer_a.commit.assert_awaited_once()
+        consumer_b.commit.assert_awaited_once()
 
     async def test_nack_requeue_true_republishes_with_incremented_attempt(
         self,
@@ -275,17 +301,18 @@ class TestAckNack:
     ) -> None:
         """A requeued nack must republish with attempt bumped, then commit."""
         broker = KafkaBroker("localhost:9092")
-        broker._consumer = mocker.AsyncMock()
+        consumer = mocker.AsyncMock()
         record = self._record(mocker, headers=((ATTEMPT_HEADER, b"1"),))
-        delivery = KafkaDelivery(broker, record)
+        delivery = KafkaDelivery(broker, record, consumer)
 
         await delivery.nack(requeue=True)
 
         mock_producer_cls.return_value.send_and_wait.assert_awaited_once()
         _, kwargs = mock_producer_cls.return_value.send_and_wait.await_args
         assert (ATTEMPT_HEADER, b"2") in kwargs["headers"]
-        broker._consumer.commit.assert_awaited_once()
+        consumer.commit.assert_awaited_once()
 
+    @pytest.mark.usefixtures("mock_admin_cls")
     async def test_nack_requeue_false_publishes_to_the_dead_letter_topic(
         self,
         mocker: "MockerFixture",
@@ -293,9 +320,9 @@ class TestAckNack:
     ) -> None:
         """A dropped message must land on `{topic}.dlq`, then still commit past it."""
         broker = KafkaBroker("localhost:9092")
-        broker._consumer = mocker.AsyncMock()
+        consumer = mocker.AsyncMock()
         record = self._record(mocker, topic=TOPIC, value=b"doomed")
-        delivery = KafkaDelivery(broker, record)
+        delivery = KafkaDelivery(broker, record, consumer)
 
         await delivery.nack(requeue=False)
 
@@ -305,6 +332,23 @@ class TestAckNack:
             headers=[],
         )
 
+    async def test_nack_requeue_false_creates_the_dead_letter_topic_first(
+        self,
+        mocker: "MockerFixture",
+        mock_admin_cls: AsyncMock,
+        mock_producer_cls: AsyncMock,
+    ) -> None:
+        """The DLQ topic is created like any other — a broker with auto-create off still works."""
+        broker = KafkaBroker("localhost:9092")
+        delivery = KafkaDelivery(broker, self._record(mocker), mocker.AsyncMock())
+
+        await delivery.nack(requeue=False)
+
+        mock_admin_cls.return_value.create_topics.assert_awaited_once()
+        (new_topics,), _ = mock_admin_cls.return_value.create_topics.await_args
+        assert new_topics[0].name == f"{TOPIC}{KafkaBroker.DLQ_SUFFIX}"
+
+    @pytest.mark.usefixtures("mock_admin_cls")
     async def test_nack_requeue_false_converts_the_records_header_tuple_to_a_list(
         self,
         mocker: "MockerFixture",
@@ -317,16 +361,16 @@ class TestAckNack:
         rather than relying on equality alone catching a silent tuple pass-through.
         """
         broker = KafkaBroker("localhost:9092")
-        broker._consumer = mocker.AsyncMock()
+        consumer = mocker.AsyncMock()
         record = self._record(mocker, headers=((ATTEMPT_HEADER, b"1"), ("trace", b"abc")))
-        delivery = KafkaDelivery(broker, record)
+        delivery = KafkaDelivery(broker, record, consumer)
 
         await delivery.nack(requeue=False)
 
         _, kwargs = mock_producer_cls.return_value.send_and_wait.await_args
         assert isinstance(kwargs["headers"], list)
         assert kwargs["headers"] == [(ATTEMPT_HEADER, b"1"), ("trace", b"abc")]
-        broker._consumer.commit.assert_awaited_once()
+        consumer.commit.assert_awaited_once()
 
 
 class TestGuaranteeAndClose:
@@ -343,10 +387,26 @@ class TestGuaranteeAndClose:
         await broker.close()  # must not raise
 
         broker._producer = mocker.AsyncMock()
-        broker._consumer = mocker.AsyncMock()
+        broker._consumers["t"] = mocker.AsyncMock()
         broker._admin = mocker.AsyncMock()
+        consumer = broker._consumers["t"]
         await broker.close()
 
         broker._producer.stop.assert_awaited_once()
-        broker._consumer.stop.assert_awaited_once()
+        consumer.stop.assert_awaited_once()
         broker._admin.close.assert_awaited_once()
+
+    async def test_close_stops_every_consumer_not_just_the_last(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """A shared broker holds one consumer per topic; close() must stop all of them."""
+        broker = KafkaBroker("localhost:9092")
+        consumers = {topic: mocker.AsyncMock() for topic in ("a", "b", "c")}
+        broker._consumers.update(consumers)
+
+        await broker.close()
+
+        for consumer in consumers.values():
+            consumer.stop.assert_awaited_once()
+        assert broker._consumers == {}

@@ -10,9 +10,9 @@ variable for the whole test and pulls every delivery it needs from that *same*
 generator, mirroring how `Worker.run()` actually drives it
 (`async for delivery in broker.consume(topic):`, held for the loop's lifetime) —
 never the fire-and-forget `anext(broker.consume(topic))` pattern the RabbitMQ/Redis
-container tests use. Kafka's ack/nack route through the broker's own shared
-`self._consumer` (unlike RabbitMQ/Redis, where ack/nack are self-contained on the
-delivery), so letting a generator go out of scope mid-test schedules its
+container tests use. A Kafka ack/nack commits on the consumer that produced the
+record (unlike RabbitMQ/Redis, where ack/nack are self-contained on the delivery),
+so letting a generator go out of scope mid-test schedules its
 `finally: await consumer.stop()` as a background task that races the next
 `ack()`/`nack()` call against that same consumer — a real hang, caught live while
 first writing this file with the fire-and-forget pattern.
@@ -28,6 +28,7 @@ from collections.abc import AsyncIterator, Iterator
 from uuid import uuid4
 
 import pytest
+from aiokafka import TopicPartition
 from testcontainers.community.kafka import KafkaContainer
 
 from mint.worker.brokers.kafka import KafkaBroker
@@ -130,3 +131,42 @@ class TestDeadLetterRegression:
         assert second.body == b"retry me"
         assert second.attempt == 2
         await second.ack()
+
+
+class TestSharedBrokerAcrossTopics:
+    """Regression: one broker serves every worker in a WorkerApp — no shared consumer slot."""
+
+    async def test_two_topics_commit_independently_against_a_real_broker(
+        self,
+        broker: KafkaBroker,
+    ) -> None:
+        """Acking on topic A must not move topic B's committed offset.
+
+        With a single ``_consumer`` slot the second ``consume()`` overwrote the
+        first, so A's ack committed B's consumer — B's offsets advanced past a
+        record still in flight, and a restart lost it. Only a real broker proves
+        the committed offsets themselves, not just which mock was called.
+        """
+        topic_a, topic_b = unique_topic(), unique_topic()
+        await broker.publish(topic_a, b"a1")
+        await broker.publish(topic_b, b"b1")
+
+        consumer_a, consumer_b = broker.consume(topic_a), broker.consume(topic_b)
+        delivery_a = await asyncio.wait_for(anext(consumer_a), timeout=FETCH_TIMEOUT_SECONDS)
+        delivery_b = await asyncio.wait_for(anext(consumer_b), timeout=FETCH_TIMEOUT_SECONDS)
+
+        await delivery_a.ack()
+
+        # B was never acked, so a fresh consumer group position for B must still
+        # be uncommitted while A's is committed past its only record.
+        committed_a = await broker._consumers[topic_a].committed(
+            TopicPartition(topic_a, 0),
+        )
+        committed_b = await broker._consumers[topic_b].committed(
+            TopicPartition(topic_b, 0),
+        )
+        assert committed_a == 1
+        assert committed_b is None
+
+        await delivery_b.ack()
+        assert await broker._consumers[topic_b].committed(TopicPartition(topic_b, 0)) == 1

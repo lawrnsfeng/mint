@@ -6,6 +6,14 @@ a durable consumer's cursor to the (stream, consumer name) pair — reusing the 
 name across different topics/subjects makes them fight over the same delivery
 cursor, silently dropping or duplicating messages depending on subscribe order.
 Here the durable name is derived from the topic, so each gets its own cursor.
+
+Two further issues found by review. ``_stream_name`` collapsed ``.`` to ``-``
+with a plain replace, which is not injective: ``a.b`` and ``a-b`` mapped onto one
+stream and one durable name — the same cursor sharing, reached a different way.
+And ``_ensure_stream`` gave every topic its own stream claiming ``{topic}`` and
+``{topic}.dlq``, so consuming ``foo.dlq`` tried to declare a stream over a subject
+``foo``'s stream already owned, which JetStream rejects. A dead-letter subject now
+resolves back to its parent's stream instead.
 """
 
 from collections.abc import AsyncIterator, Mapping
@@ -69,16 +77,39 @@ class NatsBroker:
         return self._jetstream
 
     def _stream_name(self, topic: str) -> str:
-        return topic.replace(".", "-")
+        """Return an injective stream name for ``topic``.
+
+        JetStream stream names can't contain ``.``, so it collapses to ``-``. A
+        plain replace isn't injective — ``a.b`` and ``a-b`` both became ``a-b``,
+        sharing one stream *and* one durable consumer name, which is the exact
+        cursor-sharing failure bug #10 was about. Doubling any existing ``-``
+        first keeps the mapping reversible.
+        """
+        return topic.replace("-", "--").replace(".", "-")
 
     def _durable_name(self, topic: str) -> str:
         """Return a per-topic durable consumer name — the actual fix for bug #10."""
         return f"{self.group}-{self._stream_name(topic)}"
 
+    def _owning_topic(self, topic: str) -> str:
+        """Return the topic whose stream owns ``topic``'s subject.
+
+        A dead-letter subject lives inside its parent topic's stream, so a ``.dlq``
+        topic resolves back to that parent. Declaring a stream of its own would
+        claim ``{topic}.dlq``, a subject the parent stream already owns, and
+        JetStream rejects overlapping subjects across streams — the same
+        terminate-the-chain rule ``RabbitMQBroker._declare_topic`` needs for
+        bug #21.
+        """
+        if topic.endswith(self.DLQ_SUFFIX):
+            return topic[: -len(self.DLQ_SUFFIX)]
+        return topic
+
     async def _ensure_stream(self, jetstream: JetStreamContext, topic: str) -> None:
+        owner = self._owning_topic(topic)
         await jetstream.add_stream(
-            name=self._stream_name(topic),
-            subjects=[topic, f"{topic}{self.DLQ_SUFFIX}"],
+            name=self._stream_name(owner),
+            subjects=[owner, f"{owner}{self.DLQ_SUFFIX}"],
         )
 
     async def publish(

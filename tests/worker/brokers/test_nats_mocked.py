@@ -259,3 +259,60 @@ class TestGuaranteeAndClose:
         broker = NatsBroker("nats://fake")
 
         await broker.close()  # must not raise
+
+
+class TestStreamNamingIsInjective:
+    """Two distinct topics must never collapse onto one stream or one durable name."""
+
+    def test_a_dotted_and_a_dashed_topic_get_different_stream_names(
+        self,
+        broker: NatsBroker,
+    ) -> None:
+        """A plain `.` -> `-` replace mapped `a.b` and `a-b` onto the same stream.
+
+        That is bug #10's cursor sharing reached a different way: one stream and
+        one durable name shared by two logically unrelated topics.
+        """
+        assert broker._stream_name("a.b") != broker._stream_name("a-b")
+
+    def test_a_dotted_and_a_dashed_topic_get_different_durable_names(
+        self,
+        broker: NatsBroker,
+    ) -> None:
+        """The durable name derives from the stream name, so it inherits the collision."""
+        assert broker._durable_name("a.b") != broker._durable_name("a-b")
+
+    def test_stream_names_never_contain_a_dot(self, broker: NatsBroker) -> None:
+        """JetStream stream names can't contain `.`, which is why the mapping exists at all."""
+        assert "." not in broker._stream_name("deeply.nested.topic-with-dashes")
+
+
+class TestDeadLetterStreamOwnership:
+    """A `.dlq` subject belongs to its parent's stream, not a stream of its own."""
+
+    async def test_consuming_a_dlq_topic_reuses_its_parents_stream(
+        self,
+        broker: NatsBroker,
+        mock_jetstream: AsyncMock,
+    ) -> None:
+        """Declaring `foo-dlq` over `foo.dlq` overlaps `foo`'s stream, which JetStream rejects.
+
+        The same terminate-the-chain rule RabbitMQ needs for bug #21: a
+        dead-letter destination ends the chain instead of extending it.
+        """
+        await broker.publish(f"{TOPIC_A}{NatsBroker.DLQ_SUFFIX}", b"body")
+
+        _, kwargs = mock_jetstream.add_stream.await_args
+        assert kwargs["name"] == broker._stream_name(TOPIC_A)
+        assert kwargs["subjects"] == [TOPIC_A, f"{TOPIC_A}{NatsBroker.DLQ_SUFFIX}"]
+
+    async def test_a_dlq_topic_never_claims_a_recursive_dlq_subject(
+        self,
+        broker: NatsBroker,
+        mock_jetstream: AsyncMock,
+    ) -> None:
+        """`foo.dlq.dlq` must never be declared — the chain terminates at one level."""
+        await broker.publish(f"{TOPIC_A}{NatsBroker.DLQ_SUFFIX}", b"body")
+
+        _, kwargs = mock_jetstream.add_stream.await_args
+        assert f"{TOPIC_A}.dlq.dlq" not in kwargs["subjects"]

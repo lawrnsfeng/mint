@@ -3,11 +3,13 @@
 `mint.worker` is a decentralized async canvas-orchestration library — chains and
 chords (fan-out/fan-in) of tasks dispatched over a broker, similar in spirit to
 Celery's `chain`/`chord` but fully asynchronous, ported from an internal
-predecessor (`mini.worker`) and hardened against 17 confirmed bugs, several of
-which were only found by writing this package test-first and running its bug
-regression tests against real containers. This page is the permanent reference
-for *why* it's built the way it is, the bugs found and fixed along the way, and
-the mapping for migrating an existing `mini.worker` consumer.
+predecessor (`mini.worker`) and hardened against 40 confirmed bugs — 17 inherited
+from `mini.worker`, 5 more found live while building this package test-first
+against real containers, and 18 found by a second review round afterwards. This
+page is the permanent reference for *why* it's built the way it is, a summary of
+the inherited bugs, and the mapping for migrating an existing `mini.worker`
+consumer. [`worker-bugs-and-fixes.md`](worker-bugs-and-fixes.md) is the expanded
+version, with a concrete failure scenario and the exact fix for every one.
 
 ## The core idea, unchanged from mini
 
@@ -18,6 +20,10 @@ itself. That decentralization is the library's differentiator and the one
 design choice this port never questioned. Everything else was fixed.
 
 ## mini vs. mint: bugs found and fixed
+
+The 17 bugs inherited from `mini.worker`. Bugs #18-22 (found live while building
+this package) and #23-40 (found by the second review round) are catalogued in
+[`worker-bugs-and-fixes.md`](worker-bugs-and-fixes.md).
 
 | # | Bug | mini location | Fix |
 |---|---|---|---|
@@ -41,14 +47,22 @@ design choice this port never questioned. Everything else was fixed.
 
 ## Bugs only a container test could catch
 
-Bugs #9, #16, and #17 all passed their mocked-client test suite and only
-surfaced against a real broker — the exact reason every broker/store gets two
-test files (`test_<name>_mocked.py`, then `test_<name>_container.py`), run in
-that order, never combined into one file. Mocking catches *our own* logic bugs
-(a wrong method call, a missing `await`, a hardcoded name — bugs #7, #8, #10,
-#12 above all fall in this category); a handful of real-protocol behaviors
-(exact wire-level type requirements, a client's default offset-reset policy, a
-queue redeclaration conflict) are only observable against the real thing.
+Bugs #9, #16, #17 and #21 all passed their mocked-client test suite and only
+surfaced against a real broker — the reason a broker gets two test files
+(`test_<name>_mocked.py`, then `test_<name>_container.py`), run in that order,
+never combined into one file. Mocking catches *our own* logic bugs (a wrong
+method call, a missing `await`, a hardcoded name — bugs #7, #8, #10, #12 above
+all fall in this category); a handful of real-protocol behaviors (exact
+wire-level type requirements, a client's default offset-reset policy, a queue
+redeclaration conflict, whether two consumer groups really commit independently)
+are only observable against the real thing.
+
+Container coverage is deliberately uneven rather than uniform, and worth being
+precise about: RabbitMQ and Kafka have container suites (`test_rabbitmq_container.py`,
+`test_kafka_container.py`), and so does `RedisCanvasStore`
+(`test_redis_container.py`, for the Lua fan-in's atomicity under real
+concurrency). The Redis *broker* and NATS have mocked suites only — a gap, not a
+claim of equivalence.
 
 ## The idempotent fan-in, in detail
 

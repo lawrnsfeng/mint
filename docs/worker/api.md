@@ -110,8 +110,6 @@
 
 ::: mint.worker.exc.WorkerError
 
-::: mint.worker.exc.MalformedMessageError
-
 ::: mint.worker.exc.NodeNotFoundError
 
 ::: mint.worker.exc.ParentNotFoundError
@@ -123,6 +121,8 @@
 ::: mint.worker.exc.DuplicateNodeIdError
 
 ::: mint.worker.exc.MissingInputError
+
+::: mint.worker.exc.ConflictingErrorPolicyError
 
 ::: mint.worker.exc.CanvasCycleError
 

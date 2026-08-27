@@ -1,11 +1,12 @@
 # `mint.worker`: Every Issue Found, and How It Was Fixed
 
 This is a practical, detailed walkthrough of every bug found while porting
-`mini.worker` to `mint.worker` — both the bugs found by design review before
-writing any code, and the ones found live while building the replacement
-test-first. Each entry gives: where the bug lived, a concrete scenario where it
-bites, why it happens, and exactly what the fix looks like. For the condensed
-reference table and the migration mapping, see
+`mini.worker` to `mint.worker` — the bugs found by design review before writing
+any code, the ones found live while building the replacement test-first, and the
+ones a second review round found in `mint.worker` itself once it was complete.
+Each entry gives: where the bug lived, a concrete scenario where it bites, why it
+happens, and exactly what the fix looks like. For the condensed reference table
+and the migration mapping, see
 [`worker-implementation-notes.md`](worker-implementation-notes.md) — this file
 is the expanded, "how do I actually fix this" version.
 
@@ -38,6 +39,27 @@ is the expanded, "how do I actually fix this" version.
 - [20. Constructing a broker outside an event loop crashes](#20-constructing-a-broker-outside-an-event-loop-crashes)
 - [21. RabbitMQ rejects redeclaring its own dead-letter queue](#21-rabbitmq-rejects-redeclaring-its-own-dead-letter-queue)
 - [22. A test helper's hidden hang (process hygiene, not a `mint.worker` bug)](#22-a-test-helpers-hidden-hang-process-hygiene-not-a-mintworker-bug)
+
+**Part 3 — Bugs found in `mint.worker` itself by a second review round**
+
+- [23. A chord's callback is lost for good if its dispatch fails to publish](#23-a-chords-callback-is-lost-for-good-if-its-dispatch-fails-to-publish)
+- [24. The fan-in script never reloads after a Redis script-cache flush](#24-the-fan-in-script-never-reloads-after-a-redis-script-cache-flush)
+- [25. One Kafka consumer slot, shared by every worker, commits the wrong offsets](#25-one-kafka-consumer-slot-shared-by-every-worker-commits-the-wrong-offsets)
+- [26. A Kafka ack commits past records still being processed](#26-a-kafka-ack-commits-past-records-still-being-processed)
+- [27. A message the worker's `Input` can't parse stalls its canvas forever](#27-a-message-the-workers-input-cant-parse-stalls-its-canvas-forever)
+- [28. A backlog spawns one handler task per message, without limit](#28-a-backlog-spawns-one-handler-task-per-message-without-limit)
+- [29. The coordinator tracks in-flight nodes by node id alone](#29-the-coordinator-tracks-in-flight-nodes-by-node-id-alone)
+- [30. The coordinator's shutdown leaks its store's connections](#30-the-coordinators-shutdown-leaks-its-stores-connections)
+- [31. A `stop()` that arrives before the run loop starts is discarded](#31-a-stop-that-arrives-before-the-run-loop-starts-is-discarded)
+- [32. Every AMQP RPC call leaks a reply queue and a consumer](#32-every-amqp-rpc-call-leaks-a-reply-queue-and-a-consumer)
+- [33. A malformed RPC reply is reported as a timeout](#33-a-malformed-rpc-reply-is-reported-as-a-timeout)
+- [34. The Redis broker can lose a message while requeueing it](#34-the-redis-broker-can-lose-a-message-while-requeueing-it)
+- [35. RabbitMQ's attempt counter never increments](#35-rabbitmqs-attempt-counter-never-increments)
+- [36. Aborting a group overwrites the legs that already succeeded](#36-aborting-a-group-overwrites-the-legs-that-already-succeeded)
+- [37. A chord's own input never reaches its callback](#37-a-chords-own-input-never-reaches-its-callback)
+- [38. Flattening a nested chain silently discards its error policy](#38-flattening-a-nested-chain-silently-discards-its-error-policy)
+- [39. Two different NATS topics can still share one stream and cursor](#39-two-different-nats-topics-can-still-share-one-stream-and-cursor)
+- [40. Consuming a NATS dead-letter subject is rejected outright](#40-consuming-a-nats-dead-letter-subject-is-rejected-outright)
 
 ---
 
@@ -1134,6 +1156,740 @@ before trusting it enough to fold into the regular suite.
 
 ---
 
+## Part 3 — Bugs found in `mint.worker` itself by a second review round
+
+Everything above was found while *writing* `mint.worker`. These were found by
+reviewing the finished package — the class of bug a passing test suite doesn't
+surface, because the tests were written against the same assumptions the code
+was.
+
+### 23. A chord's callback is lost for good if its dispatch fails to publish
+
+**Where:** `mint/worker/canvas/engine.py::_advance_group`
+
+**Symptom:** A chord's last leg finishes, the broker has a connection blip, and
+the chord's callback simply never runs. The canvas sits in `RUNNING` forever
+with every leg `FINISHED` and nothing left that will ever advance it.
+
+**Root cause:** The one-shot fan-in guard is burned *before* the caller gets a
+chance to publish what it authorised:
+
+```python
+progress = await self.store.mark_child_done(...)   # SETNX burns the guard here
+if not progress.fired:
+    return None, None
+...
+return Dispatch(topic=entry.topic, ...), None      # caller publishes AFTER this returns
+```
+
+`Worker._advance_canvas` then publishes, fails, and returns `False`, which nacks
+for redelivery. On redelivery `mark_child_done` finds the guard already burned,
+returns `fired=False`, `_advance_group` returns `(None, None)`, `complete()`
+returns `[]` — and `_advance_canvas` reports success, so the worker **acks**.
+This directly defeats the module's own stated contract: ack only after both the
+store write and the dispatch publish have succeeded.
+
+**The practical fix:** Make the guard releasable, and release it on exactly the
+path that burned it for nothing:
+
+```python
+# mint/worker/canvas/engine.py
+async def rollback(self, dispatches: Sequence[Dispatch]) -> None:
+    for dispatch in dispatches:
+        if dispatch.group_id is not None:
+            await self.store.reset_group_fired(dispatch.canvas_id, dispatch.group_id)
+```
+
+```python
+# mint/worker/worker.py, _advance_canvas
+except Exception:
+    logger.exception("Failed to publish dispatch", node_id=envelope.node_id)
+    await binding.engine.rollback(dispatches)   # the retry can now re-fire
+    return False
+```
+
+`Dispatch` gained a `group_id`, set only on a callback dispatch, so a caller
+rolls back exactly the bookkeeping the engine did on its behalf and nothing else.
+
+The subtle half of this fix is in the Lua script. `FAN_IN_SCRIPT` required
+`added == 1 AND count == num_children` to fire, and `added == 1` is false for
+*any* redelivery — so even with the guard released, a redelivered leg could
+never re-fire. The `added` clause turns out to be redundant: `SETNX` on the
+fired key is the entire exactly-once guarantee, and `SADD`'s idempotency is what
+keeps `count` honest. Dropping it is what makes firing re-derivable:
+
+```lua
+-- was: if added == 1 and tonumber(done_count) == tonumber(ARGV[2]) then
+if tonumber(done_count) == tonumber(ARGV[2]) then
+    if redis.call('SETNX', KEYS[2], '1') == 1 then
+        fired = 1
+    end
+end
+```
+
+Bug #3's double-counting guarantee is untouched, and still has its own tests.
+Regression tests: `test_engine.py::TestGroup::test_rollback_lets_a_redelivered_leg_re_fire_a_callback_that_never_published`
+and `test_without_a_rollback_a_redelivered_leg_still_fires_only_once`, plus
+`test_worker.py::TestRedeliverySafety::test_a_failed_callback_publish_leaves_the_chord_callback_dispatchable`
+end to end. **Note on the test itself:** the failure mode is a message that
+never arrives, so an unguarded `anext()` would *hang* the suite rather than fail
+it — exactly bug #22's trap. Every `MemoryBroker` read in those tests goes
+through a timeout-guarded helper.
+
+---
+
+### 24. The fan-in script never reloads after a Redis script-cache flush
+
+**Where:** `mint/worker/stores/redis.py::mark_child_done`
+
+**Symptom:** Chords work fine for weeks, then after a Redis restart (or a
+failover, or an ops `SCRIPT FLUSH`) every chord in the system stops firing its
+callback. Restarting the workers fixes it. Nothing in the workers' own logs
+explains why.
+
+**Root cause:** The script's SHA was loaded once and cached for the process
+lifetime, then invoked with a bare `EVALSHA`:
+
+```python
+async def _ensure_fan_in_script(self) -> str:
+    if self._fan_in_sha is None:
+        self._fan_in_sha = await self.client.script_load(FAN_IN_SCRIPT)
+    return self._fan_in_sha
+```
+
+Redis's script cache is not persistent and is not replicated. Once it's gone,
+`EVALSHA` raises `NOSCRIPT` — and nothing here ever reloads, so every subsequent
+fan-in call raises too, permanently.
+
+**The practical fix:** Use redis-py's `Script` object, which handles exactly
+this:
+
+```python
+def _ensure_fan_in_script(self) -> AsyncScript:
+    if self._fan_in_script is None:
+        self._fan_in_script = self.client.register_script(FAN_IN_SCRIPT)
+    return self._fan_in_script
+
+# ...
+added, done_count, fired = await script(keys=[done_key, fired_key], args=[child_id, num_children])
+```
+
+`AsyncScript.__call__` catches `NoScriptError` and re-loads the body before
+retrying. Regression test:
+`test_redis_mocked.py::TestFanIn::test_the_script_is_invoked_not_a_process_cached_sha`
+asserts `evalsha`/`script_load` are never called directly, since a passing
+happy-path test can't distinguish the two.
+
+---
+
+### 25. One Kafka consumer slot, shared by every worker, commits the wrong offsets
+
+**Where:** `mint/worker/brokers/kafka.py::consume`, `::commit`
+
+**Symptom:** A `WorkerApp` with two Kafka-backed workers. After a restart, one
+worker reprocesses everything it already did, and the other silently skips work
+it never finished.
+
+**Root cause:** `consume()` builds a consumer per call but stores it in one slot:
+
+```python
+consumer = AIOKafkaConsumer(topic, ...)
+await consumer.start()
+self._consumer = consumer      # overwritten by the next consume() call
+```
+
+`WorkerApp` deliberately shares one broker across every registered worker, so
+worker B's `consume()` overwrites worker A's consumer. `commit()` reads that one
+slot, so **A's ack commits B's consumer**: A's offsets never move (full replay on
+restart) while B's advance past records still in flight (loss on restart).
+`close()` had the same shape and stopped only the last consumer, leaking the rest.
+
+**The practical fix:** Key consumers by topic, and let each delivery carry the
+consumer it actually came from rather than looking one up:
+
+```python
+self._consumers: dict[str, AIOKafkaConsumer] = {}
+# ...
+self._consumers[topic] = consumer
+try:
+    async for record in consumer:
+        yield KafkaDelivery(self, record, consumer)
+finally:
+    self._consumers.pop(topic, None)
+    await consumer.stop()
+```
+
+Regression tests: `test_kafka_mocked.py::TestAckNack::test_each_delivery_commits_the_consumer_it_came_from`,
+`TestGuaranteeAndClose::test_close_stops_every_consumer_not_just_the_last`, plus
+a real-broker test asserting the *committed offsets themselves*
+(`test_kafka_container.py::TestSharedBrokerAcrossTopics`) — a mock can only prove
+which object was called, not that two groups genuinely commit independently.
+
+---
+
+### 26. A Kafka ack commits past records still being processed
+
+**Where:** `mint/worker/brokers/kafka.py::commit`
+
+**Symptom:** Under load, a Kafka worker restart loses a handful of messages that
+were mid-flight — but only when several are being handled at once.
+
+**Root cause:**
+
+```python
+await self._consumer.commit()   # no offsets argument
+```
+
+A bare `commit()` commits every partition's *current fetch position*, not the
+offset of the record being acked. `Worker.run()` spawns a task per delivery, so
+several records are in flight simultaneously; acking record N commits past
+N+1..N+k too. If the process dies before those finish, they are gone.
+
+**The practical fix:** Name the offset being acknowledged:
+
+```python
+async def _commit(self) -> None:
+    partition = TopicPartition(self._record.topic, self._record.partition)
+    await self._consumer.commit({partition: self._record.offset + 1})
+```
+
+Out-of-order acks can now move the committed offset *backwards*, which replays —
+at-least-once, and exactly what the rest of this package is built to tolerate.
+The old behavior moved it forwards, which drops. Regression test:
+`test_kafka_mocked.py::TestAckNack::test_ack_commits_this_records_own_partition_offset`.
+
+---
+
+### 27. A message the worker's `Input` can't parse stalls its canvas forever
+
+**Where:** `mint/worker/worker.py::_process_delivery`
+
+**Symptom:** One producer ships a message with a stale schema. That task's node
+sits `PENDING` forever, its canvas sits `RUNNING` forever, and every downstream
+step of the chain never runs. Nothing errors; nothing retries; nothing alerts.
+
+**Root cause:**
+
+```python
+input_obj = self._decode_input(envelope)
+if input_obj is None:
+    await delivery.nack(requeue=False)   # dead-lettered, and that's all
+    return
+```
+
+The message is correctly dead-lettered — retrying can't fix a schema mismatch —
+but no `NodeOutcome` is ever recorded, so nothing tells the canvas this node is
+finished-with-error. Embedded mode (the default) has no sweeper that would ever
+notice. Note the asymmetry that hid this: the *malformed envelope* branch above
+it genuinely has nowhere to record anything, because `canvas_id`/`node_id` are
+unreadable. Here they're both known.
+
+**The practical fix:** Fail the node explicitly, through the same path a raised
+exception already takes:
+
+```python
+if input_obj is None:
+    await self._fail_node(envelope, MALFORMED_INPUT_ERROR, binding)
+    await delivery.nack(requeue=False)
+    return
+```
+
+`_fail_node` routes by deployment mode exactly like a real failure does (store
+in embedded mode, `results_topic` in centralized mode) and is deliberately
+best-effort: the delivery is being dropped either way, so a store hiccup must
+not turn an unretryable message into a redelivery loop. Regression tests:
+`test_worker.py::TestUndeliverableInputFailsItsNode` (four tests: the outcome is
+recorded, the canvas reaches a terminal status, the dead-letter still happens,
+and centralized mode reports rather than stores).
+
+---
+
+### 28. A backlog spawns one handler task per message, without limit
+
+**Where:** `mint/worker/worker.py::run`
+
+**Symptom:** A worker restarts against a topic holding a large backlog and its
+memory climbs until the process is killed.
+
+**Root cause:**
+
+```python
+async for delivery in binding.broker.consume(self.topic):
+    task = asyncio.create_task(self._handle(delivery, binding))   # no bound at all
+```
+
+Two of the five brokers happen to provide their own backpressure —
+RabbitMQ via `prefetch_count`, the Redis broker by reading one stream entry at a
+time — which is why this never showed up in normal use. `KafkaBroker` and
+`MemoryBroker` yield as fast as the topic supplies, so the loop spawns one live
+handler per backlogged message. It also compounds bug #26: more concurrent
+in-flight records means a wider offset commit.
+
+**The practical fix:**
+
+```python
+max_concurrency: int = DEFAULT_MAX_CONCURRENCY   # 32
+
+# in run(), before spawning:
+await self._slots.acquire()
+task = asyncio.create_task(self._handle(delivery, binding))
+
+# in _handle:
+finally:
+    self._slots.release()
+```
+
+Holding the semaphore across the yield point is what actually stops the loop
+pulling more. A plain `asyncio.Semaphore` rather than
+`mint.utils.ConcurrencyLimiter`, deliberately: the limiter's `ContextVar`
+reentrancy assumes acquire and release happen in the same task, and this pattern
+splits them across two. Regression test:
+`test_worker.py::TestConcurrencyBound::test_run_never_exceeds_max_concurrency_in_flight`
+— with 8 queued messages and every handler parked, the unfixed code shows all 8
+in flight (`assert 8 == 2`).
+
+---
+
+### 29. The coordinator tracks in-flight nodes by node id alone
+
+**Where:** `mint/worker/coordinator.py::_track`, `::_untrack`
+
+**Symptom:** Two canvases built from the same template run concurrently. One of
+them stops being swept for timeouts entirely, and a later `cancel()` marks a node
+`CANCELLED` that actually finished successfully.
+
+**Root cause:**
+
+```python
+self._in_flight[node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
+```
+
+`Node(topic, input, id=...)`, `Chain(..., id=...)` and `apply(canvas_id=...)`
+all exist precisely so a caller can pin ids for idempotent retries — so the same
+node id running in two canvases at once is supported usage, not a corner case.
+With a bare `node_id` key, canvas B's `_track` evicts canvas A's entry (A drops
+out of the sweeper), and `_untrack(B, node_id)` pops the shared entry while
+leaving `_by_canvas["A"]` holding it forever — an unbounded leak, and a stale
+entry `cancel("A")` will later act on.
+
+**The practical fix:** Key by the pair that actually identifies a node.
+
+```python
+self._in_flight: dict[tuple[str, str], InFlightNode] = {}
+# ...
+self._in_flight[canvas_id, node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
+```
+
+Regression tests: `test_coordinator.py::TestCrossCanvasTracking` (three tests:
+separate tracking, untracking isolation, and a stale node in one canvas not
+timing out the other).
+
+---
+
+### 30. The coordinator's shutdown leaks its store's connections
+
+**Where:** `mint/worker/coordinator.py::_shutdown`
+
+**Symptom:** Redis connections accumulate across coordinator restarts.
+
+**Root cause:** `WorkerApp._shutdown` closes both the broker and the store;
+`Coordinator._shutdown` only ever closed the broker. A `RedisCanvasStore`'s
+connection pool was simply never released.
+
+**The practical fix:**
+
+```python
+await self.broker.close()
+await self.store.close()   # matching WorkerApp
+```
+
+Regression test: `test_coordinator.py::TestShutdownReleasesResources::test_shutdown_closes_the_store_as_well_as_the_broker`,
+asserting on close *order* via recording subclasses rather than monkeypatched
+methods (this repo forbids `# type: ignore`, and reassigning a bound method
+can't be typed).
+
+---
+
+### 31. A `stop()` that arrives before the run loop starts is discarded
+
+**Where:** `mint/worker/coordinator.py::run`, `mint/worker/app.py::run`
+
+**Symptom:** A supervisor that starts a coordinator and immediately decides to
+shut down (a failed health check, a fast SIGTERM) hangs forever. `stop()`
+returns cleanly and does nothing.
+
+**Root cause:**
+
+```python
+async def run(self) -> None:
+    self._running = True
+    self._stop_event = asyncio.Event()   # replaces whatever stop() may have already set
+```
+
+`asyncio.create_task(coordinator.run())` doesn't run the coroutine immediately.
+A `stop()` on the next line sets the event created in `__init__` — which `run()`
+then throws away when it finally gets scheduled. Nothing is left that can stop it.
+
+**The practical fix:** Create the event once, and clear it only once a shutdown
+has actually been serviced:
+
+```python
+# __init__ creates it; run() no longer touches it
+# _shutdown(), at the very end:
+self._running = False
+self._stop_event.clear()   # a serviced stop, so the instance stays reusable
+```
+
+A stop that lands early is now honored rather than lost, and re-running a
+cleanly stopped instance still works. Regression tests:
+`test_coordinator.py::TestShutdownReleasesResources::test_a_stop_that_lands_before_the_loop_starts_still_stops_it`
+and `test_an_instance_can_run_again_after_a_clean_shutdown`.
+
+---
+
+### 32. Every AMQP RPC call leaks a reply queue and a consumer
+
+**Where:** `mint/worker/executors/amqp_rpc.py::execute`
+
+**Symptom:** A worker using `AMQPRPCExecutor` runs fine for hours, then starts
+failing every call. RabbitMQ's management UI shows thousands of
+`amq.gen-*` queues.
+
+**Root cause:**
+
+```python
+async with self._ensure_channel_pool().acquire() as channel:
+    reply_queue = await self._declare_reply_queue(channel)   # declares + consumes
+    ...
+    return await self._await_reply(correlation_id, future)
+    # channel returns to the pool, still carrying this consumer
+```
+
+An exclusive queue is deleted when its **connection** closes, not its channel —
+and the channel here is pooled, so the connection stays open indefinitely. Every
+call therefore adds one queue and one consumer, spread across ~20 shared
+channels, until a per-channel consumer limit or a queue limit is reached.
+
+**The practical fix:** Capture the consumer tag and tear both down in a
+`finally`:
+
+```python
+reply_queue, consumer_tag = await self._declare_reply_queue(channel)
+try:
+    return await self._call(channel, reply_queue, input_)
+finally:
+    await self._release_reply_queue(reply_queue, consumer_tag)
+```
+
+`_release_reply_queue` cancels the consumer, deletes the queue with
+`if_unused=False, if_empty=False`, and logs rather than raises — teardown must
+never mask the call's own result or error. Regression tests:
+`test_amqp_rpc.py::TestReplyQueueLifecycle` (three tests, including the timeout
+path, where the leak matters most, and a failing teardown not masking the real
+error).
+
+---
+
+### 33. A malformed RPC reply is reported as a timeout
+
+**Where:** `mint/worker/executors/amqp_rpc.py::_on_reply`
+
+**Symptom:** A remote service is upgraded and starts returning a slightly
+different shape. Callers hang for the full 30-second timeout and then raise
+`RemoteCallTimeoutError: No reply on queue rpc.echo within 30.0s` — for replies
+that arrived promptly.
+
+**Root cause:**
+
+```python
+future = self._pending.pop(correlation_id, None)   # popped first
+if future is None or future.done():
+    return
+future.set_result(self.output_type.model_validate_json(message.body))   # may raise
+```
+
+The `ValidationError` escapes into aio-pika's consumer callback with the future
+already removed from `_pending` and never resolved. The caller has nothing left
+that can complete it, so it waits out the timeout and reports the wrong cause —
+sending you to investigate the network instead of the schema.
+
+**The practical fix:**
+
+```python
+try:
+    future.set_result(self.output_type.model_validate_json(message.body))
+except ValidationError as exc:
+    future.set_exception(exc)
+```
+
+Regression test: `test_amqp_rpc.py::TestReplyValidation::test_an_unparseable_reply_raises_a_validation_error_not_a_timeout`.
+
+---
+
+### 34. The Redis broker can lose a message while requeueing it
+
+**Where:** `mint/worker/brokers/redis.py::redeliver`, `::deadletter`
+
+**Symptom:** Rare, unreproducible message loss on a worker that was killed
+mid-nack.
+
+**Root cause:**
+
+```python
+await self.client.xack(entry.topic, self.group, entry.message_id)
+await self.client.xdel(entry.topic, entry.message_id)      # message no longer exists
+fields = {...}
+await self.client.xadd(entry.topic, fields)                 # replacement written here
+```
+
+Between the `XDEL` and the `XADD` the message exists nowhere: not in the stream,
+not in the pending-entries list. A crash in that window loses it outright —
+which is precisely the at-most-once behavior bug #8's whole Streams rewrite
+exists to eliminate.
+
+**The practical fix:** Write first, retire second.
+
+```python
+await self.client.xadd(entry.topic, fields)   # replacement exists before...
+await self._retire(entry)                     # ...the original is acked and deleted
+```
+
+A crash mid-sequence now duplicates rather than drops, and the canvas engine's
+idempotent fan-in already absorbs duplicates by design. Regression tests:
+`test_redis_mocked.py::TestRedeliveryOrdering` — asserting the *call order*, since
+both orderings produce an identical end state on the happy path and only a crash
+distinguishes them.
+
+---
+
+### 35. RabbitMQ's attempt counter never increments
+
+**Where:** `mint/worker/brokers/rabbitmq.py`
+
+**Symptom:** `delivery.attempt` is always `1` on RabbitMQ, so any retry/poison
+policy written against it never triggers. `docs/worker/usage.md` documented every
+broker as incrementing it.
+
+**Root cause:** Two halves. `publish()` never wrote `ATTEMPT_HEADER` at all, so
+the constant was read-only in practice — `RabbitMQDelivery` always fell back to
+its default. And `nack(requeue=True)` used AMQP's native requeue:
+
+```python
+await self._message.reject(requeue=requeue)
+```
+
+which redelivers the *original frame*. Its headers are on the wire already and
+cannot be rewritten, so there is no way to bump a counter through that path at
+all. Redis, Kafka and `MemoryBroker` all republish and therefore all increment.
+
+**The practical fix:** Stamp the header on publish, and make requeue a
+republish-then-ack like the other brokers:
+
+```python
+async def nack(self, *, requeue: bool) -> None:
+    if not requeue:
+        await self._message.reject(requeue=False)   # native reject: this is what engages the DLX
+        return
+    await self._broker.redeliver(self._topic, self._message, self.attempt + 1)
+    await self._message.ack()
+```
+
+Publish-before-ack, same ordering rule as issue #34. `requeue=False` stays a
+native reject deliberately — that is what routes through the queue's dead-letter
+exchange (bug #9).
+
+**The tradeoff, taken knowingly:** a requeued message goes to the back of the
+queue instead of being redelivered in place, so requeue no longer preserves
+ordering. Uniform, observable retry counting was judged worth more than
+per-message ordering on a nack path. It's called out in the broker's docstring
+so the next reader doesn't have to rediscover it. Regression tests:
+`test_rabbitmq_mocked.py::TestAttemptHeaderIsPublished` and
+`test_rabbitmq_container.py::TestDeadLetterRegression::test_nack_requeue_true_redelivers_with_an_incremented_attempt`
+— a mock accepts either shape without complaint, so the real broker is what
+proves it.
+
+---
+
+### 36. Aborting a group overwrites the legs that already succeeded
+
+**Where:** `mint/worker/canvas/engine.py::_advance_group`
+
+**Symptom:** A chord under `ErrorPolicy.ABORT` has legs 1-5 finish successfully
+and leg 6 fail. Afterwards all of legs 1-5 read as `CANCELLED` — no record
+survives that they ran, even though their side effects really happened.
+
+**Root cause:**
+
+```python
+pending = [child_id for child_id in group.children if child_id != finished_child_id]
+await self._abort_canvas(canvas_id, pending)   # cancel_nodes overwrites unconditionally
+```
+
+"Everything except the leg that just failed" is not the same set as "everything
+that hasn't run". Compare `_chain_remaining`, which gets the equivalent right by
+slicing the not-yet-run tail — a chain has an ordering to slice, and a group
+doesn't, so the group version quietly cancelled completed work.
+
+**The practical fix:** Ask the store what actually finished.
+
+```python
+async def _unfinished(self, canvas_id: str, group: GroupNode) -> list[str]:
+    results = await self.store.get_results(canvas_id, group.children)
+    return [child_id for child_id in group.children if child_id not in results]
+```
+
+Regression tests: `test_engine.py::TestGroupAbortPreservesFinishedLegs` (three
+tests: a finished sibling stays FINISHED, genuinely pending legs are still
+cancelled, and the failed leg keeps its own ERROR outcome).
+
+---
+
+### 37. A chord's own input never reaches its callback
+
+**Where:** `mint/worker/canvas/builder.py::Chord`
+
+**Symptom:** `FanIn.input` is always `None`, for every chord ever built with the
+DSL.
+
+**Root cause:** `GroupNode.input` existed, `models.py` documented `FanIn` as
+"every leg's result plus the group input", and the engine faithfully passed
+`input=group.input` through — but `Chord.__init__` had no `input` parameter and
+`Chord.build()` never set the field. The whole path was wired except its source.
+
+**The practical fix:** Give the DSL the argument the model was already expecting:
+
+```python
+def __init__(self, legs, callback=None, *, input=None, error_policy=..., id=None):
+    ...
+    self.input = input
+
+# in build():
+nodes[self.id] = GroupNode(..., input=self.input, ...)
+```
+
+This is for context an aggregation step needs that isn't any single leg's output
+— the originating request, a tenant id. Regression tests:
+`test_builder.py::TestChordInput`.
+
+---
+
+### 38. Flattening a nested chain silently discards its error policy
+
+**Where:** `mint/worker/canvas/builder.py::Chain.__init__`
+
+**Symptom:**
+
+```python
+Chain([a, Chain([b, c], error_policy=ErrorPolicy.CONTINUE)], error_policy=ErrorPolicy.PROPAGATE)
+```
+
+`b` and `c` run under `PROPAGATE`. The caller's explicit `CONTINUE` is reversed
+with no error, no warning, and no way to notice short of watching a failure
+cancel steps it was told not to.
+
+**Root cause:**
+
+```python
+if isinstance(step, Chain):
+    self.steps.extend(step.steps)   # takes the steps, drops the policy and the id
+```
+
+Flattening genuinely dissolves the nested chain — it stops existing as a node, so
+it *cannot* keep a policy of its own. The bug is doing that silently.
+
+**The practical fix:** Reject the conflict instead of resolving it invisibly.
+
+```python
+if step.error_policy != error_policy:
+    raise ConflictingErrorPolicyError(
+        chain_id=self.id, nested_id=step.id,
+        policy=error_policy, nested_policy=step.error_policy,
+    )
+```
+
+Matching and defaulted policies flatten exactly as before, so no working code
+changes. Regression tests: `test_builder.py::TestNestedChainErrorPolicy`.
+
+---
+
+### 39. Two different NATS topics can still share one stream and cursor
+
+**Where:** `mint/worker/brokers/nats.py::_stream_name`
+
+**Symptom:** Topics `a.b` and `a-b` interfere with each other exactly the way
+bug #10 described — in the module written to fix bug #10.
+
+**Root cause:**
+
+```python
+def _stream_name(self, topic: str) -> str:
+    return topic.replace(".", "-")
+```
+
+JetStream stream names can't contain `.`, so collapsing it is necessary. But a
+plain replace is not injective: `a.b` and `a-b` both map to `a-b`. Since
+`_durable_name` derives from `_stream_name`, they also share one durable
+consumer — one cursor between two unrelated topics.
+
+**The practical fix:** Escape before collapsing, so the mapping is reversible:
+
+```python
+return topic.replace("-", "--").replace(".", "-")
+```
+
+Regression tests: `test_nats_mocked.py::TestStreamNamingIsInjective`.
+
+---
+
+### 40. Consuming a NATS dead-letter subject is rejected outright
+
+**Where:** `mint/worker/brokers/nats.py::_ensure_stream`
+
+**Symptom:** Consuming `{topic}.dlq` to inspect what landed there fails —
+JetStream refuses to create the stream because its subject overlaps an existing
+one.
+
+**Root cause:**
+
+```python
+await jetstream.add_stream(
+    name=self._stream_name(topic),
+    subjects=[topic, f"{topic}{self.DLQ_SUFFIX}"],
+)
+```
+
+Applied to `foo`, this stream claims `foo` and `foo.dlq`. Applied to `foo.dlq`,
+it tries to create stream `foo-dlq` claiming `foo.dlq` and `foo.dlq.dlq` — and
+`foo.dlq` is already owned by `foo`'s stream. JetStream rejects overlapping
+subjects across streams.
+
+This is the same shape as bug #21 (RabbitMQ refusing to redeclare its own DLQ
+with different arguments), and the fix is the same rule: **a dead-letter
+destination terminates the chain rather than extending it.** Worth noting that
+`RabbitMQBroker` had already learned this and NATS hadn't — a fix applied to one
+broker didn't get carried across to its siblings.
+
+**The practical fix:** Resolve a `.dlq` topic back to the stream that already
+owns it:
+
+```python
+def _owning_topic(self, topic: str) -> str:
+    if topic.endswith(self.DLQ_SUFFIX):
+        return topic[: -len(self.DLQ_SUFFIX)]
+    return topic
+
+async def _ensure_stream(self, jetstream, topic: str) -> None:
+    owner = self._owning_topic(topic)
+    await jetstream.add_stream(
+        name=self._stream_name(owner),
+        subjects=[owner, f"{owner}{self.DLQ_SUFFIX}"],
+    )
+```
+
+Regression tests: `test_nats_mocked.py::TestDeadLetterStreamOwnership`.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -1168,3 +1924,23 @@ adding a new broker, executor, or engine transition:
 - **Any test that varies nesting depth or payload size** — the two shapes
   that can blow up memory silently — runs once, standalone, under a memory
   cap before it's trusted to join the full suite (issue #15's process fix).
+- **A one-shot guard burned before an I/O call must be releasable if that call
+  fails.** Anything that records "this already happened" before the thing has
+  actually happened needs a rollback on the failure path, or the retry finds the
+  work already claimed and silently does nothing (issue #23).
+- **A shared client object needs per-topic (or per-key) state, not one slot.**
+  `WorkerApp` shares one broker across every worker, so any `self._x = ...` in a
+  per-topic method is a collision waiting to happen (issue #25).
+- **Every branch that drops a message must still record an outcome for its
+  node**, whenever the node is identifiable. Dropping the message and saying
+  nothing leaves the canvas waiting on it forever (issue #27).
+- **A consume loop needs a concurrency bound of its own.** Some brokers provide
+  backpressure and some don't; the loop can't tell which it has (issue #28).
+- **Anything keyed by node id must be keyed by `(canvas_id, node_id)`.** Node
+  ids are caller-suppliable, so they are only unique within a canvas (issue #29).
+- **A string-mangling function used to derive a key must be injective.** Ask
+  "can two different inputs produce this same output?" before it becomes a
+  cursor, a lock name, or a stream name (issue #39).
+- **When a fix lands on one broker, check its siblings for the same shape.**
+  Bug #21's DLQ-terminates-the-chain rule was fixed in RabbitMQ and left broken
+  in NATS for exactly as long as nobody looked (issue #40).

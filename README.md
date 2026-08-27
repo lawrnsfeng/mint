@@ -39,8 +39,9 @@ See `docs/s3-implementation-notes.md` for a method-by-method comparison
 between the Azure and S3 backends (including known behavioral gaps),
 `docs/db-repository-implementation-notes.md` for `mint.db`'s design
 decisions and confirmed SQLModel gotchas, `docs/worker-implementation-notes.md`
-for `mint.worker`'s 17-bug catalogue and migration mapping from an internal
-predecessor, and `specs/001-s3-storage/spec.md` /
+for `mint.worker`'s design decisions and migration mapping from an internal
+predecessor (with `docs/worker-bugs-and-fixes.md` for the full catalogue of
+every bug found and how each was fixed), and `specs/001-s3-storage/spec.md` /
 `specs/002-db-repository-layer/spec.md` for the file-storage/DB layers'
 feature specs.
 

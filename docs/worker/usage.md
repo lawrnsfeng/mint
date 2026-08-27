@@ -93,6 +93,11 @@ app.register(AutoInclude(db=db))
 await app.run()   # consumes every registered topic; SIGTERM/SIGINT -> drain -> close
 ```
 
+Each worker handles at most `Worker.max_concurrency` deliveries at once (32 by
+default; set it as a class attribute). The consume loop stops pulling while that
+many are in flight — the only backpressure Kafka and `MemoryBroker` get, since
+neither has a prefetch of its own.
+
 `register()` rejects two workers claiming the same topic, and validates
 `Input`/`Output`/`topic` exist before the app ever starts consuming.
 `app.stop()` triggers the same graceful shutdown programmatically. A worker
@@ -160,31 +165,37 @@ legs can be heterogeneous, so the fan-in point has no single type to be generic
 over. `ok`/`error` are first-class fields (no more inferring success from a
 missing key), but a succeeded leg's `.value` is still the JSON string its own
 `Output.model_dump_json()` produced — decode it with that leg's own `Output`
-type. `FanIn.input` carries whatever `GroupNode.input` was set to; the `Chord`
-DSL itself doesn't expose a way to set it (it's there for callers building the
-graph directly against `canvas.models` rather than through the DSL), so it's
-`None` for any chord built with `Chord(...)`.
+type. `FanIn.input` carries whatever `Chord(..., input=...)` was given, for
+context the aggregation step needs that isn't any single leg's output (the
+originating request, a tenant id); it's `None` if you didn't pass one.
 
 ## Brokers
 
 | Broker | `DeliveryGuarantee` | Notes |
 |---|---|---|
 | `brokers.memory.MemoryBroker` | at-least-once | In-process `asyncio.Queue`; for tests and single-process use. |
-| `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. |
+| `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. `nack(requeue=True)` republishes with `attempt` bumped rather than using AMQP's native requeue, so the counter is observable — at the cost of ordering on that path. |
 | `brokers.redis.RedisBroker` | at-least-once | Streams + consumer groups (`XADD`/`XREADGROUP`/`XACK`). |
 | `brokers.nats.NatsBroker` | at-least-once | JetStream pull consumers with a per-topic durable name. |
 | `brokers.kafka.KafkaBroker` | at-least-once | `auto_offset_reset="earliest"` — a new consumer group sees a topic's backlog, never skips it. |
 
 Every implementation satisfies the same `IBroker` Protocol
 (`publish`/`consume`/`close`), and every one is tested against the same
-properties — publish/consume round-trip, `nack(requeue=True)` redelivers with
-an incremented `attempt`, `nack(requeue=False)` reaches the DLQ — first against
-a mocked client, then a small suite against a real broker for what mocking
-can't prove (`test_<broker>_mocked.py` then `test_<broker>_container.py`, run
-standalone and memory-capped — see the [Implementation
-Notes](../worker-implementation-notes.md)). Construction never requires a
-running event loop — every broker builds its connection pool
-lazily, on first actual use, so ordinary synchronous DI/container setup works.
+properties — publish/consume round-trip, `nack(requeue=True)` redelivers with an
+incremented `attempt`, `nack(requeue=False)` reaches the DLQ — against a mocked
+client (`test_<broker>_mocked.py`).
+
+Container suites exist for RabbitMQ and Kafka (`test_<broker>_container.py`),
+and for `RedisCanvasStore`; the Redis *broker* and NATS have mocked coverage
+only. That unevenness is a real gap rather than a claim of equivalence — the
+bugs a container catches (exact wire-level types, a client's default policies, a
+redeclaration conflict) are structurally invisible to a mock. See the
+[Implementation Notes](../worker-implementation-notes.md); container suites run
+standalone and memory-capped.
+
+Construction never requires a running event loop — every broker builds its
+connection pool lazily, on first actual use, so ordinary synchronous
+DI/container setup works.
 
 ## Executors
 
@@ -281,7 +292,14 @@ Chord([...], callback=..., error_policy=ErrorPolicy.CONTINUE)  # fire callback w
 |---|---|---|---|
 | `CONTINUE` | no | **yes** | Record the error, keep going — a chain proceeds to its next step; a chord still counts the leg toward fan-in. |
 | `PROPAGATE` | **yes** | no | Stop (a chain cancels its remaining steps), mark the immediate parent `ERROR`, still bubble up. |
-| `ABORT` | no | no | Cancel every pending sibling immediately and fail the whole canvas — nothing further dispatches. |
+| `ABORT` | no | no | Cancel every pending sibling that hasn't run yet and fail the whole canvas — nothing further dispatches. Legs that already finished keep their outcomes. |
+
+A chain step that fails under `CONTINUE` has no result to hand its successor, so
+the next step is dispatched with `"{}"` as its body. Unless that worker's `Input`
+has all-optional fields, it will fail validation — which now fails that node
+explicitly and reaches a terminal canvas status, rather than stalling. If a
+chain's later steps need to run after an earlier failure, give their `Input`
+models usable defaults.
 
 ## Testing against `mint.worker`
 

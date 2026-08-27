@@ -57,10 +57,11 @@ uv sync --group worker  # mint.worker (redis, aio-pika, nats-py, aiokafka, grpci
   — construction options for both backends, recursive copy/remove via
   `sprout.Executor`, known behavioral gaps between them.
 - **[Worker usage](worker/usage.md)** / **[API reference](worker/api.md)**
-  / **[Implementation Notes](worker-implementation-notes.md)** — the
-  `Chain`/`Chord` DSL, embedded vs. centralized deployment modes, every
-  broker/executor, and a 17-bug catalogue with a migration mapping from an
-  internal predecessor.
+  / **[Implementation Notes](worker-implementation-notes.md)** / **[Bugs and
+  Fixes](worker-bugs-and-fixes.md)** — the `Chain`/`Chord` DSL, embedded vs.
+  centralized deployment modes, every broker/executor, a migration mapping from
+  an internal predecessor, and a walkthrough of every bug found while porting
+  and reviewing it.
 - **[DB Repository Layer usage](db/usage.md)** / **[API
   reference](db/api.md)** — the deepest guide in this site: design
   rationale, every method and option, real-world schema shapes, and

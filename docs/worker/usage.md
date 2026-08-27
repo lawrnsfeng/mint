@@ -184,7 +184,7 @@ originating request, a tenant id); it's `None` if you didn't pass one.
 | `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. `nack(requeue=True)` republishes with `attempt` bumped rather than using AMQP's native requeue, so the counter is observable — at the cost of ordering on that path. Consumers hold their own channels on a dedicated connection, never the shared publish pool. |
 | `brokers.redis.RedisBroker` | at-least-once | Streams + consumer groups (`XADD`/`XREADGROUP`/`XACK`), with `XAUTOCLAIM` reclaim so a message whose consumer died before acking is redelivered rather than stranded in its pending list. Tune the window with `reclaim_idle_ms` — it must exceed your slowest handler, or live work gets taken over mid-flight. |
 | `brokers.nats.NatsBroker` | at-least-once | JetStream pull consumers with a per-topic durable name. |
-| `brokers.kafka.KafkaBroker` | at-least-once | `auto_offset_reset="earliest"` — a new consumer group sees a topic's backlog, never skips it. |
+| `brokers.kafka.KafkaBroker` | at-least-once | `auto_offset_reset="earliest"` — a new consumer group sees a topic's backlog, never skips it. Offsets are tracked per partition and only the contiguous settled prefix is committed, so concurrent handlers finishing out of order can't commit past work still in flight. |
 
 Every implementation satisfies the same `IBroker` Protocol
 (`publish`/`consume`/`close`), and every one is tested against the same
@@ -249,7 +249,11 @@ class QueueBackedWorker(Worker[In, Out]):
 - `ThreadPoolExecutor`/`ProcessPoolExecutor` offload a blocking or CPU-bound
   `process` onto a worker thread/process; `ProcessPoolExecutor` checks
   `fn`/`input_` are picklable up front and raises `UnpicklableTaskError`
-  immediately rather than hanging the pool.
+  immediately rather than hanging the pool. A worker's own attributes must
+  therefore be picklable — its runtime state (broker, store, in-flight tasks) is
+  stripped automatically, but a live DB client or socket held as an instance
+  attribute is not, and will raise. Keep those behind a lazily-created accessor,
+  or construct them in `process`.
 - `GRPCExecutor`/`AMQPRPCExecutor` are remote executors: they **replace**
   `process` rather than wrap it, dispatching `input_` to a remote service or
   queue instead. A worker using one never needs to implement `process` at all.
@@ -314,7 +318,7 @@ Chord([...], callback=..., error_policy=ErrorPolicy.CONTINUE)  # fire callback w
 |---|---|---|---|
 | `CONTINUE` | no | **yes** | Record the error, keep going — a chain proceeds to its next step; a chord still counts the leg toward fan-in. |
 | `PROPAGATE` | **yes** | no | Stop and mark the container `ERROR`, still bubbling up. A chain cancels its remaining steps; a chord cancels its unfinished legs **and its callback**, which never runs. |
-| `ABORT` | no | no | Cancel every pending sibling that hasn't run yet and fail the whole canvas — nothing further dispatches. Legs that already finished keep their outcomes. |
+| `ABORT` | no | no | Cancel this container's children that haven't run (a chord's callback included) and mark the canvas `ERROR` — the canvas status is what stops everything else, not a per-node sweep. Legs that already finished keep their outcomes. |
 
 A chain step that fails under `CONTINUE` has no result to hand its successor, so
 the next step is dispatched with `"{}"` as its body. Unless that worker's `Input`

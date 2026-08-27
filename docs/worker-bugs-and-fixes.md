@@ -88,6 +88,18 @@ is the expanded, "how do I actually fix this" version.
 - [60. A node its parent doesn't list raises a bare `ValueError`](#60-a-node-its-parent-doesnt-list-raises-a-bare-valueerror)
 - [61. The idempotency guarantee is narrower than documented](#61-the-idempotency-guarantee-is-narrower-than-documented)
 
+**Part 6 — Bugs found by a fifth review round, four of them in earlier fixes**
+
+- [62. Concurrent handlers commit past in-flight Kafka records](#62-concurrent-handlers-commit-past-in-flight-kafka-records)
+- [63. `ProcessPoolExecutor` can never run a real `Worker`](#63-processpoolexecutor-can-never-run-a-real-worker)
+- [64. A group's terminal branches skip its only de-duplication](#64-a-groups-terminal-branches-skip-its-only-de-duplication)
+- [65. The RabbitMQ consumer connection races its own lazy init](#65-the-rabbitmq-consumer-connection-races-its-own-lazy-init)
+- [66. The handler's catch-all bypasses `max_attempts`](#66-the-handlers-catch-all-bypasses-max_attempts)
+- [67. Untracking before advancing strands a dead-lettered result](#67-untracking-before-advancing-strands-a-dead-lettered-result)
+- [68. A reused `canvas_id` is dead on arrival](#68-a-reused-canvas_id-is-dead-on-arrival)
+- [69. `ABORT` leaves the group's callback `PENDING`](#69-abort-leaves-the-groups-callback-pending)
+- [70. `XAUTOCLAIM` reclaims this consumer's own in-flight work](#70-xautoclaim-reclaims-this-consumers-own-in-flight-work)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -2623,6 +2635,264 @@ from adding one.
 
 ---
 
+## Part 6 — Bugs found by a fifth review round, four of them in earlier fixes
+
+Issues #62, #64, #67 and #69 were all introduced by fixes from Parts 4 and 5.
+None of them existed in the original package. That ratio is the argument for
+re-reviewing after every round rather than declaring the code clean once the
+first list is closed.
+
+### 62. Concurrent handlers commit past in-flight Kafka records
+
+**Where:** `mint/worker/brokers/kafka.py::KafkaDelivery._commit`
+
+**Symptom:** Under load, a Kafka worker restart loses a scattering of messages —
+the same symptom as issue #26, which this code was written to fix.
+
+**Root cause:** Issue #26 replaced a bare `consumer.commit()` with this record's
+own offset, and its docstring said:
+
+> Committing `offset + 1` for this record's partition only can at worst move the
+> offset backwards under out-of-order acks, which replays (at-least-once) rather
+> than drops.
+
+Only the *backwards* direction is safe. `Worker.run()` settles up to
+`max_concurrency` (32 by default) records concurrently on a single partition, so
+they finish out of order in the other direction too. Settling offset 7 while 5
+and 6 are still running commits the group to 8; a restart resumes there and 5 and
+6 are never redelivered. The fix for a too-wide commit introduced a too-far-ahead
+one, and the docstring's reassurance is what made it look settled.
+
+**The practical fix:** Commit only the contiguous settled prefix.
+
+```python
+def settle(self, record: "ConsumerRecord") -> int | None:
+    key = (record.topic, record.partition)
+    self._settled[key].add(record.offset)
+    commit_offset = None
+    while inflight and inflight[0] in self._settled[key]:
+        offset = inflight.pop(0)
+        self._settled[key].discard(offset)
+        commit_offset = offset + 1
+    return commit_offset          # None while an earlier offset is still running
+```
+
+Tracking happens in `KafkaDelivery.__init__` rather than the consume loop — a
+delivery existing *is* what "this offset is in flight" means, so nothing can hand
+one out untracked, including the tests that construct deliveries directly.
+
+---
+
+### 63. `ProcessPoolExecutor` can never run a real `Worker`
+
+**Where:** `mint/worker/executors/process_pool.py::execute`
+
+**Symptom:** Every message on a worker configured with
+`executor = ProcessPoolExecutor()` fails with `UnpicklableTaskError` and errors
+its node. The executor has never worked for its actual purpose.
+
+**Root cause:** `Worker._run_task` calls `executor.execute(self.process, input_obj)`,
+so `_ensure_picklable` pickles a **bound method** — which drags the whole `Worker`
+instance along. That instance holds `_inflight`, which always contains the
+currently-running `asyncio.Task` while a message is being handled, plus a
+semaphore, an event, and `_binding`'s live broker/store handles.
+
+```
+>>> pickle.dumps((worker.process, payload))
+TypeError: cannot pickle '_asyncio.Task' object
+```
+
+The executor's own tests pass module-level functions (`double`, `boom`), which is
+the one shape that *isn't* how `Worker` uses it — so a green suite proved nothing
+about the real call path.
+
+**The practical fix:** Teach `Worker` what not to carry across the boundary.
+
+```python
+def __getstate__(self) -> dict[str, object]:
+    return {k: v for k, v in self.__dict__.items() if k not in _UNPICKLABLE_RUNTIME_STATE}
+
+def __setstate__(self, state: dict[str, object]) -> None:
+    self.__dict__.update(state)
+    self._binding = None
+    self._inflight = set()
+    self._stopped = asyncio.Event()
+    self._slots = asyncio.Semaphore(self.max_concurrency)
+```
+
+The child process only ever calls `process`; it has no use for any of it. A
+worker's *own* dependencies must still be picklable — that constraint is real and
+is exactly what `UnpicklableTaskError` reports, so there is a test that keeps the
+guard honest by hanging an unpicklable attribute on a worker and expecting it to
+fire.
+
+---
+
+### 64. A group's terminal branches skip its only de-duplication
+
+**Where:** `mint/worker/canvas/engine.py::_advance_group`
+
+**Symptom:** Two legs of the same chord fail at once, under `PROPAGATE`, and the
+enclosing chain dispatches its next step twice.
+
+**Root cause:** Issue #57 added a PROPAGATE branch modelled on the existing ABORT
+one — and inherited its structure, including returning *before*
+`mark_child_done`. That call is the only de-duplication a group has. With two
+workers failing two legs concurrently in embedded mode, both take the branch and
+both return a group-level `ERROR`, so `_complete` records the group twice and
+walks to the parent twice.
+
+ABORT was accidentally protected: it sets the canvas to `ERROR`, and the second
+completion short-circuits on the status guard at the top of `complete()`.
+PROPAGATE deliberately does not touch canvas status — it bubbles — so nothing
+stopped it.
+
+**The practical fix:** Claim the group's single terminal slot, reusing the
+callback-fired guard:
+
+```python
+if not await self.store.claim_group_terminal(canvas_id, group.id):
+    return None, None
+```
+
+Sharing that key is not a shortcut, it's the correct semantics: a group emits
+exactly one terminal event — it fires its callback, or it aborts/propagates,
+never both. Both branches now claim it, so ABORT no longer depends on a side
+effect of the status guard to be safe.
+
+---
+
+### 65. The RabbitMQ consumer connection races its own lazy init
+
+**Where:** `mint/worker/brokers/rabbitmq.py::_ensure_consumer_connection`
+
+**Symptom:** A multi-worker app leaks connections that keep consuming after
+`close()`.
+
+**Root cause:** Issue #49 moved consumers off the shared channel pool onto a
+dedicated connection, built lazily:
+
+```python
+if self._consumer_connection is None:
+    self._consumer_connection = await connect_robust(self.uri)
+```
+
+Check, then `await`. `WorkerApp.run()` starts every worker's `run()` as a
+concurrent task and each calls `consume()`, so with N workers all N see `None`,
+all N connect, and the last assignment orphans the rest. `close()` closes only
+the surviving reference; the orphans keep their consumers alive.
+
+**The practical fix:** An `asyncio.Lock` around the check-and-build. The lock is
+constructed in `__init__`, which is safe without a running loop on modern Python
+— the same constraint that made the pools lazy in the first place (bug #20).
+
+---
+
+### 66. The handler's catch-all bypasses `max_attempts`
+
+**Where:** `mint/worker/worker.py::_handle`
+
+**Symptom:** The unbounded retry storm issue #43 exists to prevent, reachable
+through the handler added by issue #41.
+
+**Root cause:** The generic `except Exception` settled with
+`_safe_nack(delivery, requeue=True)` — unconditional, ignoring the cap sitting
+right beside it in `_retry_or_drop`. A persistently failing `delivery.ack()`
+(closed channel, broker hiccup) therefore ran the work, failed to ack, requeued,
+and ran the work again, forever.
+
+**The practical fix:** Route it through `_retry_or_drop` like every other failure
+path. `node_id` becomes optional, since the catch-all may fire before an envelope
+was ever decoded.
+
+---
+
+### 67. Untracking before advancing strands a dead-lettered result
+
+**Where:** `mint/worker/coordinator.py::_handle_result`
+
+**Symptom:** A canvas stays `RUNNING` forever with nothing able to advance it —
+and the timeout sweeper, which exists for exactly this, never fires.
+
+**Root cause:** `_untrack` ran before `_advance`. Once issue #56 added a retry
+cap, a result that failed to advance at `max_attempts` was dead-lettered — and by
+then the node was neither completed nor tracked, so the sweeper had nothing left
+to time out. The two fixes were individually correct and jointly wrong.
+
+**The practical fix:** Untrack only after the advance succeeds. A failed advance
+leaves the node tracked, so the sweeper can still fail it.
+
+---
+
+### 68. A reused `canvas_id` is dead on arrival
+
+**Where:** `mint/worker/stores/redis.py::create_canvas`,
+`mint/worker/stores/memory.py::create_canvas`
+
+**Symptom:** Retrying `apply(canvas_id=...)` after a failed first attempt does
+nothing at all. The nodes are written, the entry message is published, and the
+canvas never advances.
+
+**Root cause:** `Chain.apply`/`Chord.apply` accept a caller-supplied `canvas_id`
+explicitly for idempotent retries, and a publish failure marks the canvas
+`ERROR`. But neither store reset the status on creation — Redis never wrote it,
+and `MemoryCanvasStore` used `setdefault`. Issue #59 then made a terminal status
+*outlive* its data by design, which turned a narrow window into a permanent one:
+the retry inherits `ERROR`, every `complete()` short-circuits on the non-RUNNING
+guard and acks, and nothing ever runs.
+
+**The practical fix:** `create_canvas` sets the status to `RUNNING`
+unconditionally. Creating a canvas is a statement that it is live.
+
+---
+
+### 69. `ABORT` leaves the group's callback `PENDING`
+
+**Where:** `mint/worker/canvas/engine.py::_advance_group`
+
+**Symptom:** After an abort, the chord's callback still reads `PENDING`, as
+though it were still expected.
+
+**Root cause:** Issue #57's PROPAGATE branch cancels the callback along with the
+unfinished legs; the older ABORT branch cancelled only `_unfinished(group)`,
+which is legs. The new fix was more correct than the code it was modelled on, and
+the asymmetry stayed. `ErrorPolicy.ABORT`'s docstring also promised to "cancel
+every pending sibling", which `_abort_canvas` never did — it only ever touched
+the immediate container.
+
+**The practical fix:** ABORT uses `_cancel_group_remainder` too, and the enum
+docstring now describes what actually happens: the container's remainder is
+cancelled and the canvas is marked `ERROR`, which is what stops everything else —
+not a per-node sweep.
+
+---
+
+### 70. `XAUTOCLAIM` reclaims this consumer's own in-flight work
+
+**Where:** `mint/worker/brokers/redis.py::_reclaim`
+
+**Symptom:** A handler that takes longer than `reclaim_idle_ms` finds its own
+message being processed a second time, concurrently with the first.
+
+**Root cause:** Issue #58 added reclaim to make the at-least-once claim true.
+`XAUTOCLAIM` matches purely on idle time and has no notion of "someone else's" —
+an entry this very consumer is still working on is idle by that definition too.
+With the 60s default and `max_concurrency=32`, any slow handler self-duplicates.
+The constructor docstring noted that `reclaim_idle_ms` should exceed the slowest
+handler, which describes the tuning but not the failure it guards against.
+
+**The practical fix:** Track the ids this broker currently holds and skip them:
+
+```python
+if message_id in self._inflight_ids:
+    return None
+```
+
+Added when an entry is turned into a `StreamEntry`, discarded in `_retire`, so
+the set is exactly "delivered and not yet settled".
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -2710,3 +2980,18 @@ adding a new broker, executor, or engine transition:
 - **Anything a Protocol advertises has to be true.** Declaring
   `AT_LEAST_ONCE` while never reclaiming an abandoned pending entry is a promise
   the rest of the package is built on (issue #58).
+- **Review the fixes, not just the original code.** Nine of the bugs in this
+  catalogue were introduced by an earlier round's fix, and four of those came
+  from a single round (issues #62, #64, #67, #69).
+- **A narrowing fix can overshoot in the other direction.** Replacing a too-wide
+  Kafka commit with a per-record one made it commit too far *ahead* instead
+  (issue #62).
+- **Test the call path the production code actually uses.** `ProcessPoolExecutor`
+  was only ever tested with module-level functions — the one shape `Worker` never
+  passes it (issue #63).
+- **Copying a branch copies its bugs.** The PROPAGATE branch inherited ABORT's
+  missing de-duplication; ABORT then inherited PROPAGATE's missing callback
+  cancellation in the other direction (issues #64, #69).
+- **Two individually correct fixes can be jointly wrong.** A retry cap plus an
+  early untrack meant a dead-lettered result escaped the sweeper entirely
+  (issue #67).

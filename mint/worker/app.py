@@ -9,6 +9,7 @@ canvas engine, and executor at ``register()`` time.
 import asyncio
 import contextlib
 import signal
+from functools import partial
 from typing import Final
 
 from mint.logger import get_logger
@@ -82,11 +83,32 @@ class WorkerApp:
             raise AppAlreadyRunningError
         self._running = True
         self._tasks = {topic: asyncio.create_task(w.run()) for topic, w in self._workers.items()}
+        for topic, task in self._tasks.items():
+            task.add_done_callback(partial(self._on_worker_exit, topic))
         self._install_signal_handlers()
         try:
             await self._stop_event.wait()
         finally:
             await self._shutdown()
+
+    def _on_worker_exit(self, topic: str, task: asyncio.Task[None]) -> None:
+        """Shut the app down if a consume loop dies on its own.
+
+        ``run()`` only awaits ``_stop_event``, so a worker task that died — a
+        dropped broker connection propagating out of ``consume()``, say — used to
+        go completely unobserved: the process stayed alive and healthy-looking
+        while consuming nothing from that topic, forever. A dead loop is not
+        recoverable in place, so it takes the app down and lets the supervisor
+        restart it, rather than degrading silently.
+        """
+        if task.cancelled() or self._stop_event.is_set():
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.error("Worker consume loop exited unexpectedly", topic=topic)
+        else:
+            logger.error("Worker consume loop failed", topic=topic, error=repr(exc))
+        self._stop_event.set()
 
     async def stop(self) -> None:
         """Trigger a graceful shutdown programmatically — also what SIGTERM/SIGINT call.
@@ -116,14 +138,30 @@ class WorkerApp:
         for task in self._tasks.values():
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(self.drain_timeout):
-                await asyncio.gather(*(w.drain() for w in self._workers.values()))
+        await self._drain_workers()
         await self.broker.close()
         await self.store.close()
         await self._close_executors()
         self._running = False
         self._stop_event.clear()
+
+    async def _drain_workers(self) -> None:
+        """Let in-flight handlers finish, then make sure the timed-out ones are done too.
+
+        On timeout, cancelling the outer gather cancels each handler task — but
+        cancellation is only *requested* there, not completed. Closing the broker
+        immediately afterwards tore the connection down while those handlers were
+        still inside ``await delivery.nack(requeue=True)``, so their nack raised and
+        the delivery was stranded — exactly what ``Worker.drain``'s contract says
+        this design prevents. The second, un-timed drain waits for the cancellation
+        to actually land before anything is closed.
+        """
+        drains = [worker.drain() for worker in self._workers.values()]
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(self.drain_timeout):
+                await asyncio.gather(*drains)
+                return
+        await asyncio.gather(*(w.drain() for w in self._workers.values()), return_exceptions=True)
 
     async def _close_executors(self) -> None:
         """Close every distinct closable executor in use, each exactly once.

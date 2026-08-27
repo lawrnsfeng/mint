@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from mint.worker.brokers.interface import Delivery
 from mint.worker.brokers.memory import MemoryBroker
 from mint.worker.canvas.dispatch import Dispatch
 from mint.worker.canvas.models import ChainNode, ErrorInfo, NodeOutcome, TaskNode
@@ -526,3 +527,107 @@ class TestShutdownReleasesResources:
         await coordinator.stop()
         async with asyncio.timeout(1.0):
             await second
+
+
+class FailFirstResultCoordinator(Coordinator):
+    """A Coordinator whose first result handling raises something outside WorkerError."""
+
+    def __init__(
+        self,
+        broker: MemoryBroker,
+        store: MemoryCanvasStore,
+        results_topic: str,
+        *,
+        sweep_interval: float = Coordinator.DEFAULT_SWEEP_INTERVAL_SECONDS,
+    ) -> None:
+        """Start with an empty call log."""
+        super().__init__(broker, store, results_topic, sweep_interval=sweep_interval)
+        self.handled: list[str] = []
+        self.second_call = asyncio.Event()
+
+    async def _handle_result(self, delivery: Delivery) -> None:
+        """Raise on the first call, behave normally afterwards."""
+        self.handled.append("call")
+        if len(self.handled) == 1:
+            detail = "ack failed"
+            raise ConnectionResetError(detail)
+        self.second_call.set()
+        await super()._handle_result(delivery)
+
+
+class TestResultLoopSurvivesOneBadDelivery:
+    """One unexpected exception must not kill the coordinator's only result loop."""
+
+    async def test_a_failing_ack_does_not_stop_the_loop(self) -> None:
+        """Guarding only CancelledError stalled every canvas in the deployment silently.
+
+        The process stayed up and the sweeper kept running, so nothing looked
+        wrong — results simply stopped being processed, forever.
+        """
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
+        )
+        broker = MemoryBroker()
+        coordinator = FailFirstResultCoordinator(
+            broker,
+            store,
+            RESULTS_TOPIC,
+            sweep_interval=100.0,
+        )
+
+        task = asyncio.create_task(coordinator._consume_results())
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        async with asyncio.timeout(1.0):
+            await coordinator.second_call.wait()
+
+        assert len(coordinator.handled) >= 2
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+class TestSweepDoesNotRaceARealResult:
+    """A result arriving mid-sweep must win over the synthetic timeout outcome."""
+
+    async def test_a_node_untracked_during_the_sweep_is_not_timed_out(self) -> None:
+        """_sweep_once snapshots stale entries then awaits, leaving a window.
+
+        Completing the node twice dispatches a chain's next step twice, or
+        double-counts a group leg.
+        """
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
+        )
+        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        stale = datetime.now(UTC) - timedelta(seconds=99)
+        entry = InFlightNode(CANVAS, "t1", stale)
+        coordinator._in_flight[CANVAS, "t1"] = entry
+        # the real result landed first, in the window the sweep awaits through
+        coordinator._untrack(CANVAS, "t1")
+
+        await coordinator._timeout_node(entry)
+
+        assert await store.get_result(CANVAS, "t1") is None
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.RUNNING
+
+    async def test_a_genuinely_stale_node_is_still_timed_out(self) -> None:
+        """The re-check must not stop the sweeper doing its actual job."""
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
+        )
+        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        stale = datetime.now(UTC) - timedelta(seconds=99)
+        coordinator._in_flight[CANVAS, "t1"] = InFlightNode(CANVAS, "t1", stale)
+
+        await coordinator._sweep_once()
+
+        recorded = await store.get_result(CANVAS, "t1")
+        assert recorded is not None
+        assert recorded.status == NodeStatus.ERROR

@@ -120,6 +120,8 @@ class Coordinator:
             asyncio.create_task(self._consume_results()),
             asyncio.create_task(self._sweep_loop()),
         }
+        for task in self._tasks:
+            task.add_done_callback(self._on_task_exit)
         self._install_signal_handlers()
         try:
             await self._stop_event.wait()
@@ -135,6 +137,22 @@ class Coordinator:
         landed in the window between ``create_task(run())`` and the loop starting —
         leaving it running with nothing left to stop it.
         """
+        self._stop_event.set()
+
+    def _on_task_exit(self, task: asyncio.Task[None]) -> None:
+        """Shut down if the result loop or the sweeper dies on its own.
+
+        ``run()`` only awaits ``_stop_event``, so either task dying left the
+        process alive and idle-looking while doing none of its actual work.
+        """
+        if task.cancelled() or self._stop_event.is_set():
+            return
+        exc = task.exception()
+        logger.error(
+            "Coordinator task exited unexpectedly",
+            topic=self.results_topic,
+            error=repr(exc) if exc is not None else None,
+        )
         self._stop_event.set()
 
     def _track(self, canvas_id: str, node_id: str) -> None:
@@ -166,12 +184,30 @@ class Coordinator:
         self._stop_event.clear()
 
     async def _consume_results(self) -> None:
+        """Consume results until cancelled, surviving anything one delivery can throw.
+
+        Guarding only ``CancelledError`` meant a single unexpected exception — most
+        plausibly a failing ``ack()`` — killed the coordinator's result loop for
+        good. With ``run()`` only awaiting ``_stop_event``, the process stayed up,
+        the sweeper kept timing nodes out, and every canvas in the deployment
+        stalled with no error anywhere.
+        """
         async for delivery in self.broker.consume(self.results_topic):
             try:
                 await self._handle_result(delivery)
             except asyncio.CancelledError:
-                await delivery.nack(requeue=True)
+                await self._safe_nack(delivery)
                 raise
+            except Exception:
+                logger.exception("Unhandled error handling a result", topic=self.results_topic)
+                await self._safe_nack(delivery)
+
+    async def _safe_nack(self, delivery: Delivery) -> None:
+        """Requeue a delivery, logging rather than raising — nothing above would catch it."""
+        try:
+            await delivery.nack(requeue=True)
+        except Exception:
+            logger.exception("Failed to nack a result", topic=self.results_topic)
 
     async def _handle_result(self, delivery: Delivery) -> None:
         envelope = self._decode_envelope(delivery.body)
@@ -235,6 +271,17 @@ class Coordinator:
             await self._timeout_node(entry)
 
     async def _timeout_node(self, entry: InFlightNode) -> None:
+        """Fail one node that never reported, unless its real result just arrived.
+
+        ``_sweep_once`` snapshots the stale entries and then awaits per entry, so a
+        genuine result can be handled concurrently in that window. Without this
+        re-check the node completes twice — once with its real outcome and once
+        with the synthetic timeout — which dispatches a chain's next step twice, or
+        double-counts a group leg. Untracking *is* the check: whichever of the two
+        removes the entry first is the one that gets to complete the node.
+        """
+        if (entry.canvas_id, entry.node_id) not in self._in_flight:
+            return
         self._untrack(entry.canvas_id, entry.node_id)
         outcome = NodeOutcome(
             node_id=entry.node_id,

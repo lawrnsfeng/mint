@@ -169,7 +169,7 @@ class TestTracking:
 
         await coordinator.track_and_publish("topic-t1", envelope.to_bytes())
 
-        assert "t1" in coordinator._in_flight
+        assert (CANVAS, "t1") in coordinator._in_flight
         assert coordinator._by_canvas[CANVAS] == {"t1"}
         delivered = await anext(broker.consume("topic-t1"))
         assert delivered.body == envelope.to_bytes()
@@ -203,7 +203,7 @@ class TestTracking:
 
         await coordinator._handle_result(delivery)
 
-        assert "t1" not in coordinator._in_flight
+        assert (CANVAS, "t1") not in coordinator._in_flight
         assert CANVAS not in coordinator._by_canvas
 
 
@@ -261,12 +261,12 @@ class TestSweep:
         broker = MemoryBroker()
         coordinator = Coordinator(broker, store, RESULTS_TOPIC, max_age=60.0)
         stale_time = datetime.now(UTC) - timedelta(seconds=120)
-        coordinator._in_flight["t1"] = InFlightNode(CANVAS, "t1", stale_time)
+        coordinator._in_flight[CANVAS, "t1"] = InFlightNode(CANVAS, "t1", stale_time)
         coordinator._by_canvas[CANVAS] = {"t1"}
 
         await coordinator._sweep_once()
 
-        assert "t1" not in coordinator._in_flight
+        assert (CANVAS, "t1") not in coordinator._in_flight
         stored = await store.get_result(CANVAS, "t1")
         assert stored is not None
         assert stored.status == NodeStatus.ERROR
@@ -285,7 +285,7 @@ class TestSweep:
 
         await coordinator._sweep_once()
 
-        assert "t1" in coordinator._in_flight
+        assert (CANVAS, "t1") in coordinator._in_flight
         assert await store.get_result(CANVAS, "t1") is None
 
 
@@ -391,4 +391,138 @@ class TestRunStopLifecycle:
         await coordinator.stop()
         await run_task
 
-        assert "t1" not in coordinator._in_flight
+        assert (CANVAS, "t1") not in coordinator._in_flight
+
+
+class ClosingSpyBroker(MemoryBroker):
+    """A MemoryBroker that records when it is closed, into a shared ordered log."""
+
+    def __init__(self, log: list[str]) -> None:
+        """Record close calls into ``log``."""
+        super().__init__()
+        self._log = log
+
+    async def close(self) -> None:
+        """Record the call, then close as usual."""
+        self._log.append("broker")
+        await super().close()
+
+
+class ClosingSpyStore(MemoryCanvasStore):
+    """A MemoryCanvasStore that records when it is closed, into a shared ordered log."""
+
+    def __init__(self, log: list[str]) -> None:
+        """Record close calls into ``log``."""
+        super().__init__()
+        self._log = log
+
+    async def close(self) -> None:
+        """Record the call, then close as usual."""
+        self._log.append("store")
+        await super().close()
+
+
+class TestCrossCanvasTracking:
+    """Two canvases sharing a node id must be tracked, swept, and cancelled independently.
+
+    ``Node(topic, input, id=...)`` and ``apply(canvas_id=...)`` both exist so a
+    caller can pin ids for idempotent retries, which makes the same node id
+    running in two canvases at once ordinary usage rather than a corner case.
+    """
+
+    OTHER_CANVAS = "c2"
+
+    async def test_two_canvases_sharing_a_node_id_are_tracked_separately(self) -> None:
+        """A bare node_id key let the second canvas evict the first from the sweeper."""
+        coordinator = Coordinator(MemoryBroker(), MemoryCanvasStore(), RESULTS_TOPIC)
+
+        coordinator._track(CANVAS, "shared")
+        coordinator._track(self.OTHER_CANVAS, "shared")
+
+        assert (CANVAS, "shared") in coordinator._in_flight
+        assert (self.OTHER_CANVAS, "shared") in coordinator._in_flight
+
+    async def test_untracking_one_canvas_leaves_the_others_entry_alone(self) -> None:
+        """Untracking canvas B must not pop canvas A's identically-named node."""
+        coordinator = Coordinator(MemoryBroker(), MemoryCanvasStore(), RESULTS_TOPIC)
+        coordinator._track(CANVAS, "shared")
+        coordinator._track(self.OTHER_CANVAS, "shared")
+
+        coordinator._untrack(self.OTHER_CANVAS, "shared")
+
+        assert (CANVAS, "shared") in coordinator._in_flight
+        assert (self.OTHER_CANVAS, "shared") not in coordinator._in_flight
+        assert coordinator._by_canvas[CANVAS] == {"shared"}
+        assert self.OTHER_CANVAS not in coordinator._by_canvas
+
+    async def test_a_stale_node_in_one_canvas_does_not_time_out_the_other(self) -> None:
+        """The sweeper must fail only the canvas whose node actually went stale."""
+        store = MemoryCanvasStore()
+        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC, max_age=1.0)
+        for canvas in (CANVAS, self.OTHER_CANVAS):
+            await store.create_canvas(
+                canvas,
+                {"shared": TaskNode(id="shared", canvas_id=canvas, topic="t")},
+            )
+        stale = datetime.now(UTC) - timedelta(seconds=99)
+        coordinator._in_flight[CANVAS, "shared"] = InFlightNode(CANVAS, "shared", stale)
+        coordinator._track(self.OTHER_CANVAS, "shared")
+
+        await coordinator._sweep_once()
+
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+        assert await store.get_canvas_status(self.OTHER_CANVAS) == CanvasStatus.RUNNING
+
+
+class TestShutdownReleasesResources:
+    """_shutdown must release everything it owns, matching WorkerApp._shutdown."""
+
+    async def test_shutdown_closes_the_store_as_well_as_the_broker(self) -> None:
+        """A RedisCanvasStore's connection pool leaked on every coordinator shutdown.
+
+        ``WorkerApp._shutdown`` closes both; the coordinator only closed the broker.
+        """
+        closed: list[str] = []
+        broker = ClosingSpyBroker(closed)
+        store = ClosingSpyStore(closed)
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+
+        run_task = asyncio.create_task(coordinator.run())
+        async with asyncio.timeout(1.0):
+            await coordinator.stop()
+            await run_task
+
+        assert closed == ["broker", "store"]
+
+    async def test_a_stop_that_lands_before_the_loop_starts_still_stops_it(self) -> None:
+        """`run()` used to replace `_stop_event`, discarding a stop from that window.
+
+        `create_task(run())` doesn't run the coroutine immediately, so a `stop()`
+        issued on the next line set an event `run()` was about to throw away —
+        leaving a coordinator running with nothing left able to stop it.
+        """
+        coordinator = Coordinator(MemoryBroker(), MemoryCanvasStore(), RESULTS_TOPIC)
+
+        run_task = asyncio.create_task(coordinator.run())
+        await coordinator.stop()
+
+        async with asyncio.timeout(1.0):
+            await run_task
+
+        assert coordinator._running is False
+
+    async def test_an_instance_can_run_again_after_a_clean_shutdown(self) -> None:
+        """The stop event is cleared once serviced, so a stopped instance is reusable."""
+        coordinator = Coordinator(MemoryBroker(), MemoryCanvasStore(), RESULTS_TOPIC)
+        first = asyncio.create_task(coordinator.run())
+        await coordinator.stop()
+        async with asyncio.timeout(1.0):
+            await first
+
+        second = asyncio.create_task(coordinator.run())
+        await asyncio.sleep(0)
+        assert coordinator._running is True
+
+        await coordinator.stop()
+        async with asyncio.timeout(1.0):
+            await second

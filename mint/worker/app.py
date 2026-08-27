@@ -81,7 +81,6 @@ class WorkerApp:
         if self._running:
             raise AppAlreadyRunningError
         self._running = True
-        self._stop_event = asyncio.Event()
         self._tasks = {topic: asyncio.create_task(w.run()) for topic, w in self._workers.items()}
         self._install_signal_handlers()
         try:
@@ -90,7 +89,14 @@ class WorkerApp:
             await self._shutdown()
 
     async def stop(self) -> None:
-        """Trigger a graceful shutdown programmatically — also what SIGTERM/SIGINT call."""
+        """Trigger a graceful shutdown programmatically — also what SIGTERM/SIGINT call.
+
+        Safe to call before ``run()`` has actually begun: the event is created once,
+        in ``__init__``, and cleared only once a shutdown has fully run. ``run()``
+        used to replace it on entry, which silently discarded a ``stop()`` that
+        landed in the window between ``create_task(run())`` and the loop starting —
+        leaving it running with nothing left to stop it.
+        """
         self._stop_event.set()
 
     def _install_signal_handlers(self) -> None:
@@ -117,6 +123,7 @@ class WorkerApp:
         await self.store.close()
         await self._close_executors()
         self._running = False
+        self._stop_event.clear()
 
     async def _close_executors(self) -> None:
         """Close every distinct closable executor in use, each exactly once.

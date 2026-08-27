@@ -76,7 +76,11 @@ class Coordinator:
         self.results_topic = results_topic
         self.sweep_interval = sweep_interval
         self.max_age = max_age
-        self._in_flight: dict[str, InFlightNode] = {}
+        # Keyed by (canvas_id, node_id), never node_id alone: Node(..., id=...) and
+        # apply(canvas_id=...) both let a caller fix ids, so the same node id running
+        # in two canvases at once is supported usage — and a bare node_id key means
+        # one canvas silently evicts the other from the sweeper.
+        self._in_flight: dict[tuple[str, str], InFlightNode] = {}
         self._by_canvas: dict[str, set[str]] = {}
         self._running = False
         self._stop_event = asyncio.Event()
@@ -112,7 +116,6 @@ class Coordinator:
         if self._running:
             raise CoordinatorAlreadyRunningError
         self._running = True
-        self._stop_event = asyncio.Event()
         self._tasks = {
             asyncio.create_task(self._consume_results()),
             asyncio.create_task(self._sweep_loop()),
@@ -124,15 +127,22 @@ class Coordinator:
             await self._shutdown()
 
     async def stop(self) -> None:
-        """Trigger a graceful shutdown programmatically — also what SIGTERM/SIGINT call."""
+        """Trigger a graceful shutdown programmatically — also what SIGTERM/SIGINT call.
+
+        Safe to call before ``run()`` has actually begun: the event is created once,
+        in ``__init__``, and cleared only once a shutdown has fully run. ``run()``
+        used to replace it on entry, which silently discarded a ``stop()`` that
+        landed in the window between ``create_task(run())`` and the loop starting —
+        leaving it running with nothing left to stop it.
+        """
         self._stop_event.set()
 
     def _track(self, canvas_id: str, node_id: str) -> None:
-        self._in_flight[node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
+        self._in_flight[canvas_id, node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
         self._by_canvas.setdefault(canvas_id, set()).add(node_id)
 
     def _untrack(self, canvas_id: str, node_id: str) -> None:
-        self._in_flight.pop(node_id, None)
+        self._in_flight.pop((canvas_id, node_id), None)
         nodes = self._by_canvas.get(canvas_id)
         if nodes is None:
             return
@@ -151,7 +161,9 @@ class Coordinator:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.broker.close()
+        await self.store.close()
         self._running = False
+        self._stop_event.clear()
 
     async def _consume_results(self) -> None:
         async for delivery in self.broker.consume(self.results_topic):

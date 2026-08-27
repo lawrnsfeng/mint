@@ -13,6 +13,14 @@ Regression fixes (bug #11):
 - The connection/channel pools build lazily, for the same reason as
   ``RabbitMQBroker``: ``aio_pika.pool.Pool.__init__`` needs a running event loop,
   so building it eagerly would break ordinary synchronous DI/container setup.
+
+Found by review: every call declared an exclusive reply queue and registered a
+consumer on a *pooled* channel, and tore down neither. An exclusive queue only
+disappears when its connection closes, so a long-running worker accumulated one
+queue and one consumer per call until RabbitMQ's limits stopped it. Both are now
+released in a ``finally``. A reply that fails ``output_type`` validation also
+resolves its future with that error instead of escaping into aio-pika's callback
+and leaving the caller to time out with a misleading "no reply".
 """
 
 import asyncio
@@ -27,9 +35,10 @@ from aio_pika.abc import (
     AbstractIncomingMessage,
     AbstractQueue,
     AbstractRobustConnection,
+    ConsumerTag,
 )
 from aio_pika.pool import Pool
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from mint.logger import get_logger
 from mint.worker.exc import RemoteCallTimeoutError
@@ -118,12 +127,22 @@ class AMQPRPCExecutor[T: BaseModel, RT: BaseModel]:
             future = self._pending.pop(correlation_id, None)
             if future is None or future.done():
                 return
-            future.set_result(self.output_type.model_validate_json(message.body))
+            try:
+                future.set_result(self.output_type.model_validate_json(message.body))
+            except ValidationError as exc:
+                # The future is already popped, so letting this escape into aio-pika's
+                # consumer callback would leave the caller blocked for the full timeout
+                # and then raise RemoteCallTimeoutError — reporting "no reply" for a
+                # reply that did arrive and simply didn't match output_type.
+                future.set_exception(exc)
 
-    async def _declare_reply_queue(self, channel: AbstractChannel) -> AbstractQueue:
+    async def _declare_reply_queue(
+        self,
+        channel: AbstractChannel,
+    ) -> tuple[AbstractQueue, ConsumerTag]:
         queue = await channel.declare_queue(exclusive=True)
-        await queue.consume(self._on_reply, no_ack=True)
-        return queue
+        consumer_tag = await queue.consume(self._on_reply, no_ack=True)
+        return queue, consumer_tag
 
     async def execute(self, fn: object, input_: T) -> RT:
         """Publish ``input_`` and await its reply, or raise on timeout.
@@ -134,21 +153,51 @@ class AMQPRPCExecutor[T: BaseModel, RT: BaseModel]:
         """
         del fn
         async with self._ensure_channel_pool().acquire() as channel:
-            reply_queue = await self._declare_reply_queue(channel)
-            correlation_id = str(uuid4())
-            loop = asyncio.get_running_loop()
-            future: asyncio.Future[RT] = loop.create_future()
-            self._pending[correlation_id] = future
-            await channel.default_exchange.publish(
-                Message(
-                    input_.model_dump_json().encode(),
-                    correlation_id=correlation_id,
-                    reply_to=reply_queue.name,
-                    delivery_mode=DeliveryMode.PERSISTENT,
-                ),
-                routing_key=self.queue,
-            )
-            return await self._await_reply(correlation_id, future)
+            reply_queue, consumer_tag = await self._declare_reply_queue(channel)
+            try:
+                return await self._call(channel, reply_queue, input_)
+            finally:
+                # An exclusive queue only disappears when its *connection* closes, and
+                # the channel here goes straight back into a pool still carrying this
+                # consumer. Without explicit teardown a long-running worker accumulates
+                # one queue and one consumer per call, across ~20 pooled channels, until
+                # it hits RabbitMQ's per-channel consumer or queue limits.
+                await self._release_reply_queue(reply_queue, consumer_tag)
+
+    async def _call(
+        self,
+        channel: AbstractChannel,
+        reply_queue: AbstractQueue,
+        input_: T,
+    ) -> RT:
+        """Publish one request on ``channel`` and await its correlated reply."""
+        correlation_id = str(uuid4())
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[RT] = loop.create_future()
+        self._pending[correlation_id] = future
+        await channel.default_exchange.publish(
+            Message(
+                input_.model_dump_json().encode(),
+                correlation_id=correlation_id,
+                reply_to=reply_queue.name,
+                delivery_mode=DeliveryMode.PERSISTENT,
+            ),
+            routing_key=self.queue,
+        )
+        return await self._await_reply(correlation_id, future)
+
+    @staticmethod
+    async def _release_reply_queue(queue: AbstractQueue, consumer_tag: ConsumerTag) -> None:
+        """Cancel this call's consumer and delete its reply queue, best-effort.
+
+        Teardown must never mask the call's own result or error, so a broker that
+        has already dropped the queue/consumer is logged rather than raised.
+        """
+        try:
+            await queue.cancel(consumer_tag)
+            await queue.delete(if_unused=False, if_empty=False)
+        except Exception:
+            logger.exception("Failed to release an AMQP RPC reply queue", queue=queue.name)
 
     async def _await_reply(self, correlation_id: str, future: asyncio.Future[RT]) -> RT:
         try:

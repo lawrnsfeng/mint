@@ -20,7 +20,7 @@ from aio_pika.abc import (
     AbstractQueue,
     AbstractRobustConnection,
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from mint.worker.exc import RemoteCallTimeoutError
 from mint.worker.executors.amqp_rpc import AMQPRPCConfig, AMQPRPCExecutor
@@ -324,3 +324,96 @@ class TestAclose:
     def test_construction_outside_a_running_event_loop_does_not_raise(self) -> None:
         """Pool construction is lazy, matching RabbitMQBroker — no running loop needed."""
         AMQPRPCExecutor(QUEUE, "amqp://fake", EchoOutput)  # must not raise
+
+
+class TestReplyQueueLifecycle:
+    """Every call must tear down the reply queue and consumer it created."""
+
+    async def test_a_completed_call_cancels_its_consumer_and_deletes_its_queue(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """An exclusive queue outlives its channel, so a pooled channel would hoard it.
+
+        The channel goes straight back into a pool of ~20 still carrying this
+        consumer; without teardown a long-running worker accumulates one queue and
+        one consumer per call until RabbitMQ's own limits stop it.
+        """
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-1"
+
+        call = asyncio.ensure_future(executor.execute(None, EchoInput(value="hi")))
+        await asyncio.sleep(0)
+        await deliver_reply(
+            executor,
+            mock_channel,
+            mocker,
+            correlation_id=next(iter(executor._pending)),
+            output=EchoOutput(value="hi"),
+        )
+        await call
+
+        queue.cancel.assert_awaited_once_with("ctag-1")
+        queue.delete.assert_awaited_once_with(if_unused=False, if_empty=False)
+
+    async def test_a_timed_out_call_still_tears_its_reply_queue_down(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """The leak is worst exactly when calls fail, so teardown runs on the error path too."""
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-2"
+
+        with pytest.raises(RemoteCallTimeoutError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+        queue.cancel.assert_awaited_once_with("ctag-2")
+        queue.delete.assert_awaited_once()
+
+    async def test_a_failing_teardown_never_masks_the_calls_own_result(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """A broker that already dropped the queue must not turn a timeout into its own error."""
+        queue = mock_channel.declare_queue.return_value
+        queue.cancel.side_effect = RuntimeError("channel closed")
+
+        with pytest.raises(RemoteCallTimeoutError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+
+class TestReplyValidation:
+    """A reply that doesn't match output_type must surface as itself, not as a timeout."""
+
+    async def test_an_unparseable_reply_raises_a_validation_error_not_a_timeout(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """The future is popped before validation, so a raise there stranded the caller.
+
+        It blocked for the whole timeout and then reported "no reply on queue" —
+        for a reply that did arrive and simply had the wrong shape.
+        """
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-3"
+
+        call = asyncio.ensure_future(executor.execute(None, EchoInput(value="hi")))
+        await asyncio.sleep(0)
+        correlation_id = next(iter(executor._pending))
+        callback = queue.consume.await_args.args[0]
+        await callback(
+            fake_incoming_message(
+                mocker,
+                correlation_id=correlation_id,
+                body=b'{"wrong_field": 1}',
+            ),
+        )
+
+        with pytest.raises(ValidationError):
+            await call

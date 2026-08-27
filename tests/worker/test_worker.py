@@ -19,7 +19,7 @@ from mint.worker.canvas.engine import CanvasEngine
 from mint.worker.canvas.models import ChainNode, GroupNode, NodeOutcome, TaskNode
 from mint.worker.enums import CanvasStatus, NodeStatus
 from mint.worker.envelope import Envelope
-from mint.worker.exc import WorkerNotBoundError
+from mint.worker.exc import NodeNotFoundError, WorkerNotBoundError
 from mint.worker.executors.inline import InlineExecutor
 from mint.worker.stores.memory import MemoryCanvasStore
 from mint.worker.worker import Worker, WorkerBinding
@@ -496,7 +496,9 @@ class TestHookFailuresAreContained:
         await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
         delivery = envelope_delivery(broker, "t1", CANVAS, '{"value": 5}')
 
-        await worker._process_delivery(delivery, binding)
+        # _handle, not _process_delivery: the success hook runs there now, after the
+        # delivery's settlement is recorded, so a slow hook can't un-settle an ack.
+        await worker._handle(delivery, binding)
 
         assert len(worker.on_success_calls) == 1  # called exactly once, not retried
         stored = await store.get_result(CANVAS, "t1")
@@ -564,13 +566,12 @@ class TestCentralizedMode:
         binding = bind_worker(worker, broker, store, results_topic="results")
         delivery = envelope_delivery(broker, "t1", CANVAS, '{"value": 5}')
 
-        await worker._process_delivery(delivery, binding)
+        await worker._handle(delivery, binding)
 
         # No local advancement: the engine never wrote a result for t1.
         assert await store.get_result(CANVAS, "t1") is None
         # The outcome landed on the results topic instead.
-        reported = await anext(broker.consume("results"))
-        envelope = Envelope.from_bytes(reported.body)
+        envelope = await next_envelope(broker, "results")
         assert envelope.node_id == "t1"
         assert envelope.canvas_id == CANVAS
         outcome = NodeOutcome.model_validate_json(envelope.body)
@@ -726,6 +727,142 @@ class TestRedeliverySafety:
         )
 
         assert (await next_envelope(healthy_broker, "next")).node_id == "t2"
+
+
+class RaisingOnCompleteStore(MemoryCanvasStore):
+    """A store whose set_result always fails — stands in for a persistently broken store."""
+
+    def __init__(self, delegate: MemoryCanvasStore) -> None:
+        """Share ``delegate``'s graph so nodes resolve, but never record an outcome."""
+        super().__init__()
+        self._nodes = delegate._nodes
+        self._canvas_status = delegate._canvas_status
+
+    async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
+        """Fail the way an unreachable store would — as a WorkerError the engine expects."""
+        del outcome
+        raise NodeNotFoundError(node_id=node_id, canvas_id=canvas_id)
+
+
+class UnexpectedlyRaisingStore(MemoryCanvasStore):
+    """A store that fails with something outside the WorkerError hierarchy.
+
+    `_advance_canvas` only catches `WorkerError`, so anything else escapes
+    `_process_delivery` entirely — the case `_handle` has to cope with.
+    """
+
+    def __init__(self, delegate: MemoryCanvasStore) -> None:
+        """Share ``delegate``'s graph so nodes resolve, but never record an outcome."""
+        super().__init__()
+        self._nodes = delegate._nodes
+        self._canvas_status = delegate._canvas_status
+
+    async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
+        """Fail the way a driver-level error would — not a WorkerError at all."""
+        del canvas_id, node_id, outcome
+        detail = "connection reset by peer"
+        raise ConnectionResetError(detail)
+
+
+class TestDeliveryIsAlwaysSettled:
+    """Every exit path must leave the delivery acked or nacked, exactly once."""
+
+    async def test_an_unexpected_exception_nacks_instead_of_stranding_the_delivery(
+        self,
+    ) -> None:
+        """`_handle` is fire-and-forget, so an escaping exception is never even logged.
+
+        The delivery would be left unacked and unnacked — invisible to the broker,
+        to the canvas, and to the operator.
+        """
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, UnexpectedlyRaisingStore(store))
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+        delivery = envelope_delivery(broker, "t1", CANVAS, '{"value": 5}')
+
+        await worker._handle(delivery, binding)
+
+        redelivered = await next_delivery(broker, TOPIC)
+        assert redelivered.attempt == 2
+
+    async def test_cancellation_after_the_ack_does_not_double_settle(self) -> None:
+        """Drain-timeout cancellation lands in on_success, after the ack has happened.
+
+        Nacking there settles the delivery twice: on RabbitMQ that republishes the
+        message *and* acks a second time, so a node that already finished runs again
+        after a clean shutdown.
+        """
+        acked_then_cancelled = asyncio.Event()
+
+        class CancelInHookWorker(DoublingWorker):
+            async def on_success(self, input_obj: Input, result: Output) -> None:
+                del input_obj, result
+                acked_then_cancelled.set()
+                await asyncio.sleep(3600)
+
+        worker = CancelInHookWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+        delivery = envelope_delivery(broker, "t1", CANVAS, '{"value": 5}')
+
+        task = asyncio.create_task(worker._handle(delivery, binding))
+        async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
+            await acked_then_cancelled.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        # Nothing was requeued: the delivery was already settled by the ack.
+        assert TOPIC not in broker._queues or broker._queues[TOPIC].empty()
+
+
+class TestRetryCap:
+    """A persistently failing store or broker must not retry forever."""
+
+    async def _failing_delivery(self, attempt: int) -> tuple[DoublingWorker, MemoryBroker]:
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, RaisingOnCompleteStore(store))
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+        envelope = Envelope(node_id="t1", canvas_id=CANVAS, body='{"value": 5}')
+        delivery = MemoryDelivery(broker, TOPIC, envelope.to_bytes(), attempt=attempt)
+        await worker._handle(delivery, binding)
+        return worker, broker
+
+    async def test_a_failure_under_the_cap_is_requeued(self) -> None:
+        """Ordinary transient failures must still retry, with the attempt bumped."""
+        _, broker = await self._failing_delivery(attempt=1)
+
+        assert (await next_delivery(broker, TOPIC)).attempt == 2
+
+    async def test_a_failure_at_the_cap_is_dead_lettered_instead(self) -> None:
+        """Nothing read Delivery.attempt before, so a broken store retried forever.
+
+        On MemoryBroker that is a tight CPU-burning loop, since requeue redelivers
+        synchronously onto the queue the same consumer is polling.
+        """
+        _, broker = await self._failing_delivery(attempt=DoublingWorker.max_attempts)
+
+        dead = await next_delivery(broker, f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}")
+        assert dead.attempt == DoublingWorker.max_attempts
+
+    async def test_a_node_whose_failure_cannot_be_recorded_is_retried_not_dropped(
+        self,
+    ) -> None:
+        """Dead-lettering an unrecordable failure leaves the canvas RUNNING forever."""
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, RaisingOnCompleteStore(store))
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._handle(envelope_delivery(broker, "t1", CANVAS, "{}"), binding)
+
+        assert (await next_delivery(broker, TOPIC)).attempt == 2
 
 
 class TestBinding:

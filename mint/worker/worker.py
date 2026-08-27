@@ -26,11 +26,26 @@ from mint.worker.stores.interface import ICanvasStore
 logger = get_logger(__name__)
 
 DEFAULT_MAX_CONCURRENCY: Final[int] = 32
+DEFAULT_MAX_ATTEMPTS: Final[int] = 5
 
 MALFORMED_INPUT_ERROR: Final[ErrorInfo] = ErrorInfo(
     type="ValidationError",
     message="message body does not match this worker's Input model",
 )
+
+
+@dataclass(frozen=True)
+class DeliveryOutcome[T: BaseModel, RT: BaseModel]:
+    """What handling one delivery settled, and any success hook still owed.
+
+    ``settled`` has to be readable by ``_handle`` *before* the hook runs: the ack
+    happens inside ``_process_delivery``, but ``on_success`` runs after it, and a
+    cancellation in that window must not nack an already-acked delivery.
+    """
+
+    settled: bool
+    input_obj: T | None = None
+    result: RT | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +91,9 @@ class Worker[T: BaseModel, RT: BaseModel]:
     # but Kafka and MemoryBroker yield as fast as the topic supplies, so an
     # unbounded loop spawns one handler task per backlogged message.
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    # How many delivery attempts a message gets before it is dead-lettered instead
+    # of requeued. Every broker maintains Delivery.attempt; this is what reads it.
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
     def __init__(self) -> None:
         """Start unbound; ``WorkerApp.register()`` supplies runtime dependencies."""
@@ -150,19 +168,50 @@ class Worker[T: BaseModel, RT: BaseModel]:
         return self._binding
 
     async def _handle(self, delivery: Delivery, binding: WorkerBinding) -> None:
+        """Run one delivery to completion, settling it exactly once, whatever happens.
+
+        Every exit path — success, cancellation during shutdown, or an unexpected
+        exception — must leave the delivery either acked or nacked. This task is
+        fire-and-forget (``run()`` only keeps it alive in ``_inflight``), so an
+        exception escaping here would never be retrieved or logged, and the
+        delivery would simply be stranded: unacked, unnacked, invisible.
+        """
+        settled = False
         try:
-            await self._process_delivery(delivery, binding)
+            handled = await self._process_delivery(delivery, binding)
+            settled = handled.settled
+            if handled.input_obj is not None and handled.result is not None:
+                await self._safe_on_success(handled.input_obj, handled.result)
         except asyncio.CancelledError:
-            await delivery.nack(requeue=True)
+            # Only nack what we never settled. Cancellation can land *after* the ack
+            # (in the on_success hook), and nacking an acked delivery double-settles
+            # it — on RabbitMQ that republishes the message and acks a second time,
+            # which the broker rejects and which reruns a node that already finished.
+            if not settled:
+                await self._safe_nack(delivery, requeue=True)
             raise
+        except Exception:
+            logger.exception("Unhandled error handling a delivery", topic=self.topic)
+            if not settled:
+                await self._safe_nack(delivery, requeue=True)
         finally:
             self._slots.release()
 
-    async def _process_delivery(self, delivery: Delivery, binding: WorkerBinding) -> None:
+    async def _process_delivery(
+        self,
+        delivery: Delivery,
+        binding: WorkerBinding,
+    ) -> DeliveryOutcome[T, RT]:
+        """Handle one delivery, settling it, and report any success hook still owed.
+
+        The hook is deliberately *not* run here. It runs in ``_handle``, after the
+        settlement flag has been read, so that a cancellation inside a slow hook
+        can't nack a delivery this method already acked.
+        """
         envelope = self._decode_envelope(delivery.body)
         if envelope is None:
             await delivery.nack(requeue=False)
-            return
+            return DeliveryOutcome(settled=True)
 
         input_obj = self._decode_input(envelope)
         if input_obj is None:
@@ -171,20 +220,51 @@ class Worker[T: BaseModel, RT: BaseModel]:
             # Failing the node explicitly is what stops one schema-mismatched message
             # from leaving the node PENDING and its canvas RUNNING forever (embedded
             # mode, the default, has no sweeper that would ever notice).
-            await self._fail_node(envelope, MALFORMED_INPUT_ERROR, binding)
+            if not await self._fail_node(envelope, MALFORMED_INPUT_ERROR, binding):
+                # The failure couldn't even be recorded. Dead-lettering now would
+                # leave the canvas RUNNING with nothing able to advance it, so retry
+                # instead — bounded by max_attempts, which dead-letters in the end.
+                await self._retry_or_drop(delivery, envelope)
+                return DeliveryOutcome(settled=True)
             await delivery.nack(requeue=False)
-            return
+            return DeliveryOutcome(settled=True)
 
         outcome, result = await self._run_task(input_obj, envelope.node_id, binding.executor)
 
         if not await self._advance(envelope, outcome, binding):
-            await delivery.nack(requeue=True)
-            return
+            await self._retry_or_drop(delivery, envelope)
+            return DeliveryOutcome(settled=True)
 
         await delivery.ack()
+        return DeliveryOutcome(settled=True, input_obj=input_obj, result=result)
 
-        if result is not None:
-            await self._safe_on_success(input_obj, result)
+    async def _retry_or_drop(self, delivery: Delivery, envelope: Envelope) -> None:
+        """Requeue this delivery, or dead-letter it once ``max_attempts`` is spent.
+
+        Without a cap, a persistently failing store or broker means every failure
+        nacks for redelivery forever. On a broker that redelivers synchronously
+        (``MemoryBroker``) that is a tight CPU-burning loop; on the rest it is an
+        unbounded retry storm with no poison-message escape. Every broker already
+        maintains ``Delivery.attempt`` — nothing read it until now.
+        """
+        if delivery.attempt >= self.max_attempts:
+            logger.error(
+                "Giving up on a delivery after repeated failures",
+                topic=self.topic,
+                node_id=envelope.node_id,
+                canvas_id=envelope.canvas_id,
+                attempt=delivery.attempt,
+            )
+            await delivery.nack(requeue=False)
+            return
+        await delivery.nack(requeue=True)
+
+    async def _safe_nack(self, delivery: Delivery, *, requeue: bool) -> None:
+        """Nack, logging rather than raising — used where nothing is left to catch it."""
+        try:
+            await delivery.nack(requeue=requeue)
+        except Exception:
+            logger.exception("Failed to nack a delivery", topic=self.topic)
 
     async def _advance(
         self,
@@ -202,20 +282,23 @@ class Worker[T: BaseModel, RT: BaseModel]:
         envelope: Envelope,
         error: ErrorInfo,
         binding: WorkerBinding,
-    ) -> None:
-        """Record an ERROR outcome for a node whose message will be dead-lettered.
+    ) -> bool:
+        """Record an ERROR outcome for a node whose message can't be processed.
 
-        Best-effort by design: the delivery is being dropped either way, so a
-        store or broker failure here must not turn an unretryable message into a
-        redelivery loop. It is logged and the dead-letter still happens.
+        Returns whether the failure was actually recorded. A caller that gets
+        ``False`` must not dead-letter: the node would be left with no outcome and
+        its canvas RUNNING forever, which is the exact stall this method exists to
+        prevent.
         """
         outcome = NodeOutcome(node_id=envelope.node_id, status=NodeStatus.ERROR, error=error)
-        if not await self._advance(envelope, outcome, binding):
-            logger.error(
-                "Could not record the failure of an undeliverable message",
-                node_id=envelope.node_id,
-                canvas_id=envelope.canvas_id,
-            )
+        if await self._advance(envelope, outcome, binding):
+            return True
+        logger.error(
+            "Could not record the failure of an undeliverable message",
+            node_id=envelope.node_id,
+            canvas_id=envelope.canvas_id,
+        )
+        return False
 
     async def _advance_canvas(
         self,

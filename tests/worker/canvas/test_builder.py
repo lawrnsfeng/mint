@@ -4,7 +4,7 @@ import pytest
 
 from mint.worker.canvas.builder import Chain, Chord, Node
 from mint.worker.canvas.engine import CanvasEngine
-from mint.worker.canvas.models import ChainNode, FanIn, GroupNode, NodeOutcome
+from mint.worker.canvas.models import AnyNode, ChainNode, FanIn, GroupNode, NodeOutcome
 from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.envelope import Envelope
 from mint.worker.exc import (
@@ -326,3 +326,48 @@ class TestNestedChainErrorPolicy:
         outer = Chain([Node(topic="a"), Chain([Node(topic="b")])])
 
         assert [step.topic for step in outer.steps] == ["a", "b"]
+
+
+class TestNestedContainerIdCollision:
+    """A container writes its own node last, so an early-only check misses a nested clash."""
+
+    def test_a_nested_chord_sharing_the_outer_chords_id_is_rejected(self) -> None:
+        """Nesting a chord inside another with the same id produced a self-referencing group.
+
+        The outer chord's up-front check ran before the inner one existed, and its
+        own write then overwrote the inner group entirely — leaving legs whose
+        parent points at a group that no longer holds them, and `mark_child_done`
+        called with ids that aren't in `children`.
+        """
+        inner = Chord([Node(topic="a", input="{}"), Node(topic="b", input="{}")], id="x")
+
+        with pytest.raises(DuplicateNodeIdError):
+            Chord([inner, Node(topic="c", input="{}")], id="x").build("c1", None, {})
+
+    def test_a_nested_chain_sharing_the_outer_chords_id_is_rejected(self) -> None:
+        """Same shape with a chain as the nested container."""
+        inner = Chain([Node(topic="a", input="{}"), Node(topic="b", input="{}")], id="x")
+
+        with pytest.raises(DuplicateNodeIdError):
+            Chord([inner, Node(topic="c", input="{}")], id="x").build("c1", None, {})
+
+    def test_a_callback_sharing_the_chords_id_is_rejected(self) -> None:
+        """The callback is built before the group's own node too."""
+        with pytest.raises(DuplicateNodeIdError):
+            Chord(
+                [Node(topic="a", input="{}")],
+                callback=Node(topic="cb", id="x"),
+                id="x",
+            ).build("c1", None, {})
+
+    def test_distinct_nested_container_ids_still_build(self) -> None:
+        """The guard must not reject an ordinary nested graph."""
+        inner = Chord([Node(topic="a", input="{}"), Node(topic="b", input="{}")], id="inner")
+        nodes: dict[str, AnyNode] = {}
+
+        Chord([inner, Node(topic="c", input="{}")], id="outer").build("c1", None, nodes)
+
+        outer_node = nodes["outer"]
+        assert isinstance(outer_node, GroupNode)
+        assert "inner" in outer_node.children
+        assert "outer" not in outer_node.children

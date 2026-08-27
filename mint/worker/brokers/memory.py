@@ -71,11 +71,22 @@ class MemoryBroker:
         )
 
     async def consume(self, topic: str) -> AsyncIterator[MemoryDelivery]:
-        """Yield deliveries from ``topic`` until ``close()`` is called."""
+        """Yield deliveries from ``topic`` until ``close()`` is called.
+
+        The stop sentinel is put back before returning. ``close()`` can only push
+        one per queue, so without this only the first of several consumers on a
+        topic (a ``Coordinator`` alongside a worker, or two consumers in a test)
+        would ever wake up — the rest stayed blocked on ``get()`` forever.
+
+        Leaving the sentinel in place also means a queue stays drainable after
+        close: anything already requeued is still readable, which is what makes
+        "was this nacked rather than dropped?" checkable at all.
+        """
         queue = self._queue(topic)
         while True:
             item = await queue.get()
             if item is None:
+                await queue.put(None)
                 return
             yield item
 
@@ -84,7 +95,7 @@ class MemoryBroker:
         if self._closed:
             return
         self._closed = True
-        for queue in self._queues.values():
+        for queue in list(self._queues.values()):
             await queue.put(None)
 
     async def redeliver(

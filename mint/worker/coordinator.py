@@ -97,10 +97,10 @@ class Coordinator:
         self._track(envelope.canvas_id, envelope.node_id)
         await self.broker.publish(topic, body)
 
-    async def dispatch(self, dispatches: list[Dispatch]) -> None:
-        """Publish every dispatch, tracked, exactly like ``track_and_publish``."""
+    async def dispatch(self, dispatches: list[Dispatch], trace_id: str | None = None) -> None:
+        """Publish every dispatch, tracked, carrying ``trace_id`` forward."""
         for one in dispatches:
-            await self.track_and_publish(one.topic, one.to_envelope().to_bytes())
+            await self.track_and_publish(one.topic, one.to_envelope(trace_id).to_bytes())
 
     async def cancel(self, canvas_id: str) -> None:
         """Cancel a running canvas: mark every in-flight node CANCELLED, then error it."""
@@ -220,19 +220,31 @@ class Coordinator:
             return
 
         self._untrack(envelope.canvas_id, envelope.node_id)
-        if not await self._advance(envelope.canvas_id, envelope.node_id, outcome):
+        if not await self._advance(
+            envelope.canvas_id,
+            envelope.node_id,
+            outcome,
+            trace_id=envelope.trace_id,
+        ):
             await delivery.nack(requeue=True)
             return
         await delivery.ack()
 
-    async def _advance(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> bool:
+    async def _advance(
+        self,
+        canvas_id: str,
+        node_id: str,
+        outcome: NodeOutcome,
+        *,
+        trace_id: str | None = None,
+    ) -> bool:
         try:
             dispatches = await self.engine.complete(canvas_id, node_id, outcome)
         except WorkerError:
             logger.exception("Canvas engine error advancing node", node_id=node_id)
             return False
         try:
-            await self.dispatch(dispatches)
+            await self.dispatch(dispatches, trace_id)
         except Exception:
             logger.exception("Failed to publish dispatch", node_id=node_id)
             # Same reasoning as Worker._advance_canvas: a burned fan-in guard must be

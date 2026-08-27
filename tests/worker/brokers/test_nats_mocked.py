@@ -6,6 +6,7 @@ different topics' consumers genuinely don't fight over the same JetStream cursor
 is a real-broker property, covered separately in a container test.
 """
 
+from itertools import product
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 
@@ -274,6 +275,26 @@ class TestStreamNamingIsInjective:
         one durable name shared by two logically unrelated topics.
         """
         assert broker._stream_name("a.b") != broker._stream_name("a-b")
+
+    def test_topics_mixing_dots_and_dashes_do_not_collide(self, broker: NatsBroker) -> None:
+        """Escaping `-` as `--` isn't injective either — dash runs become ambiguous.
+
+        `a-.b` and `a.-b` both encoded to `a---b`, so the first attempt at fixing
+        the collision above simply moved it to a less obvious pair of inputs.
+        """
+        assert broker._stream_name("a-.b") != broker._stream_name("a.-b")
+
+    def test_the_encoding_is_injective_over_every_short_topic(
+        self,
+        broker: NatsBroker,
+    ) -> None:
+        """Exhaustive over the characters that interact: separators plus the tag chars."""
+        encoded: dict[str, str] = {}
+        for length in range(1, 6):
+            for chars in product(".-hda", repeat=length):
+                topic = "".join(chars)
+                name = broker._stream_name(topic)
+                assert encoded.setdefault(name, topic) == topic
 
     def test_a_dotted_and_a_dashed_topic_get_different_durable_names(
         self,

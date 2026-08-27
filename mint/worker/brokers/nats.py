@@ -10,6 +10,9 @@ Here the durable name is derived from the topic, so each gets its own cursor.
 Two further issues found by review. ``_stream_name`` collapsed ``.`` to ``-``
 with a plain replace, which is not injective: ``a.b`` and ``a-b`` mapped onto one
 stream and one durable name — the same cursor sharing, reached a different way.
+(The first attempt at a fix, escaping ``-`` as ``--``, was itself not injective:
+it makes dash runs ambiguous, so ``a-.b`` and ``a.-b`` both encoded to ``a---b``.
+Each character needs its own distinct escape.)
 And ``_ensure_stream`` gave every topic its own stream claiming ``{topic}`` and
 ``{topic}.dlq``, so consuming ``foo.dlq`` tried to declare a stream over a subject
 ``foo``'s stream already owned, which JetStream rejects. A dead-letter subject now
@@ -76,16 +79,24 @@ class NatsBroker:
         self._jetstream = self._client.jetstream()
         return self._jetstream
 
+    DASH_ESCAPE: Final[str] = "-h"
+    DOT_ESCAPE: Final[str] = "-d"
+
     def _stream_name(self, topic: str) -> str:
         """Return an injective stream name for ``topic``.
 
-        JetStream stream names can't contain ``.``, so it collapses to ``-``. A
-        plain replace isn't injective — ``a.b`` and ``a-b`` both became ``a-b``,
-        sharing one stream *and* one durable consumer name, which is the exact
-        cursor-sharing failure bug #10 was about. Doubling any existing ``-``
-        first keeps the mapping reversible.
+        JetStream stream names can't contain ``.``, so it has to be encoded away —
+        and the encoding must be injective, or two unrelated topics share one
+        stream *and* one durable consumer name, which is exactly bug #10's
+        cursor-sharing failure.
+
+        Escaping ``-`` as ``--`` before mapping ``.`` to ``-`` is *not* enough: it
+        makes runs of dashes ambiguous, so ``a-.b`` and ``a.-b`` both encode to
+        ``a---b``. Each source character needs its own distinct two-character
+        escape, so every ``-`` in the output is unambiguously a marker followed by
+        exactly one tag character.
         """
-        return topic.replace("-", "--").replace(".", "-")
+        return topic.replace("-", self.DASH_ESCAPE).replace(".", self.DOT_ESCAPE)
 
     def _durable_name(self, topic: str) -> str:
         """Return a per-topic durable consumer name — the actual fix for bug #10."""

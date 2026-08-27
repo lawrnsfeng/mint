@@ -94,14 +94,33 @@ def mock_channel(mocker: "MockerFixture") -> AsyncMock:
     queue.iterator.return_value = FakeQueueIterator([])
     channel.declare_exchange.return_value = exchange
     channel.declare_queue.return_value = queue
+    # AbstractChannel.close isn't detected as a coroutine function by autospec
+    # (same gap as AbstractRobustConnection.channel below), so override just it.
+    channel.close = mocker.AsyncMock()
     return channel
 
 
 @pytest.fixture
-def broker(mock_channel: AsyncMock) -> RabbitMQBroker:
-    """Return a broker wired directly to the mock channel pool, skipping real connection setup."""
+def mock_consumer_connection(mock_channel: AsyncMock, mocker: "MockerFixture") -> AsyncMock:
+    """Return the dedicated connection a consumer opens its own channel on."""
+    connection = mocker.create_autospec(AbstractRobustConnection, instance=True)
+    # AbstractRobustConnection.channel isn't detected as a coroutine function by
+    # autospec (verified — same gap as redis-py's command methods).
+    connection.channel = mocker.AsyncMock(return_value=mock_channel)
+    return connection
+
+
+@pytest.fixture
+def broker(mock_channel: AsyncMock, mock_consumer_connection: AsyncMock) -> RabbitMQBroker:
+    """Return a broker wired directly to the mocks, skipping real connection setup.
+
+    Both paths are wired: publishing goes through the channel *pool*, while
+    consuming deliberately does not (see ``RabbitMQBroker.consume``) and opens its
+    own channel on a dedicated connection instead.
+    """
     instance = RabbitMQBroker("amqp://fake")
     instance._channel_pool = FakePool(mock_channel)
+    instance._consumer_connection = mock_consumer_connection
     return instance
 
 
@@ -446,3 +465,50 @@ class TestLazyPoolConstruction:
         second = broker._ensure_connection_pool()
 
         assert first is second
+
+
+class TestConsumersDoNotHoldPooledChannels:
+    """A consumer holds its channel for life, so it must never take one from the pool."""
+
+    async def test_consume_opens_its_own_channel_off_the_consumer_connection(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+        mock_consumer_connection: AsyncMock,
+    ) -> None:
+        """One broker is shared by every worker, so pooled channels would run out.
+
+        With `channel_pool_size` workers consuming, every pooled channel is held
+        permanently and the next `publish` blocks forever on `acquire()` — the app
+        deadlocks with no error at all.
+        """
+        mock_channel.declare_queue.return_value.iterator.return_value = FakeQueueIterator([])
+
+        async for _ in broker.consume(TOPIC):
+            break
+
+        mock_consumer_connection.channel.assert_awaited_once()
+
+    async def test_the_consumer_channel_is_closed_when_consumption_ends(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+    ) -> None:
+        """A dedicated channel is only cheap if it's actually released afterwards."""
+        mock_channel.declare_queue.return_value.iterator.return_value = FakeQueueIterator([])
+
+        async for _ in broker.consume(TOPIC):
+            break
+
+        mock_channel.close.assert_awaited_once()
+
+    async def test_close_releases_the_consumer_connection(
+        self,
+        broker: RabbitMQBroker,
+        mock_consumer_connection: AsyncMock,
+    ) -> None:
+        """The dedicated connection is the broker's to own, so the broker must close it."""
+        await broker.close()
+
+        mock_consumer_connection.close.assert_awaited_once()
+        assert broker._consumer_connection is None

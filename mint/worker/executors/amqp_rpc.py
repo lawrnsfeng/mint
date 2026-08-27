@@ -200,13 +200,22 @@ class AMQPRPCExecutor[T: BaseModel, RT: BaseModel]:
             logger.exception("Failed to release an AMQP RPC reply queue", queue=queue.name)
 
     async def _await_reply(self, correlation_id: str, future: asyncio.Future[RT]) -> RT:
+        """Await one correlated reply, always clearing its pending-map entry.
+
+        The cleanup has to be in a ``finally``, not just the timeout branch: a
+        *cancelled* call — the ordinary shutdown path, via ``Worker._handle`` —
+        otherwise left its correlation id and future in ``_pending`` forever, so a
+        long-lived executor accumulated one entry per cancelled RPC. That is the
+        same leak bug #11 fixed for lost replies, reached by a different route.
+        """
         try:
             async with asyncio.timeout(self.timeout):
                 return await future
         except TimeoutError as exc:
-            self._pending.pop(correlation_id, None)
             future.cancel()
             raise RemoteCallTimeoutError(queue=self.queue, timeout=self.timeout) from exc
+        finally:
+            self._pending.pop(correlation_id, None)
 
     async def aclose(self) -> None:
         """Close both pools, if they were ever built. Never called from ``__del__``."""

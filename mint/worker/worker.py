@@ -319,7 +319,8 @@ class Worker[T: BaseModel, RT: BaseModel]:
 
         try:
             for dispatch in dispatches:
-                await binding.broker.publish(dispatch.topic, dispatch.to_envelope().to_bytes())
+                envelope_out = dispatch.to_envelope(trace_id=envelope.trace_id)
+                await binding.broker.publish(dispatch.topic, envelope_out.to_bytes())
         except Exception:
             logger.exception("Failed to publish dispatch", node_id=envelope.node_id)
             # Release any fan-in guard complete() burned to authorise these dispatches,

@@ -417,3 +417,38 @@ class TestReplyValidation:
 
         with pytest.raises(ValidationError):
             await call
+
+
+class TestPendingMapIsAlwaysCleared:
+    """Bug #11's leak, reached by a different route: cancellation, not a lost reply."""
+
+    async def test_a_cancelled_call_does_not_leak_its_pending_entry(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """Cancellation is the ordinary shutdown path, via Worker._handle.
+
+        Cleanup lived only in the timeout branch, so every cancelled RPC left its
+        correlation id and future in `_pending` for the executor's lifetime.
+        """
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-cancel"
+        call = asyncio.ensure_future(executor.execute(None, EchoInput(value="hi")))
+        await asyncio.sleep(0)
+        assert executor._pending
+
+        call.cancel()
+        await asyncio.gather(call, return_exceptions=True)
+
+        assert executor._pending == {}
+
+    async def test_a_timed_out_call_still_clears_its_pending_entry(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+    ) -> None:
+        """The original bug #11 case must keep working after the move to `finally`."""
+        with pytest.raises(RemoteCallTimeoutError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+        assert executor._pending == {}

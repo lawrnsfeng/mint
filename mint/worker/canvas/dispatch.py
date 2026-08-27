@@ -21,6 +21,16 @@ class Dispatch:
     body: str
     group_id: str | None = None
 
-    def to_envelope(self) -> Envelope:
-        """Build the wire envelope for this dispatch."""
-        return Envelope(node_id=self.node_id, canvas_id=self.canvas_id, body=self.body)
+    def to_envelope(self, trace_id: str | None = None) -> Envelope:
+        """Build the wire envelope for this dispatch, carrying ``trace_id`` forward.
+
+        Every non-entry message in a canvas is produced here, so dropping the
+        caller's trace id killed it at the first hop — leaving a multi-node canvas
+        impossible to correlate in logs even when its entry envelope had one.
+        """
+        return Envelope(
+            node_id=self.node_id,
+            canvas_id=self.canvas_id,
+            trace_id=trace_id,
+            body=self.body,
+        )

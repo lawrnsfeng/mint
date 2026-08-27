@@ -135,6 +135,7 @@ class RabbitMQBroker:
         self._channel_pool_size = channel_pool_size
         self._connection_pool: ConnectionPool | None = None
         self._channel_pool: ChannelPool | None = None
+        self._consumer_connection: AbstractRobustConnection | None = None
 
     def _ensure_connection_pool(self) -> ConnectionPool:
         if self._connection_pool is None:
@@ -233,16 +234,38 @@ class RabbitMQBroker:
             )
 
     async def consume(self, topic: str) -> AsyncIterator[RabbitMQDelivery]:
-        """Yield deliveries from ``topic`` until the channel is closed."""
-        async with self._ensure_channel_pool().acquire() as channel:
+        """Yield deliveries from ``topic`` until the channel is closed.
+
+        Deliberately *not* from the shared channel pool. A consumer holds its
+        channel for its entire lifetime, and ``WorkerApp`` shares one broker across
+        every registered worker — so with ``channel_pool_size`` workers consuming,
+        every pooled channel is permanently held and the next ``publish`` blocks
+        forever on ``acquire()``. The whole app deadlocks with no error at all.
+        Consumers get their own channels on a dedicated connection instead;
+        channels are cheap and a connection carries thousands.
+        """
+        connection = await self._ensure_consumer_connection()
+        channel = await connection.channel()
+        try:
             await channel.set_qos(prefetch_count=self.qos)
             _, queue = await self._declare_topic(channel, topic)
             async with queue.iterator() as iterator:
                 async for message in iterator:
                     yield RabbitMQDelivery(self, topic, message)
+        finally:
+            await channel.close()
+
+    async def _ensure_consumer_connection(self) -> AbstractRobustConnection:
+        """Return the single connection every consumer opens its own channel on."""
+        if self._consumer_connection is None:
+            self._consumer_connection = await connect_robust(self.uri)
+        return self._consumer_connection
 
     async def close(self) -> None:
-        """Close both the channel and connection pools, if they were ever built."""
+        """Close the consumer connection and both pools, whichever were ever built."""
+        if self._consumer_connection is not None:
+            await self._consumer_connection.close()
+            self._consumer_connection = None
         if self._channel_pool is not None:
             await self._channel_pool.close()
         if self._connection_pool is not None:

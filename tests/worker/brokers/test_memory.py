@@ -112,3 +112,38 @@ class TestClose:
         await broker.close()
 
         await broker.close()
+
+
+class TestCloseWakesEveryConsumer:
+    """close() pushes one sentinel per queue, so consumers must pass it along."""
+
+    async def test_a_queue_stays_drainable_after_close(self) -> None:
+        """Anything already requeued must still be readable once the broker closes.
+
+        That is what makes "was this nacked rather than dropped?" checkable.
+        """
+        broker = MemoryBroker()
+        await broker.publish("t1", b"still here")
+
+        await broker.close()
+
+        async with asyncio.timeout(1.0):
+            assert (await anext(broker.consume("t1"))).body == b"still here"
+
+    async def test_two_consumers_already_waiting_when_close_lands_both_stop(self) -> None:
+        """The real shape: both consumers parked on get() before close() is called.
+
+        Only the first used to wake; the rest blocked on get() forever. A
+        Coordinator alongside a worker on the same topic is exactly that shape.
+        """
+        broker = MemoryBroker()
+        first, second = broker.consume("t1"), broker.consume("t1")
+        waiting = [asyncio.ensure_future(anext(first)), asyncio.ensure_future(anext(second))]
+        await asyncio.sleep(0)
+
+        await broker.close()
+
+        async with asyncio.timeout(1.0):
+            results = await asyncio.gather(*waiting, return_exceptions=True)
+
+        assert all(isinstance(result, StopAsyncIteration) for result in results)

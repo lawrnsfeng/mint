@@ -33,6 +33,19 @@ from mint.worker.stores.interface import ICanvasStore
 type PublishFn = Callable[[str, bytes], Awaitable[None]]
 
 
+def _reject_duplicate(nodes: dict[str, AnyNode], node_id: str) -> None:
+    """Raise if ``node_id`` is already claimed in this graph.
+
+    Containers check this both *before* and *after* building their children. A
+    single up-front check isn't enough: a container writes its own node last (it
+    needs its children's ids first), so a nested container sharing its id slipped
+    through the early check, wrote itself, and was then silently overwritten —
+    leaving a group listing itself as its own child.
+    """
+    if node_id in nodes:
+        raise DuplicateNodeIdError(node_id=node_id)
+
+
 class Node:
     """A single task: one message published to one topic."""
 
@@ -44,8 +57,7 @@ class Node:
 
     def build(self, canvas_id: str, parent_id: str | None, nodes: dict[str, AnyNode]) -> None:
         """Add this node's persisted representation to ``nodes``."""
-        if self.id in nodes:
-            raise DuplicateNodeIdError(node_id=self.id)
+        _reject_duplicate(nodes, self.id)
         nodes[self.id] = TaskNode(
             id=self.id,
             canvas_id=canvas_id,
@@ -101,10 +113,10 @@ class Chain:
 
     def build(self, canvas_id: str, parent_id: str | None, nodes: dict[str, AnyNode]) -> None:
         """Add every step's persisted representation, then this chain's own."""
-        if self.id in nodes:
-            raise DuplicateNodeIdError(node_id=self.id)
+        _reject_duplicate(nodes, self.id)
         for step in self.steps:
             step.build(canvas_id, self.id, nodes)
+        _reject_duplicate(nodes, self.id)
         nodes[self.id] = ChainNode(
             id=self.id,
             canvas_id=canvas_id,
@@ -167,8 +179,7 @@ class Chord:
 
     def build(self, canvas_id: str, parent_id: str | None, nodes: dict[str, AnyNode]) -> None:
         """Add every leg's and the callback's persisted representation, then this group's own."""
-        if self.id in nodes:
-            raise DuplicateNodeIdError(node_id=self.id)
+        _reject_duplicate(nodes, self.id)
         leg_ids: list[str] = []
         for leg in self.legs:
             if leg.id in leg_ids:
@@ -177,6 +188,7 @@ class Chord:
             leg.build(canvas_id, self.id, nodes)
         if self.callback is not None:
             self.callback.build(canvas_id, self.id, nodes)
+        _reject_duplicate(nodes, self.id)
         nodes[self.id] = GroupNode(
             id=self.id,
             canvas_id=canvas_id,

@@ -17,7 +17,7 @@ from pydantic import BaseModel
 from mint.worker.brokers.memory import MemoryBroker, MemoryDelivery
 from mint.worker.canvas.engine import CanvasEngine
 from mint.worker.canvas.models import ChainNode, GroupNode, NodeOutcome, TaskNode
-from mint.worker.enums import NodeStatus
+from mint.worker.enums import CanvasStatus, NodeStatus
 from mint.worker.envelope import Envelope
 from mint.worker.exc import WorkerNotBoundError
 from mint.worker.executors.inline import InlineExecutor
@@ -30,8 +30,8 @@ TOPIC = "double"
 NEXT_MESSAGE_TIMEOUT = 1.0
 
 
-async def next_envelope(broker: MemoryBroker, topic: str) -> Envelope:
-    """Return the next envelope published to ``topic``, failing fast if none arrives.
+async def next_delivery(broker: MemoryBroker, topic: str) -> MemoryDelivery:
+    """Return the next delivery published to ``topic``, failing fast if none arrives.
 
     Deliberately timeout-guarded rather than a bare ``anext``: the bugs these
     tests cover manifest as a message that never arrives at all, and an unguarded
@@ -40,8 +40,12 @@ async def next_envelope(broker: MemoryBroker, topic: str) -> Envelope:
     documented as bug #22).
     """
     async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
-        delivery = await anext(broker.consume(topic))
-    return Envelope.from_bytes(delivery.body)
+        return await anext(broker.consume(topic))
+
+
+async def next_envelope(broker: MemoryBroker, topic: str) -> Envelope:
+    """Return the next envelope published to ``topic``, failing fast if none arrives."""
+    return Envelope.from_bytes((await next_delivery(broker, topic)).body)
 
 
 class Input(BaseModel):
@@ -243,7 +247,7 @@ class TestMalformedMessages:
 
         await worker._process_delivery(delivery, binding)
 
-        dead = await anext(broker.consume(f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}"))
+        dead = await next_delivery(broker, f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}")
         assert dead.body == b"not json at all"
 
     async def test_body_that_fails_input_validation_is_dead_lettered_not_acked(self) -> None:
@@ -257,8 +261,172 @@ class TestMalformedMessages:
 
         await worker._process_delivery(delivery, binding)
 
-        dead = await anext(broker.consume(f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}"))
+        dead = await next_delivery(broker, f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}")
         assert dead.attempt == 1
+
+
+class TestUndeliverableInputFailsItsNode:
+    """A body this worker's Input can never validate must fail the node, not strand it."""
+
+    async def test_an_undecodable_input_records_an_error_outcome(self) -> None:
+        """Retrying can't help, so the node must be failed rather than left PENDING forever.
+
+        Dead-lettering alone left the node PENDING and its canvas RUNNING with
+        nothing left to advance it — and embedded mode has no sweeper to notice.
+        """
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+        delivery = envelope_delivery(broker, "t1", CANVAS, '{"not_value": "wrong shape"}')
+
+        await worker._process_delivery(delivery, binding)
+
+        outcome = await store.get_result(CANVAS, "t1")
+        assert outcome is not None
+        assert outcome.status == NodeStatus.ERROR
+        assert outcome.error is not None
+        assert outcome.error.type == "ValidationError"
+
+    async def test_an_undecodable_input_still_reaches_a_terminal_canvas_status(self) -> None:
+        """A single bad message must not leave the whole canvas RUNNING forever."""
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._process_delivery(
+            envelope_delivery(broker, "t1", CANVAS, "{}"),
+            binding,
+        )
+
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+    async def test_an_undecodable_input_is_still_dead_lettered(self) -> None:
+        """Recording the failure must not replace the dead-letter — the body is still evidence."""
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._process_delivery(
+            envelope_delivery(broker, "t1", CANVAS, "{}"),
+            binding,
+        )
+
+        dead = await next_delivery(broker, f"{TOPIC}{MemoryBroker.DLQ_SUFFIX}")
+        assert b"not_value" not in dead.body
+
+    async def test_in_centralized_mode_the_failure_is_reported_not_stored(self) -> None:
+        """Centralized mode never touches the engine — the ERROR must go to results_topic."""
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store, results_topic="results")
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._process_delivery(
+            envelope_delivery(broker, "t1", CANVAS, "{}"),
+            binding,
+        )
+
+        reported = await next_envelope(broker, "results")
+        assert NodeOutcome.model_validate_json(reported.body).status == NodeStatus.ERROR
+
+
+class TestConcurrencyBound:
+    """run() must stop pulling once max_concurrency deliveries are in flight."""
+
+    @staticmethod
+    async def _seed(broker: MemoryBroker, store: MemoryCanvasStore, count: int) -> None:
+        """Publish ``count`` well-formed deliveries, each against its own canvas."""
+        for index in range(count):
+            canvas = f"c{index}"
+            node = f"t{index}"
+            await store.create_canvas(
+                canvas,
+                {node: TaskNode(id=node, canvas_id=canvas, topic=TOPIC)},
+            )
+            envelope = Envelope(node_id=node, canvas_id=canvas, body='{"value": 1}')
+            await broker.publish(TOPIC, envelope.to_bytes())
+
+    async def test_run_never_exceeds_max_concurrency_in_flight(self) -> None:
+        """An unbounded loop spawns one handler per backlogged message; this must not.
+
+        MemoryBroker (like Kafka) yields as fast as the topic supplies, with no
+        prefetch of its own to provide backpressure. Every handler parks on
+        ``gate``, so with 8 messages queued an unbounded loop would show all 8
+        in flight at once.
+        """
+        gate = asyncio.Event()
+        at_bound = asyncio.Event()
+        peak = 0
+
+        class SlowWorker(DoublingWorker):
+            max_concurrency = 2
+
+            async def process(self, input_obj: Input) -> Output:
+                nonlocal peak
+                peak = max(peak, len(self._inflight))
+                if peak >= SlowWorker.max_concurrency:
+                    at_bound.set()
+                await gate.wait()
+                return Output(doubled=input_obj.value * 2)
+
+        worker = SlowWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        bind_worker(worker, broker, store)
+        await self._seed(broker, store, 8)
+
+        run_task = asyncio.create_task(worker.run())
+        try:
+            async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
+                await at_bound.wait()
+            # Give an unbounded loop every chance to over-spawn before asserting.
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            assert len(worker._inflight) == SlowWorker.max_concurrency
+            assert peak == SlowWorker.max_concurrency
+        finally:
+            gate.set()
+            worker.stop_consuming()
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+            await worker.drain()
+
+    async def test_a_finished_handler_frees_its_slot(self) -> None:
+        """The bound is a live count, not a lifetime cap — every message still gets handled."""
+        all_done = asyncio.Event()
+        expected = 3
+
+        class SingleSlotWorker(DoublingWorker):
+            max_concurrency = 1
+
+            async def on_success(self, input_obj: Input, result: Output) -> None:
+                await super().on_success(input_obj, result)
+                if len(self.on_success_calls) == expected:
+                    all_done.set()
+
+        worker = SingleSlotWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        bind_worker(worker, broker, store)
+        await self._seed(broker, store, expected)
+
+        run_task = asyncio.create_task(worker.run())
+        try:
+            async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
+                await all_done.wait()
+
+            assert len(worker.on_success_calls) == expected
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
 
 
 class TestTaskExecution:

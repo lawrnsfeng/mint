@@ -9,6 +9,7 @@ than leaving its delivery stranded unacked.
 
 import asyncio
 from dataclasses import dataclass
+from typing import Final
 
 from pydantic import BaseModel, ValidationError
 
@@ -23,6 +24,13 @@ from mint.worker.executors.interface import ITaskExecutor
 from mint.worker.stores.interface import ICanvasStore
 
 logger = get_logger(__name__)
+
+DEFAULT_MAX_CONCURRENCY: Final[int] = 32
+
+MALFORMED_INPUT_ERROR: Final[ErrorInfo] = ErrorInfo(
+    type="ValidationError",
+    message="message body does not match this worker's Input model",
+)
 
 
 @dataclass(frozen=True)
@@ -62,12 +70,22 @@ class Worker[T: BaseModel, RT: BaseModel]:
     # ProcessPoolExecutor, or a GRPCExecutor/AMQPRPCExecutor that replaces process
     # with a remote call).
     executor: ITaskExecutor[T, RT] | None = None
+    # How many deliveries this worker will handle at once. run() stops pulling from
+    # the broker while this many are in flight, which is the only backpressure some
+    # brokers get: RabbitMQ has prefetch_count and Redis reads one entry at a time,
+    # but Kafka and MemoryBroker yield as fast as the topic supplies, so an
+    # unbounded loop spawns one handler task per backlogged message.
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 
     def __init__(self) -> None:
         """Start unbound; ``WorkerApp.register()`` supplies runtime dependencies."""
         self._binding: WorkerBinding | None = None
         self._inflight: set[asyncio.Task[None]] = set()
         self._stopped = asyncio.Event()
+        # A plain Semaphore rather than mint.utils.ConcurrencyLimiter: this acquires
+        # in run() and releases in the handler task, and the limiter's ContextVar
+        # reentrancy assumes both happen in the same task.
+        self._slots = asyncio.Semaphore(self.max_concurrency)
 
     async def process(self, input_obj: T) -> RT:
         """Do the actual work for one message. Must be implemented by subclasses."""
@@ -104,6 +122,9 @@ class Worker[T: BaseModel, RT: BaseModel]:
     async def run(self) -> None:
         """Consume ``topic`` until ``stop_consuming()`` is called.
 
+        At most ``max_concurrency`` deliveries are handled at once; the loop stops
+        pulling from the broker while that many are in flight.
+
         A delivery that arrives in the race window after ``stop_consuming()`` but
         before this loop is cancelled is nacked and the loop stops immediately —
         it does NOT loop back for more. On a broker whose ``requeue=True`` redelivers
@@ -116,6 +137,9 @@ class Worker[T: BaseModel, RT: BaseModel]:
             if self._stopped.is_set():
                 await delivery.nack(requeue=True)
                 return
+            # Acquired here, released by _handle: holding it across the yield point
+            # is what stops the loop pulling more while max_concurrency are in flight.
+            await self._slots.acquire()
             task = asyncio.create_task(self._handle(delivery, binding))
             self._inflight.add(task)
             task.add_done_callback(self._inflight.discard)
@@ -131,6 +155,8 @@ class Worker[T: BaseModel, RT: BaseModel]:
         except asyncio.CancelledError:
             await delivery.nack(requeue=True)
             raise
+        finally:
+            self._slots.release()
 
     async def _process_delivery(self, delivery: Delivery, binding: WorkerBinding) -> None:
         envelope = self._decode_envelope(delivery.body)
@@ -140,16 +166,18 @@ class Worker[T: BaseModel, RT: BaseModel]:
 
         input_obj = self._decode_input(envelope)
         if input_obj is None:
+            # The body doesn't match this worker's Input, so retrying can never help —
+            # but unlike a malformed envelope, canvas_id/node_id are both known here.
+            # Failing the node explicitly is what stops one schema-mismatched message
+            # from leaving the node PENDING and its canvas RUNNING forever (embedded
+            # mode, the default, has no sweeper that would ever notice).
+            await self._fail_node(envelope, MALFORMED_INPUT_ERROR, binding)
             await delivery.nack(requeue=False)
             return
 
         outcome, result = await self._run_task(input_obj, envelope.node_id, binding.executor)
 
-        if binding.results_topic is not None:
-            advanced = await self._report_result(envelope, outcome, binding, binding.results_topic)
-        else:
-            advanced = await self._advance_canvas(envelope, outcome, binding)
-        if not advanced:
+        if not await self._advance(envelope, outcome, binding):
             await delivery.nack(requeue=True)
             return
 
@@ -157,6 +185,37 @@ class Worker[T: BaseModel, RT: BaseModel]:
 
         if result is not None:
             await self._safe_on_success(input_obj, result)
+
+    async def _advance(
+        self,
+        envelope: Envelope,
+        outcome: NodeOutcome,
+        binding: WorkerBinding,
+    ) -> bool:
+        """Route an outcome by deployment mode. False means the delivery must be retried."""
+        if binding.results_topic is not None:
+            return await self._report_result(envelope, outcome, binding, binding.results_topic)
+        return await self._advance_canvas(envelope, outcome, binding)
+
+    async def _fail_node(
+        self,
+        envelope: Envelope,
+        error: ErrorInfo,
+        binding: WorkerBinding,
+    ) -> None:
+        """Record an ERROR outcome for a node whose message will be dead-lettered.
+
+        Best-effort by design: the delivery is being dropped either way, so a
+        store or broker failure here must not turn an unretryable message into a
+        redelivery loop. It is logged and the dead-letter still happens.
+        """
+        outcome = NodeOutcome(node_id=envelope.node_id, status=NodeStatus.ERROR, error=error)
+        if not await self._advance(envelope, outcome, binding):
+            logger.error(
+                "Could not record the failure of an undeliverable message",
+                node_id=envelope.node_id,
+                canvas_id=envelope.canvas_id,
+            )
 
     async def _advance_canvas(
         self,

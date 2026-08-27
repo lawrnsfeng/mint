@@ -14,6 +14,8 @@
 
 ::: mint.worker.coordinator.Coordinator
 
+::: mint.worker.coordinator.CoordinatorConfig
+
 ::: mint.worker.coordinator.InFlightNode
 
 ## Canvas engine
@@ -123,6 +125,8 @@
 ::: mint.worker.exc.MissingInputError
 
 ::: mint.worker.exc.ConflictingErrorPolicyError
+
+::: mint.worker.exc.ChildNotInParentError
 
 ::: mint.worker.exc.CanvasCycleError
 

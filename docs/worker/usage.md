@@ -182,7 +182,7 @@ originating request, a tenant id); it's `None` if you didn't pass one.
 |---|---|---|
 | `brokers.memory.MemoryBroker` | at-least-once | In-process `asyncio.Queue`; for tests and single-process use. |
 | `brokers.rabbitmq.RabbitMQBroker` | at-least-once | Declares a per-topic dead-letter exchange; `nack(requeue=False)` reliably lands on `{topic}.dlq`. `nack(requeue=True)` republishes with `attempt` bumped rather than using AMQP's native requeue, so the counter is observable — at the cost of ordering on that path. Consumers hold their own channels on a dedicated connection, never the shared publish pool. |
-| `brokers.redis.RedisBroker` | at-least-once | Streams + consumer groups (`XADD`/`XREADGROUP`/`XACK`). |
+| `brokers.redis.RedisBroker` | at-least-once | Streams + consumer groups (`XADD`/`XREADGROUP`/`XACK`), with `XAUTOCLAIM` reclaim so a message whose consumer died before acking is redelivered rather than stranded in its pending list. Tune the window with `reclaim_idle_ms` — it must exceed your slowest handler, or live work gets taken over mid-flight. |
 | `brokers.nats.NatsBroker` | at-least-once | JetStream pull consumers with a per-topic durable name. |
 | `brokers.kafka.KafkaBroker` | at-least-once | `auto_offset_reset="earliest"` — a new consumer group sees a topic's backlog, never skips it. |
 
@@ -192,11 +192,11 @@ properties — publish/consume round-trip, `nack(requeue=True)` redelivers with 
 incremented `attempt`, `nack(requeue=False)` reaches the DLQ — against a mocked
 client (`test_<broker>_mocked.py`).
 
-Container suites exist for RabbitMQ and Kafka (`test_<broker>_container.py`),
-and for `RedisCanvasStore`; the Redis *broker* and NATS have mocked coverage
-only. That unevenness is a real gap rather than a claim of equivalence — the
-bugs a container catches (exact wire-level types, a client's default policies, a
-redeclaration conflict) are structurally invisible to a mock. See the
+Container suites exist for RabbitMQ, Kafka and Redis (`test_<broker>_container.py`),
+and for `RedisCanvasStore`; NATS has mocked coverage only. That gap is stated
+rather than papered over — the bugs a container catches (exact wire-level types,
+a client's default policies, a redeclaration conflict, whether an abandoned
+message is genuinely recoverable) are structurally invisible to a mock. See the
 [Implementation Notes](../worker-implementation-notes.md); container suites run
 standalone and memory-capped.
 
@@ -265,12 +265,18 @@ By default (embedded mode), a worker advances the canvas itself. Set
 centralized mode instead:
 
 ```python
-from mint.worker.coordinator import Coordinator
+from mint.worker.coordinator import Coordinator, CoordinatorConfig
 
 app = WorkerApp(broker, store, results_topic="canvas.results")
 app.register(SyncReference(connector=...))
 
-coordinator = Coordinator(broker, store, results_topic="canvas.results")
+coordinator = Coordinator(
+    broker,
+    store,
+    results_topic="canvas.results",
+    # optional: sweep cadence, timeout window, retry cap
+    config=CoordinatorConfig(sweep_interval=30.0, max_age=300.0, max_attempts=5),
+)
 await coordinator.run()   # the only process that ever calls engine.complete()
 ```
 
@@ -307,7 +313,7 @@ Chord([...], callback=..., error_policy=ErrorPolicy.CONTINUE)  # fire callback w
 | Policy | Chain default? | Chord default? | Behavior |
 |---|---|---|---|
 | `CONTINUE` | no | **yes** | Record the error, keep going — a chain proceeds to its next step; a chord still counts the leg toward fan-in. |
-| `PROPAGATE` | **yes** | no | Stop (a chain cancels its remaining steps), mark the immediate parent `ERROR`, still bubble up. |
+| `PROPAGATE` | **yes** | no | Stop and mark the container `ERROR`, still bubbling up. A chain cancels its remaining steps; a chord cancels its unfinished legs **and its callback**, which never runs. |
 | `ABORT` | no | no | Cancel every pending sibling that hasn't run yet and fail the whole canvas — nothing further dispatches. Legs that already finished keep their outcomes. |
 
 A chain step that fails under `CONTINUE` has no result to hand its successor, so

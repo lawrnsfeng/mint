@@ -78,6 +78,16 @@ is the expanded, "how do I actually fix this" version.
 - [53. `MemoryBroker.close()` wakes only one consumer per topic](#53-memorybrokerclose-wakes-only-one-consumer-per-topic)
 - [54. The package never passed the project's own `make check`](#54-the-package-never-passed-the-projects-own-make-check)
 
+**Part 5 — Bugs found by a fourth review round**
+
+- [55. Every AMQP RPC reply raises a `TypeError`](#55-every-amqp-rpc-reply-raises-a-typeerror)
+- [56. The coordinator retries forever with no poison-message escape](#56-the-coordinator-retries-forever-with-no-poison-message-escape)
+- [57. A group's `PROPAGATE` policy behaves exactly like `CONTINUE`](#57-a-groups-propagate-policy-behaves-exactly-like-continue)
+- [58. The Redis broker is at-most-once across a consumer crash](#58-the-redis-broker-is-at-most-once-across-a-consumer-crash)
+- [59. A finished canvas reads as RUNNING once its status expires](#59-a-finished-canvas-reads-as-running-once-its-status-expires)
+- [60. A node its parent doesn't list raises a bare `ValueError`](#60-a-node-its-parent-doesnt-list-raises-a-bare-valueerror)
+- [61. The idempotency guarantee is narrower than documented](#61-the-idempotency-guarantee-is-narrower-than-documented)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -2381,6 +2391,238 @@ against the base branch, not to infer from where the errors appear.
 
 ---
 
+## Part 5 — Bugs found by a fourth review round
+
+Three of these (#55, #58, #59) are the same shape: a claim made in a docstring
+that the code did not actually implement. Worth noting, because a confident
+comment is the easiest thing in a codebase to stop re-reading.
+
+### 55. Every AMQP RPC reply raises a `TypeError`
+
+**Where:** `mint/worker/executors/amqp_rpc.py::_on_reply`
+
+**Symptom:** Calls work. Every one of them also logs a "Task exception was never
+retrieved" traceback, with no obvious connection to application code.
+
+**Root cause:** Two aio-pika features that cannot be combined:
+
+```python
+await queue.consume(self._on_reply, no_ack=True)      # in _declare_reply_queue
+...
+async def _on_reply(self, message):
+    async with message.process():                      # incompatible with no_ack
+```
+
+Verified against the installed package rather than reasoned about:
+`IncomingMessage.__init__` sets `__processed = True` when `no_ack` is passed;
+`ProcessContext.__aexit__` evaluates `if not self.ignore_processed or not
+self.message.processed:` — with the default `ignore_processed=False` that first
+clause is always true, so it calls `ack()` on every clean exit; and `ack()` opens
+with `if self.__no_ack: raise TypeError`. Since aiormq dispatches consumer
+callbacks with a bare `create_task` and never retrieves the result, the exception
+surfaces only as GC-time noise. The call still returns, because the future is
+resolved before `__aexit__` runs — which is exactly why this survived a passing
+test suite and a container run.
+
+**The practical fix:** Delete the context manager. With `no_ack=True` there is
+nothing to acknowledge; `message.process()` was never doing anything but
+throwing. Regression tests assert both halves — that handling a reply never
+touches `process()`/`ack()`, *and* that the consumer is still registered
+`no_ack=True`, since the first assertion is only meaningful while the second
+holds.
+
+---
+
+### 56. The coordinator retries forever with no poison-message escape
+
+**Where:** `mint/worker/coordinator.py::_handle_result`
+
+**Symptom:** In centralized mode with the dispatch broker down, the coordinator
+pegs a core and makes no progress — the exact failure `Worker._retry_or_drop`
+(issue #43) was written to prevent, in the component that didn't get the fix.
+
+**Root cause:** Identical shape, no cap:
+
+```python
+if not await self._advance(...):
+    await delivery.nack(requeue=True)     # unconditional, forever
+```
+
+`delivery.attempt` appears nowhere in the file. A `WorkerError` happens to
+self-heal — `engine.complete` marks the canvas ERROR, so the replay
+short-circuits at the status guard — but a dispatch-publish failure or a failing
+`ack()` does not, and those are the ones that recur.
+
+**The practical fix:** The same `_retry_or_drop` the worker has, applied to both
+the explicit failure path and the loop's catch-all. Adding `max_attempts` pushed
+the constructor past the argument limit, so the three tunables moved into a
+`CoordinatorConfig` dataclass — following `AMQPRPCConfig`, which already
+establishes that pattern in this package, rather than suppressing the lint.
+
+---
+
+### 57. A group's `PROPAGATE` policy behaves exactly like `CONTINUE`
+
+**Where:** `mint/worker/canvas/engine.py::_advance_group`
+
+**Symptom:** `Chord([a, b], callback=cb, error_policy=ErrorPolicy.PROPAGATE)`
+nested in a chain. Leg `a` fails. `b` runs anyway, `cb` runs and succeeds, and
+the enclosing chain advances to its next step as though nothing went wrong.
+
+**Root cause:** `_advance_group` read `error_policy` in exactly two places — the
+`ABORT` pre-check, and the `final_status` computation on the *callback-less*
+path. A group with a callback therefore never consulted it: the callback was
+dispatched with the failed leg present as `ok=False`, and because a callback's
+completion becomes the group's own outcome (the `current_id == parent.callback`
+branch in `_complete`), the group recorded the callback's **success**. The
+failure evaporated.
+
+This contradicts `ErrorPolicy`'s own docstring ("stop this container, mark it
+errored, cancel what has not run yet, but still let its own parent decide") and
+the policy table in `docs/worker/usage.md`. No test covered it — the existing
+PROPAGATE coverage was all chains.
+
+**The practical fix:** Mirror `_advance_chain`'s PROPAGATE branch.
+
+```python
+if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.PROPAGATE:
+    await self._cancel_group_remainder(canvas_id, group, finished_child_id)
+    return None, NodeOutcome(node_id=group.id, status=NodeStatus.ERROR, error=outcome.error)
+```
+
+The callback is cancelled along with the unfinished legs — a propagating group
+never dispatches it, and leaving it PENDING would misreport it as still expected.
+
+---
+
+### 58. The Redis broker is at-most-once across a consumer crash
+
+**Where:** `mint/worker/brokers/redis.py::consume`
+
+**Symptom:** A worker is OOM-killed mid-handler. That message is never
+redelivered — not to that consumer, not to any other. The broker declares
+`guarantee = AT_LEAST_ONCE`, and `Worker`/`CanvasEngine` are built on that
+promise.
+
+**Root cause:** `XREADGROUP` with `>` returns *only* never-delivered entries. A
+consumer's own pending-entries list is reachable only via an explicit id (`0`) or
+`XAUTOCLAIM`, and the module had neither. So bug #8's whole point — "a crash
+before ack leaves it recoverable rather than gone" — held only for the *storage*
+of the message, not its *redelivery*. Nobody ever went back for it.
+
+The docstring made this hard to spot, because it acknowledged the gap and then
+misdescribed the mitigation:
+
+> today a message survives a crash but needs another consumer to eventually
+> re-read it via `XREADGROUP`'s own-pending-first semantics
+
+`>` has no such semantics. The stated fallback did not exist.
+
+**The practical fix:** Reclaim before reading, every poll.
+
+```python
+async def _reclaim(self, topic: str) -> StreamEntry | None:
+    response = await self.client.xautoclaim(
+        topic, self.group, self.consumer_name, self.reclaim_idle_ms,
+        start_id="0-0", count=1,
+    )
+    entries = response[1] if len(response) > 1 else []   # Redis 6 replies with 2 elements
+    ...
+```
+
+`reclaim_idle_ms` (default 60s) must comfortably exceed the slowest expected
+handler, or a live consumer's work gets stolen mid-flight.
+
+**This is also where the Redis broker finally got a container suite.** It had
+none — and this is precisely a property mocking cannot express, since a mock
+returns whatever the test tells it to. The new test has one consumer read a
+message and "crash" without acking, then asserts another consumer recovers it;
+it fails outright with the reclaim disabled.
+
+---
+
+### 59. A finished canvas reads as RUNNING once its status expires
+
+**Where:** `mint/worker/stores/redis.py::set_canvas_status`
+
+**Symptom:** A message dead-lettered from a long-finished canvas, replayed a day
+later, marks that canvas `ERROR`.
+
+**Root cause:** Reaching a terminal status expires every key tracked for the
+canvas — *including the status key itself*. And `get_canvas_status` returns
+`RUNNING` when the key is absent, because it cannot distinguish "expired" from
+"never existed". So after the TTL a completed canvas reads as live again,
+`CanvasEngine.complete`'s short-circuit no longer fires, `_require_node` raises
+on the long-deleted nodes, and the `except WorkerError` handler writes a fresh
+`ERROR` status for a canvas that finished successfully.
+
+**The practical fix:** The status key is the canvas's tombstone, so it outlives
+the data it describes — a separate, longer TTL (7× the data TTL by default)
+rather than the same one:
+
+```python
+await self.client.expire(registry_key, self.terminal_ttl_seconds)
+await self.client.expire(key, self.status_ttl_seconds)     # the status, not the data
+```
+
+**A fix that was tried and rejected:** short-circuiting `complete()` to a no-op
+when the completing node is missing. It made the existing
+`test_unknown_node_id_raises_and_errors_the_canvas` fail, and rightly — a
+genuinely corrupt live canvas would then stay `RUNNING` forever with no signal at
+all. That trades a bounded, self-expiring cosmetic problem for a permanent silent
+stall. The test caught it immediately; the store was the right place to fix it.
+
+---
+
+### 60. A node its parent doesn't list raises a bare `ValueError`
+
+**Where:** `mint/worker/canvas/models.py::ChainNode.next_id`,
+`mint/worker/canvas/engine.py::_chain_remaining`
+
+**Symptom:** A canvas stops advancing, its status stays `RUNNING` forever, and
+its message dead-letters after burning every retry.
+
+**Root cause:** Both call `list.index(...)`, which raises `ValueError` when the
+finished child isn't among the chain's children. `ValueError` is not a
+`WorkerError`, so it escaped `complete()`'s handler, `Worker._advance_canvas`'s,
+and `Coordinator._advance`'s alike — landing in the generic
+`except Exception` added for issue #41. That nacks and retries, so the delivery
+eventually dead-letters, but nothing ever records an outcome or a terminal
+status: exactly the stall `_fail_node` exists to prevent, reached by a route that
+bypasses it.
+
+Reachable in supported usage: re-running `apply(canvas_id=...)` with a different
+graph under an existing canvas id, which the coordinator's own docstring cites as
+a reason node ids may repeat.
+
+**The practical fix:** A typed `ChildNotInParentError(WorkerError)`, raised from a
+single `ChainNode.index_of` that both call sites now use. Routing through
+`WorkerError` is what gets the canvas its `ERROR` status.
+
+---
+
+### 61. The idempotency guarantee is narrower than documented
+
+**Where:** `mint/worker/canvas/engine.py::complete` (docstring)
+
+**Symptom:** None directly — this is a documentation defect, but the kind that
+causes bugs downstream, because a caller reading it will not make their handler
+idempotent.
+
+**Root cause:** `complete()` claimed idempotency "under at-least-once redelivery
+of the same outcome" without qualification. Only *group fan-in* is actually
+deduplicated, by the fired guard. Chain sequencing is not: replaying a chain
+step's outcome calls `chain.next_id()` again, which unconditionally returns the
+next step and dispatches it a second time — cascading down the rest of the chain.
+The window is real (an `ack()` that fails after the canvas has advanced) and is
+exactly what issue #41's generic handler now retries into.
+
+**The practical fix:** Say so. There is no engine-side fix without an idempotency
+key on the work itself; what there was, was a docstring that discouraged callers
+from adding one.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -2453,3 +2695,18 @@ adding a new broker, executor, or engine transition:
 - **"Pre-existing" is a claim to verify against the base branch.** A repo-wide
   lint failure introduced by a lock-file bump looks identical to one that was
   always there (issue #54).
+- **Check a docstring's claim against the code, not the other way round.** Three
+  separate bugs here were a comment describing behaviour that was never
+  implemented — an incompatible context manager, a non-existent redelivery
+  fallback, and an over-broad idempotency promise (issues #55, #58, #61).
+- **Read the third-party source when a contract matters.** `no_ack=True` versus
+  `message.process()` is settled in twenty lines of aio-pika; no amount of
+  reasoning about the API would have found it (issue #55).
+- **A policy enum must be honoured on every branch that can observe it.** Reading
+  `error_policy` on two of three paths made PROPAGATE silently equal CONTINUE
+  (issue #57).
+- **A fix that makes an existing test fail deserves a second look before the test
+  is changed.** Issue #59's first attempt did, and the test was right (issue #59).
+- **Anything a Protocol advertises has to be true.** Declaring
+  `AT_LEAST_ONCE` while never reclaiming an abandoned pending entry is a promise
+  the rest of the package is built on (issue #58).

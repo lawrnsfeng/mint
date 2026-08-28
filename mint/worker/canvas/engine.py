@@ -184,6 +184,16 @@ class CanvasEngine:
             remaining = self._chain_remaining(chain, finished_child_id)
             if chain.error_policy == ErrorPolicy.ABORT:
                 await self._abort_canvas(canvas_id, remaining)
+                # Recorded but not bubbled: ABORT ends the canvas, so nothing above
+                # should advance — but the chain itself must not be left reading
+                # PENDING with no result while its children are ERROR/CANCELLED and
+                # the canvas is ERROR. The compound node would misreport as "never
+                # started". PROPAGATE already records this by bubbling.
+                await self._record(
+                    canvas_id,
+                    chain.id,
+                    NodeOutcome(node_id=chain.id, status=NodeStatus.ERROR, error=outcome.error),
+                )
                 return None, None
             if chain.error_policy == ErrorPolicy.PROPAGATE:
                 await self.store.cancel_nodes(canvas_id, remaining)
@@ -364,6 +374,12 @@ class CanvasEngine:
             # never dispatches it, so leaving it PENDING misreports it as expected.
             await self._cancel_group_remainder(canvas_id, group, finished_child_id)
             await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
+            # Same reasoning as the chain's ABORT branch: record, don't bubble.
+            await self._record(
+                canvas_id,
+                group.id,
+                NodeOutcome(node_id=group.id, status=NodeStatus.ERROR, error=outcome.error),
+            )
             return None, None
         if group.error_policy == ErrorPolicy.PROPAGATE:
             if not await self.store.claim_group_terminal(canvas_id, group.id):

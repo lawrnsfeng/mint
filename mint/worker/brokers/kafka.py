@@ -286,6 +286,15 @@ class KafkaBroker:
         a real, container-test-only-catchable bug (bug #17), since a mocked
         producer never enforces the type at all.
         """
+        if record.topic.endswith(self.DLQ_SUFFIX):
+            # Terminate rather than extend, as RabbitMQ and NATS already do. Without
+            # this, dead-lettering a message consumed from foo.dlq creates and
+            # publishes to foo.dlq.dlq, one new topic per pass.
+            logger.warning(
+                "Dropping a message already on a dead-letter topic",
+                topic=record.topic,
+            )
+            return
         dlq_topic = f"{record.topic}{self.DLQ_SUFFIX}"
         await self._ensure_topic(dlq_topic)
         producer = await self._ensure_producer()

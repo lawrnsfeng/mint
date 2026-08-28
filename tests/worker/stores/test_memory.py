@@ -202,3 +202,39 @@ class TestMarkNodeRunning:
         await store.mark_node_running("c1", "missing")
 
         assert await store.get_node("c1", "missing") is None
+
+
+class TestRecreatingACanvasClearsFanInState:
+    """A retry under a caller-supplied canvas_id must start from nothing."""
+
+    async def test_a_burned_fan_in_guard_does_not_survive_recreation(self) -> None:
+        """Resetting only the status left the callback undispatchable forever.
+
+        `mark_child_done` reported `fired=False` on every retry, so the chord's
+        callback never fired and the canvas stalled RUNNING — the exact stall the
+        retry existed to escape.
+        """
+        store = MemoryCanvasStore()
+        node = TaskNode(id="leg", canvas_id="cv", topic="t")
+        await store.create_canvas("cv", {"leg": node})
+        first = await store.mark_child_done("cv", "g", "leg", 1)
+        assert first.fired is True
+
+        await store.create_canvas("cv", {"leg": node})
+
+        assert (await store.mark_child_done("cv", "g", "leg", 1)).fired is True
+
+    async def test_a_previous_attempts_results_do_not_survive(self) -> None:
+        """A stale outcome would make ABORT think a cancelled leg had finished."""
+        store = MemoryCanvasStore()
+        node = TaskNode(id="leg", canvas_id="cv", topic="t")
+        await store.create_canvas("cv", {"leg": node})
+        await store.set_result(
+            "cv",
+            "leg",
+            NodeOutcome(node_id="leg", status=NodeStatus.FINISHED, result="{}"),
+        )
+
+        await store.create_canvas("cv", {"leg": node})
+
+        assert await store.get_result("cv", "leg") is None

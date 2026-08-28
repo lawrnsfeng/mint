@@ -819,3 +819,68 @@ class TestSweeperAndResultAreMutuallyExclusive:
         await coordinator._handle_result(delivery)
 
         assert coordinator._in_flight[CANVAS, "t1"].dispatched_at == original.dispatched_at
+
+
+class TestALateResultLosesToTheSweeper:
+    """Mutual exclusion has to hold in both directions, not just one."""
+
+    async def _canvas(self) -> MemoryCanvasStore:
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {
+                "t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id="chain", topic="topic-t1"),
+                "t2": TaskNode(id="t2", canvas_id=CANVAS, parent_id="chain", topic="topic-t2"),
+                "chain": ChainNode(
+                    id="chain",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["t1", "t2"],
+                    error_policy=ErrorPolicy.CONTINUE,
+                ),
+            },
+        )
+        return store
+
+    async def test_a_result_arriving_after_a_timeout_does_not_dispatch_twice(
+        self,
+    ) -> None:
+        """`_timeout_node` stands down on a lost claim; `_handle_result` did not.
+
+        The sweeper timed the node out and the chain dispatched its next step; the
+        real result then arrived and dispatched it a second time.
+        """
+        store = await self._canvas()
+        broker = MemoryBroker()
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        coordinator._track(CANVAS, "t1")
+        stale = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        await coordinator._timeout_node(stale)
+
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        delivery = await anext(broker.consume(RESULTS_TOPIC))
+        await coordinator._handle_result(delivery)
+
+        dispatched = []
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(0.2):
+                while True:
+                    dispatched.append(await anext(broker.consume("topic-t2")))
+        assert len(dispatched) == 1
+
+    async def test_an_untracked_entry_node_result_still_advances(self) -> None:
+        """Standing down on a failed claim alone would break centralized mode.
+
+        An entry node dispatched with a bare `broker.publish` was never tracked —
+        the coordinator's own docstring says so — and its result must still advance.
+        """
+        store = await self._canvas()
+        broker = MemoryBroker()
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        delivery = await anext(broker.consume(RESULTS_TOPIC))
+        await coordinator._handle_result(delivery)
+
+        async with asyncio.timeout(1.0):
+            assert await anext(broker.consume("topic-t2")) is not None

@@ -115,6 +115,13 @@ class MemoryBroker:
         attempt: int,
         headers: Mapping[str, str] | None = None,
     ) -> None:
-        """Publish ``body`` to ``topic``'s dead-letter queue instead of redelivering it."""
+        """Publish ``body`` to ``topic``'s dead-letter queue instead of redelivering it.
+
+        A message already on a dead-letter queue is dropped rather than moved to
+        ``{topic}.dlq.dlq`` — mirroring every real broker here, so a test using
+        ``MemoryBroker`` sees the same shape as production.
+        """
+        if topic.endswith(self.DLQ_SUFFIX):
+            return
         dlq_topic = f"{topic}{self.DLQ_SUFFIX}"
         await self._queue(dlq_topic).put(MemoryDelivery(self, dlq_topic, body, attempt, headers))

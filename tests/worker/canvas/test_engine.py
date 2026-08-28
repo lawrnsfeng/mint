@@ -198,7 +198,13 @@ class TestChain:
 
         assert result == []
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
-        assert await store.get_result(CANVAS, "chain") is None
+        # The chain itself is recorded ERROR: it really did fail, and leaving it
+        # PENDING while its children read ERROR/CANCELLED misreports the compound
+        # node as never started. Recorded, not bubbled — ABORT ends the canvas, so
+        # nothing above it should advance.
+        chain_outcome = await store.get_result(CANVAS, "chain")
+        assert chain_outcome is not None
+        assert chain_outcome.status == NodeStatus.ERROR
 
     async def test_middle_error_under_abort_stops_everything_immediately(
         self,
@@ -223,7 +229,13 @@ class TestChain:
         assert t3 is not None
         assert t3.status == NodeStatus.CANCELLED
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
-        assert await store.get_result(CANVAS, "chain") is None
+        # The chain itself is recorded ERROR: it really did fail, and leaving it
+        # PENDING while its children read ERROR/CANCELLED misreports the compound
+        # node as never started. Recorded, not bubbled — ABORT ends the canvas, so
+        # nothing above it should advance.
+        chain_outcome = await store.get_result(CANVAS, "chain")
+        assert chain_outcome is not None
+        assert chain_outcome.status == NodeStatus.ERROR
 
 
 class TestGroup:
@@ -522,7 +534,10 @@ class TestGroup:
         assert leg3 is not None
         assert leg3.status == NodeStatus.CANCELLED
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
-        assert await store.get_result(CANVAS, "g") is None
+        # Recorded ERROR for the same reason the chain's ABORT branch records one.
+        group_outcome = await store.get_result(CANVAS, "g")
+        assert group_outcome is not None
+        assert group_outcome.status == NodeStatus.ERROR
 
         # The canvas is now terminal: a late leg3 delivery must be a pure no-op.
         late = await engine.complete(CANVAS, "leg3", ok_outcome("leg3"))

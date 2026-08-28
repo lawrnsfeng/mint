@@ -108,6 +108,7 @@ class RedisCanvasStore:
         """Persist every node of a freshly built canvas in one call."""
         if not nodes:
             return
+        await self._purge(canvas_id)
         mp_str_bytes: dict[str | bytes, bytes | float | str] = {
             self._node_key(canvas_id, node_id): node.model_dump_json().encode()
             for node_id, node in nodes.items()
@@ -124,6 +125,21 @@ class RedisCanvasStore:
         # attempt outlives the data by design (see set_canvas_status) — so without
         # this a retry would short-circuit every completion and never advance.
         await self.set_canvas_status(canvas_id, CanvasStatus.RUNNING)
+
+    async def _purge(self, canvas_id: str) -> None:
+        """Delete everything a previous attempt under this canvas id left behind.
+
+        Resetting the status alone is not enough: a burned fan-in guard makes
+        mark_child_done report ``fired=False`` forever, so a retried chord's
+        callback is never dispatched and the canvas stalls RUNNING — the very
+        stall the retry existed to escape. The key registry knows every key the
+        previous attempt touched.
+        """
+        registry_key = self._key_registry_key(canvas_id)
+        tracked = await self.client.smembers(registry_key)
+        if tracked:
+            await self.client.delete(*tracked)
+        await self.client.delete(registry_key)
 
     async def get_node(self, canvas_id: str, node_id: str) -> AnyNode | None:
         """Look up a single node, or None if it does not exist."""

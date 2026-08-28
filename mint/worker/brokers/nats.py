@@ -19,6 +19,7 @@ And ``_ensure_stream`` gave every topic its own stream claiming ``{topic}`` and
 resolves back to its parent's stream instead.
 """
 
+import contextlib
 from collections.abc import AsyncIterator, Mapping
 from typing import TYPE_CHECKING, Final
 
@@ -146,16 +147,23 @@ class NatsBroker:
             subject=topic,
             durable=self._durable_name(topic),
         )
-        while True:
-            try:
-                messages = await subscription.fetch(
-                    self.PULL_BATCH,
-                    timeout=self.PULL_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                continue
-            for msg in messages:
-                yield NatsDelivery(self, msg)
+        try:
+            while True:
+                try:
+                    messages = await subscription.fetch(
+                        self.PULL_BATCH,
+                        timeout=self.PULL_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    continue
+                for msg in messages:
+                    yield NatsDelivery(self, msg)
+        finally:
+            # RabbitMQ and Kafka both release their consumer here; this one relied on
+            # close() tearing down the whole client, which Worker.close_consumer()
+            # does not do.
+            with contextlib.suppress(Exception):
+                await subscription.unsubscribe()
 
     async def deadletter(self, msg: Msg) -> None:
         """Publish ``msg`` to its subject's dead-letter subject, if it has one.

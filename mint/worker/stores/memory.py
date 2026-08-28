@@ -29,13 +29,24 @@ class MemoryCanvasStore:
     async def create_canvas(self, canvas_id: str, nodes: Mapping[str, AnyNode]) -> None:
         """Persist every node of a freshly built canvas in one call."""
         async with self._lock:
+            # A retry under a caller-supplied canvas_id must start from nothing.
+            # Resetting only the status is not enough: a burned fan-in guard from
+            # the previous attempt makes mark_child_done report fired=False forever,
+            # so the chord's callback is never dispatched and the canvas stalls
+            # RUNNING — a stall the retry existed to escape.
+            self._purge(canvas_id)
             for node_id, node in nodes.items():
                 self._nodes[(canvas_id, node_id)] = node
-            # Set, not setdefault: apply() accepts a caller-supplied canvas_id for
-            # idempotent retries, and a retry after a failed first attempt would
-            # otherwise inherit that attempt's terminal status — every completion
-            # short-circuits and the canvas never advances at all.
             self._canvas_status[canvas_id] = CanvasStatus.RUNNING
+
+    def _purge(self, canvas_id: str) -> None:
+        """Drop everything a previous attempt under this canvas id left behind."""
+        for mapping in (self._nodes, self._results):
+            for key in [key for key in mapping if key[0] == canvas_id]:
+                del mapping[key]
+        for key in [key for key in self._group_done if key[0] == canvas_id]:
+            del self._group_done[key]
+        self._group_fired -= {key for key in self._group_fired if key[0] == canvas_id}
 
     async def get_node(self, canvas_id: str, node_id: str) -> AnyNode | None:
         """Look up a single node, or None if it does not exist."""

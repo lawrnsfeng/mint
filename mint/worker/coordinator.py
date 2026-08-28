@@ -96,6 +96,11 @@ class Coordinator:
         # in two canvases at once is supported usage — and a bare node_id key means
         # one canvas silently evicts the other from the sweeper.
         self._in_flight: dict[tuple[str, str], InFlightNode] = {}
+        # Nodes the sweeper has already failed. A late real result for one of these
+        # must stand down, or the node completes twice. This can't be inferred from
+        # a failed _claim: an entry node dispatched with a bare broker.publish was
+        # never tracked either, and its result must still advance the canvas.
+        self._timed_out: set[tuple[str, str]] = set()
         self._by_canvas: dict[str, set[str]] = {}
         self._running = False
         self._shut_down = False
@@ -125,6 +130,8 @@ class Coordinator:
             await self.store.cancel_nodes(canvas_id, node_ids)
             for node_id in node_ids:
                 self._untrack(canvas_id, node_id)
+        # This canvas is over; nothing will arrive late for it any more.
+        self._timed_out -= {key for key in self._timed_out if key[0] == canvas_id}
         await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
 
     async def run(self) -> None:
@@ -304,6 +311,19 @@ class Coordinator:
         # entry still present mid-advance and completes the same node a second time
         # with a synthetic timeout. Restoring on failure is what stops a result that
         # then dead-letters from escaping the sweeper entirely.
+        key = (envelope.canvas_id, envelope.node_id)
+        if key in self._timed_out:
+            # The sweeper already completed this node with a synthetic timeout.
+            # Advancing again dispatches a chain's next step a second time.
+            self._timed_out.discard(key)
+            logger.warning(
+                "Discarding a result for a node already timed out",
+                node_id=envelope.node_id,
+                canvas_id=envelope.canvas_id,
+            )
+            await delivery.ack()
+            return True
+
         claim = self._claim(envelope.canvas_id, envelope.node_id)
         if not await self._advance(
             envelope.canvas_id,
@@ -415,3 +435,5 @@ class Coordinator:
             # ever retry this. Put it back and let the next sweep try again, rather
             # than leaving the canvas RUNNING with no error recorded at all.
             self._restore(entry)
+            return
+        self._timed_out.add((entry.canvas_id, entry.node_id))

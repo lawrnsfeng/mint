@@ -37,6 +37,7 @@ nav:
       - API Reference: worker/api.md
       - Implementation Notes: worker-implementation-notes.md
       - Bugs and Fixes: worker-bugs-and-fixes.md
+      - Review Report: worker-review-report.md
   - Utils:
       - Usage: utils/usage.md
       - API Reference: utils/api.md

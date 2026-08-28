@@ -1,9 +1,12 @@
 # `mint.worker`: Every Issue Found, and How It Was Fixed
 
 This is a practical, detailed walkthrough of every bug found while porting
-`mini.worker` to `mint.worker` — the bugs found by design review before writing
-any code, the ones found live while building the replacement test-first, and the
-ones a second review round found in `mint.worker` itself once it was complete.
+`mini.worker` to `mint.worker` — the 14 found by design review before writing any
+code, the 8 found live while building the replacement test-first, and the 95 found
+by twelve review rounds afterwards, once the package was complete. Nineteen of
+those 95 are regressions from an earlier round's own fix, and one of those fixes
+rested on a belief about the language that was simply false — which is why every
+round reviewed the fixes and not just the original code.
 Each entry gives: where the bug lived, a concrete scenario where it bites, why it
 happens, and exactly what the fix looks like. For the condensed reference table
 and the migration mapping, see

@@ -162,6 +162,15 @@ is the expanded, "how do I actually fix this" version.
 - [110. An empty `create_canvas` skips the purge and the status reset](#110-an-empty-create_canvas-skips-the-purge-and-the-status-reset)
 - [111. `cancel_nodes` documents a contract neither store honours](#111-cancel_nodes-documents-a-contract-neither-store-honours)
 
+**Part 14 — Bugs found by a thirteenth review round (high effort)**
+
+- [112. A driver error mid-walk leaves the fan-in guard burned](#112-a-driver-error-mid-walk-leaves-the-fan-in-guard-burned)
+- [113. `CancelledError` bypasses `rollback()` entirely](#113-cancellederror-bypasses-rollback-entirely)
+- [114. The memory store's last unguarded status write](#114-the-memory-stores-last-unguarded-status-write)
+- [115. The status CAS clears TTLs](#115-the-status-cas-clears-ttls)
+- [116. A callback's failure ignores its group's error policy](#116-a-callbacks-failure-ignores-its-groups-error-policy)
+- [117. `RedisBroker.deadletter` does not terminate the chain](#117-redisbrokerdeadletter-does-not-terminate-the-chain)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -4012,6 +4021,137 @@ redelivery of finished work.
 
 ---
 
+## Part 14 — Bugs found by a thirteenth review round (high effort)
+
+The two HIGH findings here are the same oversight from opposite directions: a
+one-shot guard released on one failure route and not another. Between them they
+cover every way `complete()` can fail — which is the point at which that path is
+finally closed rather than narrowed again.
+
+Three of the six are one-sided-pair mistakes (#114, #117, and arguably #116).
+That makes eight instances across the catalogue, comfortably the most repeated
+error in this package.
+
+### 112. A driver error mid-walk leaves the fan-in guard burned
+
+**Where:** `mint/worker/canvas/engine.py::complete`
+
+**Symptom:** A canvas hangs RUNNING with its chord callback never sent, after a
+brief store outage.
+
+**Root cause:** `complete()` wraps the walk in `except WorkerError`. But
+`_complete` burns a group's one-shot guard — `mark_child_done` or
+`claim_group_terminal` — and then keeps doing store I/O: recording bubbled
+outcomes, cancelling subtree remainders. A driver-level error from any of those
+(a `redis.ConnectionError`) is not a `WorkerError`, so it escapes unwrapped,
+`rollback()` is never reached, and the guard stays burned. Both drivers catch only
+`WorkerError`, so it lands in `Worker._handle`'s catch-all, which requeues — and
+the redelivery finds the guard burned, dispatches nothing, and acks.
+
+**The practical fix:** The walk releases whatever it burned before letting
+anything escape:
+
+```python
+try:
+    return await self._walk(canvas_id, node, outcome, visited, claimed)
+except BaseException:
+    await self._release(canvas_id, claimed)
+    raise
+```
+
+Only on the failure path — releasing after a *successful* walk would let a
+redelivery fire the callback twice, which has its own test.
+
+---
+
+### 113. `CancelledError` bypasses `rollback()` entirely
+
+**Where:** `mint/worker/worker.py::_advance_canvas`,
+`mint/worker/coordinator.py::_advance`
+
+**Symptom:** A chord's callback is lost on an ordinary graceful shutdown.
+
+**Root cause:** The publish loop was guarded by `except Exception`.
+`CancelledError` is a `BaseException` — and `WorkerApp._drain_workers`' timeout
+raises exactly that. A chord's last leg completes, the guard is burned, the
+callback dispatch is returned, and the drain times out while `broker.publish` is
+in flight. The rollback is skipped, `_handle`'s cancellation branch nacks, and
+after restart the redelivery gets `fired=False`, dispatches nothing, and acks.
+
+**The practical fix:** A `finally` keyed on a `published` flag, so both exception
+classes are covered. Awaiting inside it is safe — a plain `await` in a `finally`
+completes normally once `CancelledError` has been delivered. That was **verified
+rather than assumed**, which is the habit issue #106 cost five rounds to learn:
+
+```
+plain await in finally: ['rollback-completed']
+```
+
+---
+
+### 114. The memory store's last unguarded status write
+
+**Where:** `mint/worker/stores/memory.py::set_node_status`
+
+**Root cause:** Issue #108 gave `RedisCanvasStore.set_node_status` the terminal
+guard and left the memory store overwriting unconditionally — the seventh
+one-sided pair, and once again the unguarded half is the one that loses the race.
+Concurrent handler tasks are precisely what this store's lock exists for: task A
+reads a node as RUNNING inside `_complete`, task B's ABORT cancels it, and A's
+`_record` stamps FINISHED back over the cancellation. `_complete`'s CANCELLED
+guard then never fires and the engine advances a branch it had given up on.
+
+`cancel_nodes` in the same file argues explicitly that divergence from Redis
+"would be worse than the bug". `set_node_status`, six lines away, was left behind.
+
+---
+
+### 115. The status CAS clears TTLs
+
+**Where:** `mint/worker/stores/redis.py::SET_STATUS_SCRIPT`
+
+**Root cause:** `redis.call('SET', ...)` drops the key's expiry. A terminal canvas
+has already expired every key it tracks, but a leg whose message is still queued
+is still PENDING — so when a worker picks it up, `mark_node_running`'s transition
+is *allowed*, the SET lands, and the TTL just applied is gone. `complete()` then
+short-circuits on the terminal canvas, so nothing ever re-expires it, and the
+registry that referenced it has expired too.
+
+Exactly the leak issue #104 fixed on one path, reachable through another.
+
+**The practical fix:** `SET ... KEEPTTL`, checked against a real server — a mock
+cannot express expiry semantics at all.
+
+---
+
+### 116. A callback's failure ignores its group's error policy
+
+**Where:** `mint/worker/canvas/engine.py`
+
+**Root cause:** `error_policy` is consulted in `_apply_group_error_policy`, which
+is only reached from `_advance_group` — the *leg* completion path. The branch
+handling a callback's own completion bubbled its outcome unconditionally. For
+`PROPAGATE` that coincides with correct behaviour, which is why it went unnoticed;
+for `ABORT` it is a silent downgrade. `ErrorPolicy.ABORT` promises to mark the
+whole canvas ERROR immediately so nothing further dispatches — instead an
+enclosing `CONTINUE` chord carried on and fired its own callback.
+
+---
+
+### 117. `RedisBroker.deadletter` does not terminate the chain
+
+**Where:** `mint/worker/brokers/redis.py::deadletter`
+
+**Root cause:** `MemoryBroker`, `NatsBroker`, `KafkaBroker` and
+`RabbitMQBroker._declare_topic` all stop at one level — Kafka's comment even reads
+"Terminate rather than extend, as RabbitMQ and NATS already do". The Redis broker
+was never brought along. A worker pointed at `orders.dlq` to reprocess failures
+creates an `orders.dlq.dlq` stream once a message exhausts `max_attempts`.
+
+The eighth instance of this mistake, and the fourth on this exact rule.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -4210,3 +4350,13 @@ adding a new broker, executor, or engine transition:
   cannot find out afterwards whether it landed (issue #107).
 - **Clean up bookkeeping after the operation it guards succeeds**, not before
   (issue #109).
+- **`except Exception` does not catch `CancelledError`.** Any cleanup that must
+  survive a shutdown belongs in a `finally`, not an `except` (issue #113).
+- **Enumerate every way a function can fail before deciding where to undo.**
+  `rollback()` covered publish failures; the walk itself could fail three other
+  ways (issue #112).
+- **A rule that "coincides with correct behaviour" for one enum value is still
+  unimplemented.** PROPAGATE hid a broken ABORT for thirteen rounds (issue #116).
+- **When a fix lands on one implementation of a Protocol, do the others in the
+  same commit.** Eight bugs in this catalogue are one half of a pair; four are
+  the same dead-letter rule (issues #114, #117).

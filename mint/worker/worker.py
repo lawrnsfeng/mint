@@ -8,7 +8,6 @@ than leaving its delivery stranded unacked.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -29,7 +28,7 @@ logger = get_logger(__name__)
 DEFAULT_MAX_CONCURRENCY: Final[int] = 32
 # Runtime state a Worker must not carry into a child process; see __getstate__.
 _UNPICKLABLE_RUNTIME_STATE: Final[frozenset[str]] = frozenset(
-    {"_binding", "_inflight", "_stopped", "_slots", "_consumer"},
+    {"_binding", "_inflight", "_stopped", "_slots"},
 )
 DEFAULT_MAX_ATTEMPTS: Final[int] = 5
 
@@ -49,6 +48,7 @@ class DeliveryOutcome[T: BaseModel, RT: BaseModel]:
     """
 
     settled: bool
+    ack_required: bool = False
     input_obj: T | None = None
     result: RT | None = None
 
@@ -109,11 +109,6 @@ class Worker[T: BaseModel, RT: BaseModel]:
         # in run() and releases in the handler task, and the limiter's ContextVar
         # reentrancy assumes both happen in the same task.
         self._slots = asyncio.Semaphore(self.max_concurrency)
-        # Held so the app can close it *after* draining. Cancelling run() unwinds the
-        # `async for`, and letting the generator be finalised then would run its
-        # cleanup — closing the RabbitMQ channel / stopping the Kafka consumer that
-        # in-flight handlers still need in order to ack.
-        self._consumer: AsyncIterator[Delivery] | None = None
 
     def __getstate__(self) -> dict[str, object]:
         """Drop this worker's runtime state so ``process`` can cross a process boundary.
@@ -142,7 +137,6 @@ class Worker[T: BaseModel, RT: BaseModel]:
         self._inflight = set()
         self._stopped = asyncio.Event()
         self._slots = asyncio.Semaphore(self.max_concurrency)
-        self._consumer = None
 
     async def process(self, input_obj: T) -> RT:
         """Do the actual work for one message. Must be implemented by subclasses."""
@@ -164,18 +158,6 @@ class Worker[T: BaseModel, RT: BaseModel]:
     def stop_consuming(self) -> None:
         """Stop pulling new messages; in-flight handling continues until ``drain()``."""
         self._stopped.set()
-
-    async def close_consumer(self) -> None:
-        """Release the broker resources this worker's consume loop holds.
-
-        Called by the app only after draining, so a handler finishing late still
-        has a live channel to ack on.
-        """
-        if self._consumer is None:
-            return
-        consumer, self._consumer = self._consumer, None
-        if isinstance(consumer, AsyncGenerator):
-            await consumer.aclose()
 
     async def drain(self) -> None:
         """Wait for every in-flight handler to finish.
@@ -202,8 +184,7 @@ class Worker[T: BaseModel, RT: BaseModel]:
         still set, nack it again, and spin forever.
         """
         binding = self._require_binding()
-        self._consumer = binding.broker.consume(self.topic)
-        async for delivery in self._consumer:
+        async for delivery in binding.broker.consume(self.topic):
             if self._stopped.is_set():
                 await delivery.nack(requeue=True)
                 return
@@ -242,6 +223,15 @@ class Worker[T: BaseModel, RT: BaseModel]:
         try:
             handled = await self._process_delivery(delivery, binding)
             settled = handled.settled
+            if handled.ack_required:
+                # Marked settled *before* the await, deliberately. A cancellation
+                # landing mid-ack can't tell you whether the ack reached the broker,
+                # so the only safe direction is to never nack afterwards: an ack that
+                # failed leaves the message unacked and it is redelivered, whereas a
+                # nack after a successful ack double-settles it — on RabbitMQ that
+                # republishes *and* acks again, re-running a finished node.
+                settled = True
+                await delivery.ack()
             if handled.input_obj is not None and handled.result is not None:
                 await self._safe_on_success(handled.input_obj, handled.result)
         except asyncio.CancelledError:
@@ -267,9 +257,9 @@ class Worker[T: BaseModel, RT: BaseModel]:
     ) -> DeliveryOutcome[T, RT]:
         """Handle one delivery, settling it, and report any success hook still owed.
 
-        The hook is deliberately *not* run here. It runs in ``_handle``, after the
-        settlement flag has been read, so that a cancellation inside a slow hook
-        can't nack a delivery this method already acked.
+        Neither the ack nor the hook happens here. Both run in ``_handle``, which
+        records settlement before awaiting the ack — so a cancellation inside either
+        can't nack a delivery that was already settled.
         """
         envelope = self._decode_envelope(delivery.body)
         if envelope is None:
@@ -305,8 +295,14 @@ class Worker[T: BaseModel, RT: BaseModel]:
             await self._retry_or_drop(delivery, envelope.node_id)
             return DeliveryOutcome(settled=True)
 
-        await delivery.ack()
-        return DeliveryOutcome(settled=True, input_obj=input_obj, result=result)
+        # The ack itself is performed by _handle, which can record settlement before
+        # awaiting it; doing it here left the whole ack inside the unsettled window.
+        return DeliveryOutcome(
+            settled=False,
+            ack_required=True,
+            input_obj=input_obj,
+            result=result,
+        )
 
     async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:
         """Requeue this delivery, or dead-letter it once ``max_attempts`` is spent.

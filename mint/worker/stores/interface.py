@@ -49,7 +49,14 @@ class ICanvasStore(Protocol):
         ...
 
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
-        """Mark every listed node CANCELLED."""
+        """Mark every listed node CANCELLED, skipping any already in a terminal state.
+
+        The guard is load-bearing, not an implementation detail:
+        ``CanvasEngine._cancel_subtrees`` expands through descendants, so a
+        grandchild that already FINISHED is routinely in the list — and
+        ``_complete`` discards any outcome for a CANCELLED node, so stamping a
+        finished leg would silently drop a redelivery of its result.
+        """
         ...
 
     async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:

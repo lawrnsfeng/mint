@@ -126,15 +126,18 @@ class RedisCanvasStore:
 
     async def create_canvas(self, canvas_id: str, nodes: Mapping[str, AnyNode]) -> None:
         """Persist every node of a freshly built canvas in one call."""
-        if not nodes:
-            return
+        # Purged and reset even when empty: MemoryCanvasStore does both
+        # unconditionally, and returning early here left a reused canvas_id whose
+        # previous attempt ended ERROR reading ERROR under Redis and RUNNING under
+        # the memory store — two stand-ins for each other, diverging.
         await self._purge(canvas_id)
         mp_str_bytes: dict[str | bytes, bytes | float | str] = {
             self._node_key(canvas_id, node_id): node.model_dump_json().encode()
             for node_id, node in nodes.items()
         }
-        await self.client.mset(mp_str_bytes)
-        await self._track(canvas_id, *(str(key) for key in mp_str_bytes))
+        if mp_str_bytes:
+            await self.client.mset(mp_str_bytes)
+            await self._track(canvas_id, *(str(key) for key in mp_str_bytes))
         # SADD does not clear an existing TTL, so a reused canvas_id would inherit
         # the previous run's expiry on the registry. If the retry outlived it the
         # registry would vanish mid-run and every key tracked before that point
@@ -169,14 +172,23 @@ class RedisCanvasStore:
         return NodeAdapter.validate_json(data)
 
     async def set_node_status(self, canvas_id: str, node_id: str, status: NodeStatus) -> None:
-        """Update a node's status. A no-op if the node does not exist."""
-        node = await self.get_node(canvas_id, node_id)
-        if node is None:
-            return
-        updated = node.model_copy(update={"status": status})
-        await self.client.set(
-            self._node_key(canvas_id, node_id),
-            updated.model_dump_json().encode(),
+        """Move a node to ``status`` from a non-terminal one. A no-op otherwise.
+
+        Atomic, like every other status write here. A client-side
+        get/copy/set is the write that *loses* a race: another process cancelling
+        this node between the read and the write is silently overwritten, and
+        ``CanvasEngine._complete``'s cancelled-node guard then never fires — the
+        engine advances from a node in a branch it had given up on, which is the
+        side effect that guard exists to stop.
+
+        Terminal statuses are not overwritten: a node that finished, errored or was
+        cancelled has reached its conclusion.
+        """
+        await self._transition(
+            canvas_id,
+            node_id,
+            status,
+            (NodeStatus.PENDING, NodeStatus.RUNNING),
         )
 
     async def mark_node_running(self, canvas_id: str, node_id: str) -> None:

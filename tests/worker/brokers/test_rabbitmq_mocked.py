@@ -493,16 +493,35 @@ class TestConsumersDoNotHoldPooledChannels:
 
         mock_consumer_connection.channel.assert_awaited_once()
 
-    async def test_the_consumer_channel_is_closed_when_consumption_ends(
+    async def test_the_generator_does_not_close_the_consumer_channel(
         self,
         broker: RabbitMQBroker,
         mock_channel: AsyncMock,
     ) -> None:
-        """A dedicated channel is only cheap if it's actually released afterwards."""
+        """Closing here tore the channel down before in-flight handlers had drained.
+
+        Cancelling a task suspended in `async for` unwinds the generator and runs
+        its `finally`, awaits included — so a handler finishing during the drain
+        found a dead channel and its `ack()` raised.
+        """
         mock_channel.declare_queue.return_value.iterator.return_value = FakeQueueIterator([])
 
         async for _ in broker.consume(TOPIC):
             break
+
+        mock_channel.close.assert_not_awaited()
+
+    async def test_close_releases_every_consumer_channel(
+        self,
+        broker: RabbitMQBroker,
+        mock_channel: AsyncMock,
+    ) -> None:
+        """The broker owns them now, so it has to release them."""
+        mock_channel.declare_queue.return_value.iterator.return_value = FakeQueueIterator([])
+        async for _ in broker.consume(TOPIC):
+            break
+
+        await broker.close()
 
         mock_channel.close.assert_awaited_once()
 

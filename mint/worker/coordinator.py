@@ -334,13 +334,17 @@ class Coordinator:
         if key in self._timed_out:
             # The sweeper already took this node over. Advancing again dispatches a
             # chain's next step a second time.
-            self._timed_out.pop(key, None)
             logger.warning(
                 "Discarding a result for a node already timed out",
                 node_id=envelope.node_id,
                 canvas_id=envelope.canvas_id,
             )
             await delivery.ack()
+            # Dropped only once the ack has landed. Popping first meant a failing ack
+            # requeued the result with the key already gone, so the redelivery sailed
+            # through to _advance and completed the node a second time — the exact
+            # double-completion this set exists to prevent.
+            self._timed_out.pop(key, None)
             return True
 
         claim = self._claim(envelope.canvas_id, envelope.node_id)

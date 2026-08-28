@@ -175,7 +175,7 @@ class TestConsume:
     ``usefixtures``.
     """
 
-    async def test_consume_starts_and_stops_the_consumer(
+    async def test_consume_starts_the_consumer(
         self,
         mock_consumer_cls: AsyncMock,
     ) -> None:
@@ -186,6 +186,26 @@ class TestConsume:
             pass
 
         mock_consumer_cls.return_value.start.assert_awaited_once()
+
+    async def test_the_generator_does_not_stop_the_consumer(
+        self,
+        mock_consumer_cls: AsyncMock,
+    ) -> None:
+        """Stopping it here would kill the consumer in-flight handlers commit on.
+
+        Cancelling a task suspended in `async for` unwinds the generator and runs
+        its `finally` — awaits included — so a stop there happens before the drain,
+        not after. `close()` owns it instead.
+        """
+        broker = KafkaBroker("localhost:9092")
+
+        async for _ in broker.consume(TOPIC):
+            pass
+
+        mock_consumer_cls.return_value.stop.assert_not_awaited()
+
+        await broker.close()
+
         mock_consumer_cls.return_value.stop.assert_awaited_once()
 
     async def test_consumer_is_constructed_with_manual_commit(

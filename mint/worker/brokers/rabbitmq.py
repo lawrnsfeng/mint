@@ -18,6 +18,7 @@ goes to the back of the queue rather than being redelivered in place.
 """
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import ClassVar, Final, Protocol
@@ -137,6 +138,7 @@ class RabbitMQBroker:
         self._connection_pool: ConnectionPool | None = None
         self._channel_pool: ChannelPool | None = None
         self._consumer_connection: AbstractRobustConnection | None = None
+        self._consumer_channels: dict[str, AbstractChannel] = {}
         # WorkerApp starts every worker's run() concurrently and each calls consume(),
         # so the lazy init below is a genuine race: without this lock all N see None,
         # all N connect, and the last assignment orphans the rest — still consuming,
@@ -250,16 +252,29 @@ class RabbitMQBroker:
         Consumers get their own channels on a dedicated connection instead;
         channels are cheap and a connection carries thousands.
         """
-        connection = await self._ensure_consumer_connection()
-        channel = await connection.channel()
-        try:
-            await channel.set_qos(prefetch_count=self.qos)
-            _, queue = await self._declare_topic(channel, topic)
-            async with queue.iterator() as iterator:
-                async for message in iterator:
-                    yield RabbitMQDelivery(self, topic, message)
-        finally:
-            await channel.close()
+        channel = await self._ensure_consumer_channel(topic)
+        await channel.set_qos(prefetch_count=self.qos)
+        _, queue = await self._declare_topic(channel, topic)
+        async with queue.iterator() as iterator:
+            async for message in iterator:
+                yield RabbitMQDelivery(self, topic, message)
+
+    async def _ensure_consumer_channel(self, topic: str) -> AbstractChannel:
+        """Return this topic's dedicated consumer channel, opening it if needed.
+
+        Owned by the broker and closed by ``close()``, deliberately *not* released
+        in the generator's ``finally``. Cancelling a task suspended in ``async for``
+        unwinds the generator and runs that ``finally`` — awaits included — so
+        closing there tore the channel down before in-flight handlers had drained,
+        and their ``ack()`` then failed on a dead channel. One channel per topic is
+        bounded by the number of topics a broker serves.
+        """
+        channel = self._consumer_channels.get(topic)
+        if channel is None:
+            connection = await self._ensure_consumer_connection()
+            channel = await connection.channel()
+            self._consumer_channels[topic] = channel
+        return channel
 
     async def _ensure_consumer_connection(self) -> AbstractRobustConnection:
         """Return the single connection every consumer opens its own channel on."""
@@ -270,6 +285,10 @@ class RabbitMQBroker:
 
     async def close(self) -> None:
         """Close the consumer connection and both pools, whichever were ever built."""
+        for channel in list(self._consumer_channels.values()):
+            with contextlib.suppress(Exception):
+                await channel.close()
+        self._consumer_channels.clear()
         if self._consumer_connection is not None:
             await self._consumer_connection.close()
             self._consumer_connection = None

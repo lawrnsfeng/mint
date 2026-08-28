@@ -550,7 +550,10 @@ class TestAckOrdering:
         inner_delivery = envelope_delivery(broker, "t1", CANVAS, '{"value": 5}')
         tracked_delivery = OrderTrackingDelivery(inner_delivery, order_spy)
 
-        await worker._process_delivery(tracked_delivery, binding)
+        # _handle, not _process_delivery: the ack moved there so settlement can be
+        # recorded before it is awaited (a cancellation mid-ack can't tell you
+        # whether it landed, so nacking afterwards would double-settle).
+        await worker._handle(tracked_delivery, binding)
 
         assert order_spy.events == ["store_write:t1", "publish:next", "ack"]
 
@@ -1022,3 +1025,43 @@ class TestConcurrencySlotIsAlwaysReleased:
 
         assert worker._slots.locked() is False
         assert worker._inflight == set()
+
+
+class TestSettlementIsRecordedBeforeTheAck:
+    """A cancellation mid-ack can't tell you whether the ack landed."""
+
+    async def test_cancellation_during_the_ack_does_not_nack(self) -> None:
+        """`settled` was only assigned after `_process_delivery` returned.
+
+        The ack happened inside it, so a cancellation in flight there propagated
+        with `settled` still False and nacked a delivery that may already have been
+        acked — the double-settle the design says it prevents. The flag protected
+        the on_success window but not the ack itself.
+        """
+        acking = asyncio.Event()
+        nacked: list[bool] = []
+
+        class SlowAckDelivery(MemoryDelivery):
+            async def ack(self) -> None:
+                acking.set()
+                await asyncio.sleep(3600)
+
+            async def nack(self, *, requeue: bool) -> None:
+                nacked.append(requeue)
+                await super().nack(requeue=requeue)
+
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+        envelope = Envelope(node_id="t1", canvas_id=CANVAS, body='{"value": 5}')
+        delivery = SlowAckDelivery(broker, TOPIC, envelope.to_bytes(), attempt=1)
+
+        task = asyncio.create_task(worker._handle(delivery, binding))
+        async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
+            await acking.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert nacked == []

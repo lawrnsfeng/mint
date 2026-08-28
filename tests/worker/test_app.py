@@ -321,11 +321,12 @@ class TestRunStopLifecycle:
 class TestShutdownKeepsTheTransportAliveForDraining:
     """In-flight handlers must still be able to ack when the drain runs."""
 
-    async def test_consumers_are_released_only_after_draining(self) -> None:
-        """A handler finishing mid-drain must still have a live channel to ack on.
+    async def test_the_broker_is_closed_only_after_draining(self) -> None:
+        """Cancelling run() unwinds its `async for` and runs the generator's finally.
 
-        Cancelling run() unwinds its `async for`, and finalising the generator
-        there would close the RabbitMQ channel / stop the Kafka consumer it needs.
+        A broker that released its channel there tore it down before the drain, so a
+        handler finishing mid-drain failed its ack and had its node re-run. The
+        broker owns the consumer now, and closes it here — after the drain.
         """
         order: list[str] = []
 
@@ -334,11 +335,12 @@ class TestShutdownKeepsTheTransportAliveForDraining:
                 order.append("drain")
                 await super().drain()
 
-            async def close_consumer(self) -> None:
-                order.append("close_consumer")
-                await super().close_consumer()
+        class RecordingBroker(MemoryBroker):
+            async def close(self) -> None:
+                order.append("broker.close")
+                await super().close()
 
-        app = WorkerApp(MemoryBroker(), MemoryCanvasStore())
+        app = WorkerApp(RecordingBroker(), MemoryCanvasStore())
         app.register(RecordingWorker())
 
         run_task = asyncio.create_task(app.run())
@@ -347,7 +349,7 @@ class TestShutdownKeepsTheTransportAliveForDraining:
         async with asyncio.timeout(2.0):
             await run_task
 
-        assert order == ["drain", "close_consumer"]
+        assert order == ["drain", "broker.close"]
 
 
 class TestAppIsSingleUse:

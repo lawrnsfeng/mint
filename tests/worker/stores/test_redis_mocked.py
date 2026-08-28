@@ -127,21 +127,39 @@ class TestNodeStatus:
 
         mock_client.set.assert_not_awaited()
 
-    async def test_set_node_status_writes_the_updated_node(
+    async def test_set_node_status_is_an_atomic_transition(
         self,
         store: RedisCanvasStore,
         mock_client: AsyncMock,
     ) -> None:
-        """An existing node's status field must change in what gets written back."""
-        node = TaskNode(id="t1", canvas_id=CANVAS, topic="topic")
-        mock_client.get.return_value = node.model_dump_json().encode()
+        """The last client-side read-modify-write in this store, and the one that lost.
+
+        Another process cancelling the node between the read and the write was
+        silently overwritten, and `_complete`'s cancelled-node guard then never
+        fired.
+        """
+        script = mock_client.register_script.return_value
 
         await store.set_node_status(CANVAS, "t1", NodeStatus.RUNNING)
 
-        mock_client.set.assert_awaited_once()
-        key, written = mock_client.set.await_args.args
-        assert key == f"mint-worker:canvas:{CANVAS}:node:t1"
-        assert b'"status":"running"' in written
+        script.assert_awaited_once()
+        assert script.await_args.kwargs["keys"] == [f"mint-worker:canvas:{CANVAS}:node:t1"]
+        assert script.await_args.kwargs["args"][0] == NodeStatus.RUNNING.value
+        mock_client.get.assert_not_awaited()
+        mock_client.set.assert_not_awaited()
+
+    async def test_set_node_status_does_not_overwrite_a_terminal_status(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """A node that finished, errored or was cancelled has reached its conclusion."""
+        script = mock_client.register_script.return_value
+
+        await store.set_node_status(CANVAS, "t1", NodeStatus.FINISHED)
+
+        allowed = script.await_args.kwargs["args"][1:]
+        assert set(allowed) == {NodeStatus.PENDING.value, NodeStatus.RUNNING.value}
 
 
 class TestFanIn:

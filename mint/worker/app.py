@@ -147,13 +147,13 @@ class WorkerApp:
         # during drain() picks up whatever a drain timeout just requeued and
         # re-nacks it, inflating the attempt count.
         #
-        # But release the *transport* only after draining. Cancelling run() unwinds
-        # its `async for`, and finalising the generator there would run the broker's
-        # cleanup — closing the RabbitMQ channel, stopping the Kafka consumer — that
-        # in-flight handlers still need to ack on. A handler completing during the
-        # drain would then fail its ack, fall into the catch-all, nack, and have the
-        # node re-run despite the canvas already having advanced. Each worker holds
-        # its own consume generator so the two can be separated.
+        # Releasing the *transport* is the broker's job, not the generator's, and
+        # happens in broker.close() below — after the drain. Cancelling run() unwinds
+        # its `async for` and runs the generator's `finally` (awaits included), so a
+        # broker that closed its channel there tore it down while in-flight handlers
+        # still needed it: their ack failed, the catch-all nacked, and the node
+        # re-ran despite the canvas having advanced. Holding a reference to the
+        # generator does not prevent this — it only prevents *GC* finalisation.
         for worker in self._workers.values():
             worker.stop_consuming()
         for task in self._tasks.values():
@@ -161,8 +161,6 @@ class WorkerApp:
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         await self._drain_workers()
         try:
-            for worker in self._workers.values():
-                await self._safe_close(worker.close_consumer, "worker consumer")
             await self._safe_close(self.broker.close, "broker")
             await self._safe_close(self.store.close, "store")
             await self._safe_close(self._close_executors, "executors")

@@ -206,13 +206,12 @@ class KafkaBroker:
         )
         await consumer.start()
         self._consumers[topic] = consumer
-        try:
-            async for record in consumer:
-                yield KafkaDelivery(self, record, consumer)
-        finally:
-            self._consumers.pop(topic, None)
-            self._forget_offsets(topic)
-            await consumer.stop()
+        # No `finally` stopping the consumer: cancelling a task suspended in
+        # `async for` unwinds the generator and runs it, which would stop the
+        # consumer that in-flight handlers still need to commit on. `close()`
+        # already stops every consumer and forgets its offsets.
+        async for record in consumer:
+            yield KafkaDelivery(self, record, consumer)
 
     def _forget_offsets(self, topic: str) -> None:
         """Drop offset bookkeeping for a topic whose consumer has stopped.
@@ -316,6 +315,8 @@ class KafkaBroker:
         """Stop the producer and every consumer, and close the admin client, if started."""
         if self._producer is not None:
             await self._producer.stop()
+        for topic in list(self._consumers):
+            self._forget_offsets(topic)
         for consumer in list(self._consumers.values()):
             await consumer.stop()
         self._consumers.clear()

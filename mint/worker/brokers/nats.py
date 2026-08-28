@@ -75,6 +75,7 @@ class NatsBroker:
         self.group = group
         self._client: Client | None = None
         self._jetstream: JetStreamContext | None = None
+        self._subscriptions: dict[str, JetStreamContext.PullSubscription] = {}
 
     async def _connect(self) -> JetStreamContext:
         if self._jetstream is not None:
@@ -143,27 +144,26 @@ class NatsBroker:
         """Yield deliveries from ``topic`` via this broker's per-topic durable consumer."""
         jetstream = await self._connect()
         await self._ensure_stream(jetstream, topic)
-        subscription = await jetstream.pull_subscribe(
-            subject=topic,
-            durable=self._durable_name(topic),
-        )
-        try:
-            while True:
-                try:
-                    messages = await subscription.fetch(
-                        self.PULL_BATCH,
-                        timeout=self.PULL_TIMEOUT_SECONDS,
-                    )
-                except TimeoutError:
-                    continue
-                for msg in messages:
-                    yield NatsDelivery(self, msg)
-        finally:
-            # RabbitMQ and Kafka both release their consumer here; this one relied on
-            # close() tearing down the whole client, which Worker.close_consumer()
-            # does not do.
-            with contextlib.suppress(Exception):
-                await subscription.unsubscribe()
+        subscription = self._subscriptions.get(topic)
+        if subscription is None:
+            subscription = await jetstream.pull_subscribe(
+                subject=topic,
+                durable=self._durable_name(topic),
+            )
+            self._subscriptions[topic] = subscription
+        # Released by close(), not here: cancelling a task suspended in this loop
+        # unwinds the generator, and unsubscribing then would drop the subscription
+        # while in-flight handlers still need it to ack.
+        while True:
+            try:
+                messages = await subscription.fetch(
+                    self.PULL_BATCH,
+                    timeout=self.PULL_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                continue
+            for msg in messages:
+                yield NatsDelivery(self, msg)
 
     async def deadletter(self, msg: Msg) -> None:
         """Publish ``msg`` to its subject's dead-letter subject, if it has one.
@@ -185,6 +185,10 @@ class NatsBroker:
         await jetstream.publish(f"{msg.subject}{self.DLQ_SUFFIX}", msg.data, headers=msg.headers)
 
     async def close(self) -> None:
-        """Close the underlying NATS connection."""
+        """Unsubscribe every consumer, then close the underlying NATS connection."""
+        for subscription in list(self._subscriptions.values()):
+            with contextlib.suppress(Exception):
+                await subscription.unsubscribe()
+        self._subscriptions.clear()
         if self._client is not None:
             await self._client.close()

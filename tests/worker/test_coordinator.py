@@ -8,6 +8,7 @@ sweeping for timeouts.
 """
 
 import asyncio
+import contextlib
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
@@ -18,7 +19,7 @@ from mint.worker.brokers.memory import MemoryBroker, MemoryDelivery
 from mint.worker.canvas.dispatch import Dispatch
 from mint.worker.canvas.models import ChainNode, ErrorInfo, NodeOutcome, TaskNode
 from mint.worker.coordinator import Coordinator, CoordinatorConfig, InFlightNode
-from mint.worker.enums import CanvasStatus, NodeStatus
+from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.envelope import Envelope
 from mint.worker.exc import CoordinatorAlreadyRunningError
 from mint.worker.stores.memory import MemoryCanvasStore
@@ -726,3 +727,96 @@ class TestResultRetryCap:
         async with asyncio.timeout(1.0):
             dead = await anext(broker.consume(f"{RESULTS_TOPIC}{MemoryBroker.DLQ_SUFFIX}"))
         assert dead.attempt == CoordinatorConfig().max_attempts
+
+
+class TestSweeperAndResultAreMutuallyExclusive:
+    """Only one of the two paths may ever complete a given node."""
+
+    async def _canvas(
+        self,
+        policy: ErrorPolicy = ErrorPolicy.PROPAGATE,
+    ) -> MemoryCanvasStore:
+        store = MemoryCanvasStore()
+        await store.create_canvas(
+            CANVAS,
+            {
+                "t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id="chain", topic="topic-t1"),
+                "t2": TaskNode(id="t2", canvas_id=CANVAS, parent_id="chain", topic="topic-t2"),
+                "chain": ChainNode(
+                    id="chain",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["t1", "t2"],
+                    error_policy=policy,
+                ),
+            },
+        )
+        return store
+
+    async def test_a_sweep_during_an_in_progress_advance_does_not_double_complete(
+        self,
+    ) -> None:
+        """The claim has to happen before the store I/O, not after it.
+
+        Untracking after `_advance` left the entry visible for the whole duration
+        of `engine.complete()`, so the sweeper could pick up the same node and
+        complete it again with a synthetic timeout — dispatching the chain's next
+        step twice.
+        """
+        store = await self._canvas()
+        broker = MemoryBroker()
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        coordinator._track(CANVAS, "t1")
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        delivery = await anext(broker.consume(RESULTS_TOPIC))
+
+        stale = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        results = await asyncio.gather(
+            coordinator._handle_result(delivery),
+            coordinator._timeout_node(stale),
+        )
+        del results
+
+        dispatched = []
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(0.2):
+                while True:
+                    dispatched.append(await anext(broker.consume("topic-t2")))
+        assert len(dispatched) == 1
+
+    async def test_a_failed_sweep_advance_leaves_the_node_tracked(self) -> None:
+        """Nothing else retries a synthetic timeout — there is no delivery behind it.
+
+        Untracking before a failed advance left the canvas RUNNING with no error
+        recorded and no sweep that would ever look at it again.
+
+        The chain is CONTINUE so that the synthetic ERROR outcome still dispatches
+        the next step — which is the publish that then fails.
+        """
+        store = await self._canvas(ErrorPolicy.CONTINUE)
+        broker = RaisingOnTopicBroker(raises_for="topic-t2")
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        entry = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        coordinator._in_flight[CANVAS, "t1"] = entry
+
+        await coordinator._timeout_node(entry)
+
+        assert (CANVAS, "t1") in coordinator._in_flight
+        assert coordinator._in_flight[CANVAS, "t1"].dispatched_at == entry.dispatched_at
+
+    async def test_a_failed_result_advance_restores_the_original_dispatch_time(
+        self,
+    ) -> None:
+        """Re-tracking with a fresh timestamp would grant another full max_age."""
+        store = await self._canvas()
+        broker = RaisingOnTopicBroker(raises_for="topic-t2")
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        original = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        coordinator._in_flight[CANVAS, "t1"] = original
+        coordinator._by_canvas[CANVAS] = {"t1"}
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        delivery = await anext(broker.consume(RESULTS_TOPIC))
+
+        await coordinator._handle_result(delivery)
+
+        assert coordinator._in_flight[CANVAS, "t1"].dispatched_at == original.dispatched_at

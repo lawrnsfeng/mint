@@ -495,3 +495,58 @@ class TestOutOfOrderCommits:
         await other_delivery.ack()
 
         consumer.commit.assert_awaited_once_with({TopicPartition(TOPIC, 1): 6})
+
+
+class TestOffsetTrackingSurvivesRebalance:
+    """A rebalance redelivers uncommitted offsets; tracking must not wedge on them."""
+
+    def _record(self, mocker: "MockerFixture", offset: int) -> MagicMock:
+        record = mocker.MagicMock()
+        record.value = b"payload"
+        record.topic = TOPIC
+        record.headers = ()
+        record.partition = 0
+        record.offset = offset
+        return record
+
+    async def test_a_redelivered_offset_does_not_wedge_the_partition(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """Appending a duplicate left a twin at the head that nothing could clear.
+
+        `settle` pops one instance and discards the offset from the settled set, so
+        the second copy blocked the partition forever — no offset committed again,
+        and everything replays on restart.
+        """
+        broker = KafkaBroker("localhost:9092")
+        consumer = mocker.AsyncMock()
+        record = self._record(mocker, 5)
+        KafkaDelivery(broker, record, consumer)
+        # the same offset arrives again after a rebalance
+        redelivered = KafkaDelivery(broker, record, consumer)
+        await redelivered.ack()
+
+        # The damage only shows on the *next* offset: a duplicate 5 left behind at
+        # the head is never settled again, so nothing after it can ever commit.
+        following = KafkaDelivery(broker, self._record(mocker, 6), consumer)
+        await following.ack()
+
+        assert [call.args[0] for call in consumer.commit.await_args_list] == [
+            {TopicPartition(TOPIC, 0): 6},
+            {TopicPartition(TOPIC, 0): 7},
+        ]
+
+    async def test_a_stopped_consumers_offsets_are_forgotten(
+        self,
+        mocker: "MockerFixture",
+    ) -> None:
+        """Nothing can settle offsets whose consumer is gone, so they must not linger."""
+        broker = KafkaBroker("localhost:9092")
+        KafkaDelivery(broker, self._record(mocker, 5), mocker.AsyncMock())
+        assert broker._inflight
+
+        broker._forget_offsets(TOPIC)
+
+        assert broker._inflight == {}
+        assert broker._settled == {}

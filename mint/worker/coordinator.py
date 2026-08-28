@@ -169,6 +169,32 @@ class Coordinator:
         self._in_flight[canvas_id, node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
         self._by_canvas.setdefault(canvas_id, set()).add(node_id)
 
+    def _claim(self, canvas_id: str, node_id: str) -> InFlightNode | None:
+        """Take exclusive ownership of a tracked node, returning what was claimed.
+
+        Whoever removes the entry first is the one that gets to complete the node;
+        the loser sees None and stands down. Returns None when the node was never
+        tracked, in which case there is nothing to contend over and nothing to
+        restore.
+        """
+        entry = self._in_flight.get((canvas_id, node_id))
+        if entry is None:
+            return None
+        self._untrack(canvas_id, node_id)
+        return entry
+
+    def _restore(self, entry: InFlightNode | None) -> None:
+        """Put a claimed node back, keeping its original dispatch time.
+
+        Preserving ``dispatched_at`` matters: re-tracking with a fresh timestamp
+        would silently grant the node another full ``max_age`` before the sweeper
+        would look at it again.
+        """
+        if entry is None:
+            return
+        self._in_flight[entry.canvas_id, entry.node_id] = entry
+        self._by_canvas.setdefault(entry.canvas_id, set()).add(entry.node_id)
+
     def _untrack(self, canvas_id: str, node_id: str) -> None:
         self._in_flight.pop((canvas_id, node_id), None)
         nodes = self._by_canvas.get(canvas_id)
@@ -234,19 +260,22 @@ class Coordinator:
             await delivery.nack(requeue=False)
             return
 
-        # Untracked only once the advance has actually succeeded. Doing it up front
-        # meant a result that then failed and dead-lettered left its node neither
-        # completed nor tracked — so the sweeper, the only thing that would have
-        # failed it, never fired and the canvas stayed RUNNING forever.
+        # Claimed before advancing, and restored if that fails. Untracking is the
+        # mutual exclusion against the sweeper (see _timeout_node), so it has to
+        # happen before the store I/O, not after — otherwise the sweeper sees the
+        # entry still present mid-advance and completes the same node a second time
+        # with a synthetic timeout. Restoring on failure is what stops a result that
+        # then dead-letters from escaping the sweeper entirely.
+        claim = self._claim(envelope.canvas_id, envelope.node_id)
         if not await self._advance(
             envelope.canvas_id,
             envelope.node_id,
             outcome,
             trace_id=envelope.trace_id,
         ):
+            self._restore(claim)
             await self._retry_or_drop(delivery, envelope.node_id)
             return
-        self._untrack(envelope.canvas_id, envelope.node_id)
         await delivery.ack()
 
     async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:
@@ -332,9 +361,8 @@ class Coordinator:
         double-counts a group leg. Untracking *is* the check: whichever of the two
         removes the entry first is the one that gets to complete the node.
         """
-        if (entry.canvas_id, entry.node_id) not in self._in_flight:
+        if self._claim(entry.canvas_id, entry.node_id) is None:
             return
-        self._untrack(entry.canvas_id, entry.node_id)
         outcome = NodeOutcome(
             node_id=entry.node_id,
             status=NodeStatus.ERROR,
@@ -343,4 +371,8 @@ class Coordinator:
                 message=f"No result within {self.max_age}s",
             ),
         )
-        await self._advance(entry.canvas_id, entry.node_id, outcome)
+        if not await self._advance(entry.canvas_id, entry.node_id, outcome):
+            # There is no delivery behind a synthetic timeout, so nothing else will
+            # ever retry this. Put it back and let the next sweep try again, rather
+            # than leaving the canvas RUNNING with no error recorded at all.
+            self._restore(entry)

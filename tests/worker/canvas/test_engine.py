@@ -354,7 +354,7 @@ class TestGroup:
         total_dispatches = sum(len(r) for r in results)
         assert total_dispatches == 1
 
-    async def test_a_callback_dispatch_carries_its_group_id_for_rollback(
+    async def test_a_callback_dispatch_names_the_guard_it_burned(
         self,
         engine: CanvasEngine,
         store: MemoryCanvasStore,
@@ -365,9 +365,9 @@ class TestGroup:
 
         dispatches = await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
 
-        assert dispatches[0].group_id == "g"
+        assert dispatches[0].claimed_groups == ("g",)
 
-    async def test_a_chain_dispatch_carries_no_group_id(
+    async def test_a_chain_dispatch_claims_nothing(
         self,
         engine: CanvasEngine,
         store: MemoryCanvasStore,
@@ -378,7 +378,7 @@ class TestGroup:
 
         dispatches = await engine.complete(CANVAS, "s1", ok_outcome("s1"))
 
-        assert dispatches[0].group_id is None
+        assert dispatches[0].claimed_groups == ()
 
     async def test_rollback_lets_a_redelivered_leg_re_fire_a_callback_that_never_published(
         self,
@@ -1309,3 +1309,69 @@ class TestConcurrentTerminalLegsEmitOnce:
 
         assert all(dispatches == [] for dispatches in results)
         assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+
+class TestRollbackReleasesEveryGuardBurned:
+    """One complete() can burn several group guards; rollback must release all of them."""
+
+    async def _nested(self, store: MemoryCanvasStore) -> None:
+        """Outer chord (CONTINUE, with callback) whose legs are an inner chord and a task."""
+        await seed(
+            store,
+            task("inner1", "inner"),
+            task("inner2", "inner"),
+            GroupNode(
+                id="inner",
+                canvas_id=CANVAS,
+                parent_id="outer",
+                children=["inner1", "inner2"],
+                callback=None,
+                error_policy=ErrorPolicy.PROPAGATE,
+            ),
+            task("sibling", "outer"),
+            task("cb", "outer", topic="callback"),
+            GroupNode(
+                id="outer",
+                canvas_id=CANVAS,
+                parent_id=None,
+                children=["inner", "sibling"],
+                callback="cb",
+                error_policy=ErrorPolicy.CONTINUE,
+            ),
+        )
+
+    async def test_a_dispatch_names_both_the_inner_and_outer_guards(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """The inner group claims its terminal slot, then the outer fires its callback."""
+        await self._nested(store)
+        await engine.complete(CANVAS, "sibling", ok_outcome("sibling"))
+
+        dispatches = await engine.complete(CANVAS, "inner1", err_outcome("inner1"))
+
+        assert set(dispatches[0].claimed_groups) == {"inner", "outer"}
+
+    async def test_rollback_lets_the_whole_walk_replay(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Releasing only the dispatching group leaves the inner guard burned.
+
+        The redelivery then stops at the inner group's failed claim, returns no
+        dispatch at all, and the caller acks — the callback is lost and the canvas
+        stays RUNNING forever, which is the exact stranding rollback exists to
+        prevent.
+        """
+        await self._nested(store)
+        await engine.complete(CANVAS, "sibling", ok_outcome("sibling"))
+        authorised = await engine.complete(CANVAS, "inner1", err_outcome("inner1"))
+
+        await engine.rollback(authorised)
+        redelivered = await engine.complete(CANVAS, "inner1", err_outcome("inner1"))
+
+        assert len(authorised) == 1
+        assert len(redelivered) == 1
+        assert redelivered[0].node_id == "cb"

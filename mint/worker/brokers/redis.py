@@ -126,12 +126,18 @@ class RedisBroker:
         self.block_ms = block_ms
         self.reclaim_idle_ms = reclaim_idle_ms
         self._client: Redis[bytes] | None = None
-        # Stream ids this consumer is currently handling. XAUTOCLAIM matches purely
-        # on idle time, with no regard for who owns the entry — including entries
-        # this very consumer is still working on. Any handler slower than
-        # reclaim_idle_ms would otherwise have its own message handed back to it and
-        # processed a second time, concurrently with the first.
-        self._inflight_ids: set[bytes] = set()
+        # Entries this consumer is currently handling. XAUTOCLAIM matches purely on
+        # idle time, with no regard for who owns the entry — including entries this
+        # very consumer is still working on. Any handler slower than reclaim_idle_ms
+        # would otherwise have its own message handed back and processed a second
+        # time, concurrently with the first.
+        #
+        # Keyed by (topic, id), never id alone: a stream id is unique only within
+        # its own stream, and one broker is shared across every worker in a
+        # WorkerApp. Two topics can hand out the same id in the same millisecond,
+        # which would make one topic's entry mask the other's — and retiring the
+        # first would strip the protection from the second while it was still live.
+        self._inflight_ids: set[tuple[str, bytes]] = set()
 
     @property
     def client(self) -> "Redis[bytes]":
@@ -204,7 +210,7 @@ class RedisBroker:
         if not entries:
             return None
         message_id, fields = entries[0]
-        if message_id in self._inflight_ids:
+        if (topic, message_id) in self._inflight_ids:
             return None
         return self._entry(topic, message_id, fields)
 
@@ -222,7 +228,7 @@ class RedisBroker:
             for key, value in fields.items()
             if key not in (self.BODY_FIELD, self.ATTEMPT_FIELD)
         }
-        self._inflight_ids.add(message_id)
+        self._inflight_ids.add((topic, message_id))
         return StreamEntry(topic, message_id, body, attempt, headers or None)
 
     async def ack(self, entry: StreamEntry) -> None:
@@ -255,7 +261,7 @@ class RedisBroker:
 
     async def _retire(self, entry: StreamEntry) -> None:
         """Ack ``entry`` out of the pending list and delete it from its stream."""
-        self._inflight_ids.discard(entry.message_id)
+        self._inflight_ids.discard((entry.topic, entry.message_id))
         # types-redis declares xack() without annotations, so mypy sees an untyped
         # call in a typed context. Nothing on our side can make it typed.
         await self.client.xack(  # type: ignore[no-untyped-call]

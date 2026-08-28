@@ -200,13 +200,33 @@ class KafkaBroker:
                 yield KafkaDelivery(self, record, consumer)
         finally:
             self._consumers.pop(topic, None)
+            self._forget_offsets(topic)
             await consumer.stop()
 
+    def _forget_offsets(self, topic: str) -> None:
+        """Drop offset bookkeeping for a topic whose consumer has stopped.
+
+        Nothing can settle those offsets any more, so keeping them would block the
+        partition for the lifetime of the broker if the topic is consumed again.
+        """
+        for key in [key for key in self._inflight if key[0] == topic]:
+            del self._inflight[key]
+            self._settled.pop(key, None)
+
     def track(self, record: "ConsumerRecord") -> None:
-        """Record that ``record``'s offset is delivered and not yet settled."""
+        """Record that ``record``'s offset is delivered and not yet settled.
+
+        Idempotent per offset. A consumer-group rebalance redelivers offsets that
+        were fetched but never committed, and appending a duplicate would wedge the
+        partition permanently: ``settle`` pops one instance and discards the offset
+        from the settled set, leaving the twin at the head of the queue with nothing
+        that can ever clear it — no offset for that partition is committed again.
+        """
         key = (record.topic, record.partition)
-        self._inflight.setdefault(key, []).append(record.offset)
+        inflight = self._inflight.setdefault(key, [])
         self._settled.setdefault(key, set())
+        if record.offset not in inflight:
+            inflight.append(record.offset)
 
     def settle(self, record: "ConsumerRecord") -> int | None:
         """Mark ``record`` settled and return the offset that is now safe to commit.

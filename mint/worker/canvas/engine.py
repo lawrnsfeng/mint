@@ -11,6 +11,7 @@ nesting cannot blow the stack, and a per-call visited set turns a corrupted
 """
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Final, assert_never
 
 from mint.worker.canvas.dispatch import Dispatch
@@ -95,11 +96,14 @@ class CanvasEngine:
         makes the redelivery re-fire it, preserving the "ack only after the store
         write *and* the publish succeed" contract this package relies on.
 
-        Only callback dispatches carry a ``group_id``; everything else is a no-op.
+        Releases every guard the call burned, not only the dispatching group's — a
+        single walk can claim an inner group's terminal slot and then fire an outer
+        group's callback, and leaving the inner one burned strands the redelivery
+        just as surely.
         """
         for dispatch in dispatches:
-            if dispatch.group_id is not None:
-                await self.store.reset_group_fired(dispatch.canvas_id, dispatch.group_id)
+            for group_id in dispatch.claimed_groups:
+                await self.store.reset_group_fired(dispatch.canvas_id, group_id)
 
     async def _complete(
         self,
@@ -111,6 +115,9 @@ class CanvasEngine:
         await self._record(canvas_id, node_id, outcome)
 
         visited = {node_id}
+        # Every group guard burned during this walk, so a caller whose publish fails
+        # can release all of them rather than only the one that dispatched.
+        claimed: list[str] = []
         current_id, current_outcome, parent_id = node_id, outcome, node.parent_id
 
         while parent_id is not None:
@@ -139,6 +146,7 @@ class CanvasEngine:
                         parent,
                         current_id,
                         current_outcome,
+                        claimed,
                     )
                 case _ as unreachable:  # pragma: no cover
                     # AnyNode is exactly Task | Chain | Group, all three handled above;
@@ -150,7 +158,7 @@ class CanvasEngine:
                     assert_never(unreachable)
 
             if dispatch is not None:
-                return [dispatch]
+                return [replace(dispatch, claimed_groups=tuple(claimed))]
             if bubbled is None:
                 return []
 
@@ -217,12 +225,14 @@ class CanvasEngine:
         group: GroupNode,
         finished_child_id: str,
         outcome: NodeOutcome,
+        claimed: list[str],
     ) -> tuple[Dispatch | None, NodeOutcome | None]:
         terminal = await self._apply_group_error_policy(
             canvas_id,
             group,
             finished_child_id,
             outcome,
+            claimed,
         )
         if terminal is not None:
             return terminal
@@ -235,6 +245,7 @@ class CanvasEngine:
         )
         if not progress.fired:
             return None, None
+        claimed.append(group.id)
 
         results = await self.store.get_results(canvas_id, group.children)
         children: list[ChildResult] = []
@@ -252,15 +263,12 @@ class CanvasEngine:
 
         if group.callback is not None:
             entry = await self._entry_task(canvas_id, group, group.callback)
-            # group_id travels with the dispatch so a caller whose publish fails can
-            # hand it to rollback() and release the fan-in guard this call just burned.
             return (
                 Dispatch(
                     topic=entry.topic,
                     node_id=entry.id,
                     canvas_id=canvas_id,
                     body=fan_in.model_dump_json(),
-                    group_id=group.id,
                 ),
                 None,
             )
@@ -336,6 +344,7 @@ class CanvasEngine:
         group: GroupNode,
         finished_child_id: str,
         outcome: NodeOutcome,
+        claimed: list[str],
     ) -> tuple[Dispatch | None, NodeOutcome | None] | None:
         """Handle a failed child under ABORT/PROPAGATE, or None if the group continues.
 
@@ -350,6 +359,7 @@ class CanvasEngine:
         if group.error_policy == ErrorPolicy.ABORT:
             if not await self.store.claim_group_terminal(canvas_id, group.id):
                 return None, None
+            claimed.append(group.id)
             # Cancels the callback along with the unfinished legs — an aborting group
             # never dispatches it, so leaving it PENDING misreports it as expected.
             await self._cancel_group_remainder(canvas_id, group, finished_child_id)
@@ -358,6 +368,7 @@ class CanvasEngine:
         if group.error_policy == ErrorPolicy.PROPAGATE:
             if not await self.store.claim_group_terminal(canvas_id, group.id):
                 return None, None
+            claimed.append(group.id)
             # Mirrors _advance_chain's PROPAGATE branch. Without this the policy was
             # only ever consulted on the ABORT pre-check and the callback-less
             # final_status, so a group *with* a callback treated PROPAGATE exactly

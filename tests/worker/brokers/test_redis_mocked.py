@@ -482,3 +482,36 @@ class TestReclaimSkipsOwnInFlightWork:
         second = await anext(consumer)
 
         assert second.body == b"slow"
+
+
+class TestReclaimGuardIsScopedToItsTopic:
+    """A stream id is unique only within its own stream, and one broker serves many."""
+
+    async def test_the_same_id_on_another_topic_is_still_reclaimable(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """Two topics can hand out the same id in the same millisecond.
+
+        Keyed by id alone, one topic's in-flight entry masked the other's — and
+        retiring the first stripped the guard from the second while it was still
+        live, letting it be reclaimed and processed concurrently with itself.
+        """
+        shared_id = b"1700000000000-0"
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(shared_id, {RedisBroker.BODY_FIELD: b"topic-a"})],
+            [],
+        ]
+        first = await anext(broker.consume(TOPIC))
+        assert first.body == b"topic-a"
+
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(shared_id, {RedisBroker.BODY_FIELD: b"topic-b"})],
+            [],
+        ]
+        second = await anext(broker.consume("other.topic"))
+
+        assert second.body == b"topic-b"

@@ -9,17 +9,20 @@ from mint.worker.envelope import Envelope
 class Dispatch:
     """One message the engine wants published to advance a canvas.
 
-    ``group_id`` is set only on a chord callback's dispatch, and names the group
-    whose fan-in guard was burned to authorise it. The caller hands it back to
-    ``CanvasEngine.rollback`` when the publish fails, so the callback stays
-    dispatchable on redelivery instead of being lost for good.
+    ``claimed_groups`` names *every* group whose one-shot guard was burned while
+    producing this dispatch — not just the group that dispatched. A single
+    ``complete()`` can burn several: an inner group claiming its terminal slot,
+    bubbling an outcome outwards, and an outer group then firing its callback.
+    The caller hands the whole set back to ``CanvasEngine.rollback`` when the
+    publish fails; releasing only the last one leaves the inner guards burned, so
+    the redelivery stops at the first of them and the dispatch is lost anyway.
     """
 
     topic: str
     node_id: str
     canvas_id: str
     body: str
-    group_id: str | None = None
+    claimed_groups: tuple[str, ...] = ()
 
     def to_envelope(self, trace_id: str | None = None) -> Envelope:
         """Build the wire envelope for this dispatch, carrying ``trace_id`` forward.

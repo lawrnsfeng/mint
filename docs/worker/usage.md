@@ -110,8 +110,15 @@ in place.
 
 Shutdown cancels the consume loops, drains what is in flight, and only then
 releases each worker's broker resources — a handler finishing during the drain
-still needs a live channel to ack on. An app that has shut down cleanly can be
-`run()` again, and the SIGTERM/SIGINT handlers it installed are handed back.
+still needs a live channel to ack on. The SIGTERM/SIGINT handlers it installed are
+handed back, and every teardown step is isolated so one failing close still leaves
+the process interruptible.
+
+**A `WorkerApp` is single-use.** Shutdown closes the broker, the store and every
+closable executor, and nothing reopens them, so `run()` after a shutdown raises
+`AppAlreadyShutDownError` rather than starting loops that would consume nothing.
+Restarting means a new app over fresh connections. `Coordinator` behaves the same
+way.
 `app.stop()` triggers the same graceful shutdown programmatically. A worker
 still in flight when the drain timeout (`WorkerApp(..., drain_timeout=5.0)`)
 expires is nacked for redelivery, not dropped.

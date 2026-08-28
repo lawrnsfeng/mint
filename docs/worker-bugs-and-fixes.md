@@ -120,6 +120,16 @@ is the expanded, "how do I actually fix this" version.
 - [83. The Redis key registry inherits a TTL across a `canvas_id` reuse](#83-the-redis-key-registry-inherits-a-ttl-across-a-canvas_id-reuse)
 - [84. One slow handler blocks reclaiming abandoned entries](#84-one-slow-handler-blocks-reclaiming-abandoned-entries)
 
+**Part 9 — Bugs found by an eighth review round, and two found by reading**
+
+- [85. `NodeStatus.RUNNING` is never written](#85-nodestatusrunning-is-never-written)
+- [86. Dead-lettering from a NATS DLQ subject fails](#86-dead-lettering-from-a-nats-dlq-subject-fails)
+- [87. A restarted `WorkerApp` consumes nothing](#87-a-restarted-workerapp-consumes-nothing)
+- [88. One failing close undoes the whole shutdown](#88-one-failing-close-undoes-the-whole-shutdown)
+- [89. The coordinator can double-settle a delivery on shutdown](#89-the-coordinator-can-double-settle-a-delivery-on-shutdown)
+- [90. Closing an executor pool blocks the event loop](#90-closing-an-executor-pool-blocks-the-event-loop)
+- [91. A task cancelled before it starts leaks its concurrency slot](#91-a-task-cancelled-before-it-starts-leaks-its-concurrency-slot)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3271,6 +3281,181 @@ stall the consume loop.
 
 ---
 
+## Part 9 — Bugs found by an eighth review round, and two found by reading
+
+#85 and #86 came from reading the package for claims that were never checked
+rather than from a review of the diff. #87 is the sharpest entry in this whole
+catalogue, because the reason it survived a round is a rule already written in the
+checklist below.
+
+### 85. `NodeStatus.RUNNING` is never written
+
+**Where:** the whole package; `mint/worker/worker.py` is where it belongs
+
+**Symptom:** A canvas is stuck. Every node reads `PENDING`. There is no way to
+tell which one is being worked on right now and which was never dispatched.
+
+**Root cause:** Bug #13's premise was, verbatim, "`NodeStatus` exists as an enum
+but is never actually written anywhere — a status-check tool has nothing to read",
+and its fix claimed "every transition writes status explicitly". Grepping for
+production writes of `NodeStatus.RUNNING` returns nothing. Only `CANCELLED` (via
+`cancel_nodes`) and the terminal statuses (via `_record`) were ever written, so a
+node went `PENDING` → terminal with no observable middle.
+
+That is the fourth documented claim in this catalogue that the code did not meet
+(#55, #58, #61 were the others), and the most consequential, because the exact
+question it fails to answer — "which node is running?" — is the one you ask when a
+canvas hangs.
+
+**The practical fix:** `ICanvasStore.mark_node_running`, called by `Worker` before
+it executes.
+
+```python
+async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
+    node = await self.get_node(canvas_id, node_id)
+    if node is None or node.status != NodeStatus.PENDING:
+        return
+    await self.set_node_status(canvas_id, node_id, NodeStatus.RUNNING)
+```
+
+PENDING-only, deliberately: a stale delivery for a node an `ErrorPolicy.ABORT`
+already CANCELLED must not resurrect it as RUNNING. And the worker's call is
+wrapped so a store failure is logged, not raised — observability must never cost a
+message that is about to run perfectly well.
+
+---
+
+### 86. Dead-lettering from a NATS DLQ subject fails
+
+**Where:** `mint/worker/brokers/nats.py::deadletter`
+
+**Symptom:** `nack(requeue=False)` on a message consumed from `foo.dlq` raises
+instead of dropping it.
+
+**Root cause:** Issue #40 taught `_ensure_stream` that a dead-letter subject
+*terminates* the chain — `foo.dlq` resolves back to stream `foo`, whose subjects
+are `[foo, foo.dlq]`. Nothing claims `foo.dlq.dlq`, so publishing there has no
+stream to land in. The declare side learned the rule; the publish side never did.
+
+The same one-sided fix as issue #69 (ABORT not cancelling the callback that
+PROPAGATE did) and issue #80 (`track` deduplicating without `settle` knowing).
+Three instances now of a rule applied to one half of a pair.
+
+**The practical fix:** Terminate rather than extend — drop with a warning.
+
+---
+
+### 87. A restarted `WorkerApp` consumes nothing
+
+**Where:** `mint/worker/app.py::_shutdown`
+
+**Symptom:** A second `app.run()` starts, reports healthy, and processes nothing.
+
+**Root cause:** Issue #77 cleared each worker's `_stopped` so a restart would get
+past the first delivery. But `_shutdown` closes the broker, the store and every
+closable executor, and *nothing reopens them*: `MemoryBroker._closed` stays True,
+`RedisBroker.close()` leaves `self._client` set to a closed client, `KafkaBroker`
+keeps stopped producer/admin objects. Verified by running it — the consume loops
+hit the closed transport immediately, `_on_worker_exit` fires, zero messages
+processed.
+
+Issue #77 fixed one half of a contract and `docs/worker/usage.md` was updated to
+promise the whole thing.
+
+**How it survived a round, which is the real lesson.** The regression test
+asserted:
+
+```python
+second = asyncio.create_task(app.run())
+await asyncio.sleep(0)
+assert app._running is True          # passes: run() sets this before the loops die
+```
+
+The checklist below already said *assert on the state after the damage would
+show* — added one round earlier, after the Kafka rebalance test made exactly this
+mistake. Writing it down did not stop it happening again.
+
+**The practical fix:** Not a reopen feature — that is a larger contract than this
+package offers. An app is explicitly single-use: a second `run()` raises
+`AppAlreadyShutDownError`. `Coordinator` matches, `resume_consuming` is gone, and
+the docs say single-use.
+
+---
+
+### 88. One failing close undoes the whole shutdown
+
+**Where:** `mint/worker/app.py::_shutdown`, `mint/worker/coordinator.py::_shutdown`
+
+**Symptom:** After a shutdown in which any close raised, the process is
+uninterruptible and every later `run()` raises `AppAlreadyRunningError`.
+
+**Root cause:** The teardown was a bare sequence, and `_close_executors` gathered
+without `return_exceptions=True`. A raising `broker.close()`, `store.close()`, or
+executor `aclose()` — an `AMQPRPCExecutor` closing pools over a dropped connection
+being the obvious case — skipped `_remove_signal_handlers()` and the state reset
+entirely. That restores precisely the state issue #78 had just fixed: SIGTERM
+routed to an event nothing awaits, with the default handler displaced.
+
+**The practical fix:** Isolate each close, and put the state reset in a `finally`.
+Cleanup code is exactly where an exception is least affordable, because everything
+after it is what makes the process sane again.
+
+---
+
+### 89. The coordinator can double-settle a delivery on shutdown
+
+**Where:** `mint/worker/coordinator.py::_consume_results`
+
+**Symptom:** A node re-runs after a clean shutdown, and RabbitMQ logs a channel
+error.
+
+**Root cause:** The loop nacked unconditionally on `CancelledError`.
+`Worker._handle` carries a `settled` flag for this exact case — its docstring says
+so — because cancellation can land *after* the ack, and nacking a settled delivery
+double-settles it. The coordinator, written to mirror the worker, never got the
+flag.
+
+**The practical fix:** `_handle_result` returns whether it settled; the loop only
+nacks what it did not.
+
+---
+
+### 90. Closing an executor pool blocks the event loop
+
+**Where:** `mint/worker/executors/thread_pool.py::aclose`,
+`process_pool.py::aclose`
+
+**Symptom:** A graceful shutdown never completes.
+
+**Root cause:** `self._pool.shutdown()` defaults to `wait=True` and was called on
+the loop thread. Cancelling a `loop.run_in_executor` future does *not* cancel the
+underlying work, so a handler killed by the drain timeout leaves its
+`asyncio.run(runner())` still going — and `shutdown()` then blocks the entire loop
+until it finishes, with no deadline. A hung CPU-bound `process` turns a graceful
+shutdown into an unkillable one.
+
+**The practical fix:**
+`await asyncio.to_thread(self._pool.shutdown, cancel_futures=True)`.
+
+---
+
+### 91. A task cancelled before it starts leaks its concurrency slot
+
+**Where:** `mint/worker/worker.py::_handle`
+
+**Symptom:** A worker's effective `max_concurrency` drops by one after each
+drain-timeout cancellation.
+
+**Root cause:** The slot was released in `_handle`'s `finally`, which never runs
+for a task cancelled before its coroutine body takes its first step — which is
+exactly what the drain timeout does to `_inflight` tasks.
+
+**The practical fix:** Release from the task's done callback, which fires whatever
+became of it. The callback already existed to discard the task from `_inflight`;
+the release belongs there too.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -3403,3 +3588,18 @@ adding a new broker, executor, or engine transition:
   too (issue #84).
 - **Delete a check you find unreachable** rather than leaving it as reassuring
   dead code (issue #82).
+- **Writing a rule down does not make you follow it.** The "assert after the
+  damage would show" rule was added in Part 7 and broken in Part 8 by a restart
+  test that asserted `_running is True` — a flag `run()` sets before the loops
+  die (issue #87). Prefer reverting the fix and watching the test fail; that
+  check is mechanical, and reading your own checklist is not.
+- **Grep for the enum members nothing writes.** `NodeStatus.RUNNING` was declared,
+  documented as fixed, and never assigned (issue #85).
+- **When a rule applies to a pair, apply it to both halves.** Declare/publish,
+  ABORT/PROPAGATE, track/settle — three separate bugs from fixing one side
+  (issues #86, #69, #80).
+- **Cleanup code is where an exception is least affordable.** Everything after it
+  is what makes the process sane again (issue #88).
+- **Prefer refusing to pretending.** Reopening brokers was a bigger contract than
+  the package offers, so `run()`-after-shutdown raises instead of silently
+  consuming nothing (issue #87).

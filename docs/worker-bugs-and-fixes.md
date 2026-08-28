@@ -100,6 +100,14 @@ is the expanded, "how do I actually fix this" version.
 - [69. `ABORT` leaves the group's callback `PENDING`](#69-abort-leaves-the-groups-callback-pending)
 - [70. `XAUTOCLAIM` reclaims this consumer's own in-flight work](#70-xautoclaim-reclaims-this-consumers-own-in-flight-work)
 
+**Part 7 — Bugs found by a sixth review round**
+
+- [71. `rollback` releases only one of the guards a call burned](#71-rollback-releases-only-one-of-the-guards-a-call-burned)
+- [72. The sweeper and a live result can complete the same node](#72-the-sweeper-and-a-live-result-can-complete-the-same-node)
+- [73. A failed sweeper advance strands its node](#73-a-failed-sweeper-advance-strands-its-node)
+- [74. The Redis reclaim guard is keyed by stream id alone](#74-the-redis-reclaim-guard-is-keyed-by-stream-id-alone)
+- [75. Kafka offset tracking wedges on a rebalance](#75-kafka-offset-tracking-wedges-on-a-rebalance)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -2893,6 +2901,146 @@ the set is exactly "delivered and not yet settled".
 
 ---
 
+## Part 7 — Bugs found by a sixth review round
+
+Three of these five came from Part 6's own fixes, and two of them are the same
+mistake in opposite directions: a guard that has to be taken *before* some I/O,
+and released *after* it fails.
+
+### 71. `rollback` releases only one of the guards a call burned
+
+**Where:** `mint/worker/canvas/engine.py::rollback`
+
+**Symptom:** A chord's callback is lost and its canvas hangs — the exact failure
+issue #23 introduced `rollback` to prevent, now reachable through a different
+door.
+
+**Root cause:** Issue #64 gave the terminal branches their own one-shot claim
+(`claim_group_terminal`), which burns the same key `mark_child_done` uses. A
+single `complete()` walk can therefore burn *several* guards: an inner group
+claiming its terminal slot, bubbling an ERROR outward, and an outer group then
+fan-in-firing its callback. But `Dispatch.group_id` named only the group that
+produced the dispatch.
+
+Reproduced: an outer chord (CONTINUE, with a callback) whose legs are an inner
+chord (PROPAGATE) and a plain task. The task finishes. The inner chord's leg then
+errors — inner guard burned, group ERROR bubbles, outer fan-in completes and
+returns the callback dispatch. If that publish fails, `rollback` resets only the
+*outer* guard; on redelivery the inner group's `claim_group_terminal` returns
+False, the walk stops there, `complete()` returns `[]`, and the worker acks.
+
+**The practical fix:** Carry the whole set.
+
+```python
+claimed: list[str] = []            # accumulated across the walk
+...
+if dispatch is not None:
+    return [replace(dispatch, claimed_groups=tuple(claimed))]
+```
+
+`Dispatch.group_id` is gone; `claimed_groups` replaces it, and `rollback` releases
+every entry. Releasing only the last one leaves the inner guards burned, so the
+redelivery stops at the first of them and the dispatch is lost anyway.
+
+---
+
+### 72. The sweeper and a live result can complete the same node
+
+**Where:** `mint/worker/coordinator.py::_handle_result`
+
+**Symptom:** A chain's next step is dispatched twice, on a canvas near its
+`max_age`.
+
+**Root cause:** `_timeout_node`'s own docstring states the invariant —
+"untracking *is* the check: whichever of the two removes the entry first is the
+one that gets to complete the node". Issue #67 then moved `_untrack` to *after*
+`_advance`, to stop a dead-lettered result escaping the sweeper. That fix was
+correct for what it addressed and silently broke the invariant it sat next to:
+while `_handle_result` is inside `engine.complete()` doing store I/O, the entry
+is still in `_in_flight`, so a concurrent sweep claims it and completes the same
+node with a synthetic timeout.
+
+**The practical fix:** Claim first, restore on failure — which satisfies both
+requirements at once instead of trading one for the other.
+
+```python
+claim = self._claim(envelope.canvas_id, envelope.node_id)
+if not await self._advance(...):
+    self._restore(claim)          # the sweeper can still fail it later
+    await self._retry_or_drop(delivery, envelope.node_id)
+    return
+await delivery.ack()
+```
+
+`_restore` puts back the *original* `InFlightNode`, keeping its `dispatched_at`.
+Re-tracking with a fresh timestamp would silently grant the node another full
+`max_age` before the sweeper looked at it again.
+
+---
+
+### 73. A failed sweeper advance strands its node
+
+**Where:** `mint/worker/coordinator.py::_timeout_node`
+
+**Symptom:** A canvas stays RUNNING with no error recorded, and no further sweep
+ever revisits it.
+
+**Root cause:** `_timeout_node` untracks and then advances. Unlike every other
+failure path in the package, there is no delivery behind a synthetic timeout — so
+when `_advance` returns False (a dispatch publish failed), nothing retries. The
+node is untracked, so the sweeper won't fire again, and no broker redelivery
+exists. Every other path has a retry cap precisely so failures end somewhere
+observable; this one ended nowhere.
+
+**The practical fix:** Put it back, using the same `_restore` as issue #72.
+
+---
+
+### 74. The Redis reclaim guard is keyed by stream id alone
+
+**Where:** `mint/worker/brokers/redis.py::_reclaim`
+
+**Symptom:** A genuinely abandoned entry on one topic is never reclaimed; worse,
+an entry still being processed can be reclaimed and run concurrently with itself
+— the very thing issue #70 added the guard to stop.
+
+**Root cause:** `_inflight_ids` was a `set[bytes]` of stream ids. A Redis stream
+id (`<ms>-<seq>`) is unique only *within its own stream*, and one `RedisBroker` is
+shared across every worker in a `WorkerApp`. Two topics can hand out
+`1700000000000-0` in the same millisecond, so topic A's in-flight entry masks
+topic B's — and when A's entry is retired, `_retire` discards the shared id,
+stripping the protection from B's entry while it is still live.
+
+**The practical fix:** `set[tuple[str, bytes]]`. The same lesson as issue #29's
+`(canvas_id, node_id)`: an identifier is only as unique as its scope.
+
+---
+
+### 75. Kafka offset tracking wedges on a rebalance
+
+**Where:** `mint/worker/brokers/kafka.py::track`
+
+**Symptom:** After a consumer-group rebalance, a partition stops committing
+entirely. Everything replays on every restart, forever.
+
+**Root cause:** Issue #62's tracking assumed each offset is delivered once. A
+rebalance redelivers offsets that were fetched but never committed, so `track`
+appended a duplicate: `[5, 5]`. `settle(5)` pops one instance *and* discards 5
+from the settled set, leaving the twin at the head of the queue with nothing that
+could ever clear it. From then on `settle` returns None for that partition
+forever.
+
+**The practical fix:** Make `track` idempotent per offset, and drop a stopped
+consumer's bookkeeping so a re-consumed topic starts clean.
+
+**Worth noting how nearly this was missed.** The first regression test asserted
+only that the duplicate ack still committed offset 6 — which it does, even with
+the bug. The damage shows on the *next* offset, which is blocked forever. The
+test passed against the broken code until it was extended to settle a following
+offset; a revert-and-watch-it-fail check is what caught that.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -2995,3 +3143,15 @@ adding a new broker, executor, or engine transition:
 - **Two individually correct fixes can be jointly wrong.** A retry cap plus an
   early untrack meant a dead-lettered result escaped the sweeper entirely
   (issue #67).
+- **A fix that moves a guard can break an invariant documented right beside it.**
+  Moving `_untrack` after the advance silently violated the mutual exclusion
+  `_timeout_node`'s own docstring described (issue #72). Claim-then-restore
+  satisfied both requirements; trading one for the other never does.
+- **An identifier is only as unique as its scope.** Node ids are unique per
+  canvas, Redis stream ids per stream — key by the pair, always (issues #29, #74).
+- **Bookkeeping that assumes exactly-once delivery breaks under redelivery.**
+  Offset tracking, in a broker whose whole point is at-least-once (issue #75).
+- **Assert on the state *after* the damage would show.** The rebalance test
+  passed against the broken code, because the duplicate only blocks the *next*
+  offset. Reverting the fix and watching the test fail is what exposed it
+  (issue #75).

@@ -138,6 +138,14 @@ is the expanded, "how do I actually fix this" version.
 - [95. Kafka and MemoryBroker extend the dead-letter chain](#95-kafka-and-memorybroker-extend-the-dead-letter-chain)
 - [96. `NatsBroker.consume` never unsubscribes](#96-natsbrokerconsume-never-unsubscribes)
 
+**Part 11 — Bugs found by a tenth review round**
+
+- [97. The sweeper marks a node timed-out only after advancing it](#97-the-sweeper-marks-a-node-timed-out-only-after-advancing-it)
+- [98. `_timed_out` grows without bound](#98-_timed_out-grows-without-bound)
+- [99. Cancelled subtrees keep running and keep dispatching](#99-cancelled-subtrees-keep-running-and-keep-dispatching)
+- [100. Redis status writes are read-modify-write](#100-redis-status-writes-are-read-modify-write)
+- [101. A leaked reclaim guard makes its message unreclaimable](#101-a-leaked-reclaim-guard-makes-its-message-unreclaimable)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3610,6 +3618,142 @@ teardown can't mask the real exit.
 
 ---
 
+## Part 11 — Bugs found by a tenth review round
+
+#97 is the third round running in which a fix to the coordinator's mutual
+exclusion was itself incomplete. Each one was a narrower miss than the last, which
+is what convergence looks like — but it took a test that could actually observe
+the window to end it.
+
+### 97. The sweeper marks a node timed-out only after advancing it
+
+**Where:** `mint/worker/coordinator.py::_timeout_node`
+
+**Symptom:** A chain's next step is dispatched twice, on a canvas that timed out
+and then reported.
+
+**Root cause:** Issue #92 added `_timed_out` so a late real result would stand
+down. It was populated in the right place logically — after the timeout had
+succeeded — and the wrong place temporally:
+
+```python
+if self._claim(...) is None:
+    return
+outcome = NodeOutcome(...)
+if not await self._advance(...):     # the entire window is here
+    ...
+self._timed_out.add(key)             # too late
+```
+
+The sweeper untracks the node, then suspends for the whole of `engine.complete()`
+and the dispatch publish. A real result arriving in that window finds nothing in
+`_timed_out`, gets `None` from `_claim` — which also means "never tracked", the
+legitimate entry-node case — and completes the node again.
+
+**Why the previous round's test missed it.** It drove the two paths in sequence,
+not concurrently, and `MemoryCanvasStore` offers barely a suspension point for
+them to interleave at. The reviewer's note that "with `RedisCanvasStore` the
+window is a full round trip" is the whole finding: the in-memory store makes the
+race invisible. The new test supplies a store that blocks inside `set_result`, so
+the result handler runs while the sweeper is genuinely mid-advance.
+
+**The practical fix:** Claim before awaiting, and release the claim if the advance
+fails and the node is restored.
+
+---
+
+### 98. `_timed_out` grows without bound
+
+**Where:** `mint/worker/coordinator.py`
+
+**Root cause:** An entry is consumed by the late result it exists for — but a node
+that timed out *because its worker died* never produces one. A long-running
+coordinator accumulates one tuple per such node for the process lifetime.
+
+**The practical fix:** An insertion-ordered map capped at `MAX_TIMED_OUT`,
+evicting the oldest. The trade is explicit: a result arriving after 10,000 further
+timeouts can double-complete. That is worth stating rather than pretending the set
+is exact, because the alternative is a leak that only shows up in production.
+
+---
+
+### 99. Cancelled subtrees keep running and keep dispatching
+
+**Where:** `mint/worker/canvas/engine.py`
+
+**Symptom:** Work inside a cancelled branch keeps executing, and its side effects
+happen after the cancellation was recorded.
+
+**Root cause:** Two gaps that only bite together. `cancel_nodes` writes CANCELLED
+on the nodes it is given — and a compound leg's *children* are not among them. And
+`_complete` gates on canvas status but never on the completing node's own.
+
+Confirmed with a chain `root=[grp, tail]` under CONTINUE, where `grp` is a
+PROPAGATE group over `[a, B]` and `B` is a chain `[b1, b2]`. When `a` errors, `B`
+is marked CANCELLED but `b1`/`b2` are not, and the canvas stays RUNNING because
+`root` continues. The already-dispatched `b1` then completes, and the engine
+happily dispatches `b2`.
+
+**The practical fix:** Cancellation walks the subtree (children, and a group's
+callback), and `_complete` discards an outcome for a node that is already
+CANCELLED — recording it would overwrite the status that says why it stopped.
+
+---
+
+### 100. Redis status writes are read-modify-write
+
+**Where:** `mint/worker/stores/redis.py::mark_node_running`, `::cancel_nodes`
+
+**Symptom:** A cancelled node comes back as RUNNING; a finished leg is stamped
+CANCELLED.
+
+**Root cause:** `mark_node_running` did `get_node` → check PENDING →
+`set_node_status`, which re-reads and writes again. `ICanvasStore.mark_node_running`
+promises, in as many words, that "a stale delivery for a node an `ErrorPolicy.ABORT`
+already CANCELLED must not resurrect it as RUNNING" — and that held only within a
+single process. This store *is* the multi-process configuration; `MemoryCanvasStore`
+does the same work under a lock, which is why the guarantee looked satisfied.
+
+**The practical fix:** One Lua compare-and-set, given the allowed source statuses:
+
+```lua
+local node = cjson.decode(raw)
+for i = 2, #ARGV do
+    if node['status'] == ARGV[i] then allowed = true end
+end
+if not allowed then return 0 end
+node['status'] = ARGV[1]
+redis.call('SET', KEYS[1], cjson.encode(node))
+```
+
+`cancel_nodes` uses it too, allowing only PENDING/RUNNING — a leg that genuinely
+FINISHED before the cancellation reached it did run, and saying otherwise is a
+lie. The `cjson` round trip re-encodes the whole node, so a container test checks
+that every other field survives intact; that was the risk worth verifying against
+a real server rather than a mock.
+
+---
+
+### 101. A leaked reclaim guard makes its message unreclaimable
+
+**Where:** `mint/worker/brokers/redis.py::RedisStreamDelivery`
+
+**Symptom:** One message becomes permanently invisible: unacked, and never
+redelivered.
+
+**Root cause:** Issue #70's `_inflight_ids` guard was cleared in `_retire`, which
+only runs on a *successful* settle. But `Worker._safe_retry_or_drop` logs a
+failing nack rather than raising — deliberately, so a broker hiccup can't take
+down the handler. The id therefore stays in the set forever, and `_reclaim` skips
+that pending entry on every future `XAUTOCLAIM` pass. With one consumer on the
+topic, nothing else will ever pick it up.
+
+**The practical fix:** Release in a `finally`, settled or not. If the settle
+failed the message is still in the PEL, which is exactly when it *should* be
+reclaimable.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -3769,3 +3913,18 @@ adding a new broker, executor, or engine transition:
   a separate record, not a cleverer inference (issue #92).
 - **The in-memory broker is part of the contract.** It backs the whole fast lane,
   so a rule it doesn't implement is a rule the tests can't see (issue #95).
+- **The in-memory *store* hides races for the same reason.** It has no real
+  suspension points, so a test written against it can drive two paths in sequence
+  and call that concurrency. Where the race is the point, make the store block
+  (issue #97).
+- **A guard placed after the `await` it protects guards nothing.** Claim before
+  suspending, and release the claim if the work fails (issue #97).
+- **Bound anything that only shrinks on a happy path.** `_timed_out` entries are
+  consumed by a result that, for a dead worker, never arrives (issue #98).
+- **Cancelling a container means cancelling what it contains.** Marking the node
+  alone leaves its children running and dispatching (issue #99).
+- **A guarantee a Protocol documents has to hold in the deployment that Protocol
+  exists for.** The lock in the in-memory store made a multi-process race look
+  solved (issue #100).
+- **Release a resource in a `finally`, not on the success path** — especially
+  where the failure is deliberately swallowed elsewhere (issue #101).

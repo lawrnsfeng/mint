@@ -986,3 +986,39 @@ class TestNodeIsObservablyRunning:
         recorded = await store.get_result(CANVAS, "t1")
         assert recorded is not None
         assert recorded.status == NodeStatus.FINISHED
+
+
+class TestConcurrencySlotIsAlwaysReleased:
+    """A slot must come back even if the handler task never starts."""
+
+    async def test_a_task_cancelled_before_it_starts_still_frees_its_slot(self) -> None:
+        """`_handle`'s finally never runs for a task cancelled before its first step.
+
+        The drain timeout does exactly that, so releasing there cost the worker a
+        slot permanently. A done-callback fires whatever became of the task.
+        """
+
+        class SingleSlotWorker(DoublingWorker):
+            max_concurrency = 1
+
+        worker = SingleSlotWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._slots.acquire()
+        task = asyncio.create_task(
+            worker._handle(
+                envelope_delivery(broker, "t1", CANVAS, '{"value": 5}'),
+                binding,
+            ),
+        )
+        worker._inflight.add(task)
+        task.add_done_callback(worker._settle_slot)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        assert worker._slots.locked() is False
+        assert worker._inflight == set()

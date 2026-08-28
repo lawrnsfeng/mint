@@ -9,13 +9,19 @@ canvas engine, and executor at ``register()`` time.
 import asyncio
 import contextlib
 import signal
+from collections.abc import Awaitable, Callable
 from functools import partial
 from typing import Any, Final
 
 from mint.logger import get_logger
 from mint.worker.brokers.interface import IBroker
 from mint.worker.canvas.engine import CanvasEngine
-from mint.worker.exc import AppAlreadyRunningError, DuplicateTopicError, MissingWorkerConfigError
+from mint.worker.exc import (
+    AppAlreadyRunningError,
+    AppAlreadyShutDownError,
+    DuplicateTopicError,
+    MissingWorkerConfigError,
+)
 from mint.worker.executors.inline import InlineExecutor
 from mint.worker.executors.interface import IClosableExecutor, ITaskExecutor
 from mint.worker.stores.interface import ICanvasStore
@@ -56,6 +62,7 @@ class WorkerApp:
         self._workers: dict[str, Worker[Any, Any]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._running = False
+        self._shut_down = False
         self._stop_event = asyncio.Event()
 
     def register(self, worker: Worker[Any, Any]) -> None:
@@ -81,6 +88,12 @@ class WorkerApp:
         """Run every registered worker until stopped (SIGTERM/SIGINT or ``stop()``)."""
         if self._running:
             raise AppAlreadyRunningError
+        if self._shut_down:
+            # Shutdown closed the broker, the store and every closable executor, and
+            # nothing here reopens them — a second run would start consume loops that
+            # immediately hit a closed transport and exit, processing nothing while
+            # looking healthy. Fail loudly instead of pretending.
+            raise AppAlreadyShutDownError
         self._running = True
         self._tasks = {topic: asyncio.create_task(w.run()) for topic, w in self._workers.items()}
         for topic, task in self._tasks.items():
@@ -147,16 +160,29 @@ class WorkerApp:
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         await self._drain_workers()
-        for worker in self._workers.values():
-            await worker.close_consumer()
-        await self.broker.close()
-        await self.store.close()
-        await self._close_executors()
-        self._remove_signal_handlers()
-        for worker in self._workers.values():
-            worker.resume_consuming()
-        self._running = False
-        self._stop_event.clear()
+        try:
+            for worker in self._workers.values():
+                await self._safe_close(worker.close_consumer, "worker consumer")
+            await self._safe_close(self.broker.close, "broker")
+            await self._safe_close(self.store.close, "store")
+            await self._safe_close(self._close_executors, "executors")
+        finally:
+            # In a finally, and each close isolated: one raising teardown must not
+            # skip these. Leaving the signal handlers installed makes the process
+            # uninterruptible (bug #78), and leaving _running set makes every later
+            # run() raise AppAlreadyRunningError instead of the honest error.
+            self._remove_signal_handlers()
+            self._running = False
+            self._shut_down = True
+            self._stop_event.clear()
+
+    @staticmethod
+    async def _safe_close(close: Callable[[], Awaitable[None]], what: str) -> None:
+        """Run one teardown step, logging rather than raising."""
+        try:
+            await close()
+        except Exception:
+            logger.exception("Failed to close cleanly during shutdown", component=what)
 
     def _remove_signal_handlers(self) -> None:
         """Hand SIGTERM/SIGINT back to whatever owned them before ``run()``.
@@ -201,4 +227,8 @@ class WorkerApp:
             if worker.executor is not None:
                 executors[id(worker.executor)] = worker.executor
         closable = [e for e in executors.values() if isinstance(e, IClosableExecutor)]
-        await asyncio.gather(*(e.aclose() for e in closable))
+        # return_exceptions: one executor failing to close must not abandon the rest.
+        results = await asyncio.gather(*(e.aclose() for e in closable), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.error("Executor failed to close", error=repr(result))

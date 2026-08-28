@@ -157,6 +157,25 @@ class AppAlreadyRunningError(WorkerError):
 
 
 @dataclass
+class AppAlreadyShutDownError(WorkerError):
+    """WorkerApp.run() was called after the app had already shut down.
+
+    Shutdown closes the broker, the store and every closable executor, and nothing
+    reopens them — so a second run would consume nothing at all. Restarting means a
+    new app over fresh connections.
+    """
+
+    TEMPLATE = "WorkerApp has already shut down; build a new one to run again"
+
+
+@dataclass
+class CoordinatorAlreadyShutDownError(WorkerError):
+    """Coordinator.run() was called after the coordinator had already shut down."""
+
+    TEMPLATE = "Coordinator has already shut down; build a new one to run again"
+
+
+@dataclass
 class CoordinatorAlreadyRunningError(WorkerError):
     """Coordinator.run() was called while it was already running."""
 

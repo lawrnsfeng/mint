@@ -12,7 +12,12 @@ from mint.worker.app import WorkerApp
 from mint.worker.brokers.memory import MemoryBroker
 from mint.worker.canvas.models import TaskNode
 from mint.worker.envelope import Envelope
-from mint.worker.exc import AppAlreadyRunningError, DuplicateTopicError, MissingWorkerConfigError
+from mint.worker.exc import (
+    AppAlreadyRunningError,
+    AppAlreadyShutDownError,
+    DuplicateTopicError,
+    MissingWorkerConfigError,
+)
 from mint.worker.executors.inline import InlineExecutor
 from mint.worker.stores.memory import MemoryCanvasStore
 from mint.worker.worker import Worker
@@ -345,18 +350,20 @@ class TestShutdownKeepsTheTransportAliveForDraining:
         assert order == ["drain", "close_consumer"]
 
 
-class TestAppCanRunAgain:
-    """_shutdown resets the app's own state, so a worker's must be reset too."""
+class TestAppIsSingleUse:
+    """Shutdown closes the broker, store and executors, and nothing reopens them."""
 
-    async def test_a_second_run_still_consumes(self) -> None:
-        """A worker's stop flag must be cleared along with the app's own state.
+    async def test_running_again_after_shutdown_is_refused(self) -> None:
+        """A second run consumed nothing while looking perfectly healthy.
 
-        `Worker._stopped` was never cleared, so every worker nacked its first
-        delivery and exited immediately on the second run, taking the app with it.
+        The consume loops start, immediately hit the closed transport, and exit;
+        `_on_worker_exit` then stops the app again. The previous version of this
+        test asserted only `_running is True` — which passes, because `run()` sets
+        it before the loops die. Asserting the wrong thing is why the half-fix
+        survived a round.
         """
         app = WorkerApp(MemoryBroker(), MemoryCanvasStore())
-        worker = SignalingWorker()
-        app.register(worker)
+        app.register(SignalingWorker())
 
         first = asyncio.create_task(app.run())
         await asyncio.sleep(0)
@@ -364,14 +371,33 @@ class TestAppCanRunAgain:
         async with asyncio.timeout(2.0):
             await first
 
-        assert worker._stopped.is_set() is False
+        with pytest.raises(AppAlreadyShutDownError):
+            await app.run()
 
-        second = asyncio.create_task(app.run())
+    async def test_a_failing_close_still_releases_the_signal_handlers(self) -> None:
+        """One raising teardown must not leave the process uninterruptible.
+
+        Without isolation, a broker whose close() raises skips handler removal and
+        the state reset — re-opening bug #78 and wedging `_running` at True.
+        """
+
+        class RefusingBroker(MemoryBroker):
+            async def close(self) -> None:
+                detail = "close refused"
+                raise ConnectionResetError(detail)
+
+        app = WorkerApp(RefusingBroker(), MemoryCanvasStore())
+        app.register(SignalingWorker())
+
+        run_task = asyncio.create_task(app.run())
         await asyncio.sleep(0)
-        assert app._running is True
         await app.stop()
         async with asyncio.timeout(2.0):
-            await second
+            await run_task
+
+        assert app._running is False
+        loop = asyncio.get_running_loop()
+        assert loop.remove_signal_handler(signal.SIGTERM) is False
 
 
 class TestSignalHandlersAreReleased:

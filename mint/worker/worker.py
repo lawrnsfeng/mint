@@ -165,16 +165,6 @@ class Worker[T: BaseModel, RT: BaseModel]:
         """Stop pulling new messages; in-flight handling continues until ``drain()``."""
         self._stopped.set()
 
-    def resume_consuming(self) -> None:
-        """Clear the stop flag so this worker can run again.
-
-        ``WorkerApp._shutdown`` resets its own state for a restart, and ``run()``'s
-        ``AppAlreadyRunningError`` guard implies restarting is allowed — but a
-        worker whose ``_stopped`` was never cleared nacks its first delivery and
-        exits immediately on the second run, taking the app down with it.
-        """
-        self._stopped = asyncio.Event()
-
     async def close_consumer(self) -> None:
         """Release the broker resources this worker's consume loop holds.
 
@@ -222,7 +212,17 @@ class Worker[T: BaseModel, RT: BaseModel]:
             await self._slots.acquire()
             task = asyncio.create_task(self._handle(delivery, binding))
             self._inflight.add(task)
-            task.add_done_callback(self._inflight.discard)
+            task.add_done_callback(self._settle_slot)
+
+    def _settle_slot(self, task: asyncio.Task[None]) -> None:
+        """Release this handler's concurrency slot, whatever became of it.
+
+        A done-callback rather than ``_handle``'s ``finally``: a task cancelled
+        before its coroutine body ever starts — which the drain timeout can do —
+        never runs that ``finally``, permanently costing the worker one slot.
+        """
+        self._inflight.discard(task)
+        self._slots.release()
 
     def _require_binding(self) -> WorkerBinding:
         if self._binding is None:
@@ -259,8 +259,6 @@ class Worker[T: BaseModel, RT: BaseModel]:
                 # would otherwise re-run the work forever, which is the exact storm
                 # _retry_or_drop exists to stop.
                 await self._safe_retry_or_drop(delivery)
-        finally:
-            self._slots.release()
 
     async def _process_delivery(
         self,

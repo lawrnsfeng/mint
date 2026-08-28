@@ -18,6 +18,7 @@ waiting a result for" purely in memory.
 import asyncio
 import contextlib
 import signal
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -30,7 +31,11 @@ from mint.worker.canvas.engine import CanvasEngine
 from mint.worker.canvas.models import ErrorInfo, NodeOutcome
 from mint.worker.enums import CanvasStatus, NodeStatus
 from mint.worker.envelope import Envelope
-from mint.worker.exc import CoordinatorAlreadyRunningError, WorkerError
+from mint.worker.exc import (
+    CoordinatorAlreadyRunningError,
+    CoordinatorAlreadyShutDownError,
+    WorkerError,
+)
 from mint.worker.stores.interface import ICanvasStore
 
 logger = get_logger(__name__)
@@ -93,6 +98,7 @@ class Coordinator:
         self._in_flight: dict[tuple[str, str], InFlightNode] = {}
         self._by_canvas: dict[str, set[str]] = {}
         self._running = False
+        self._shut_down = False
         self._stop_event = asyncio.Event()
         self._tasks: set[asyncio.Task[None]] = set()
 
@@ -125,6 +131,10 @@ class Coordinator:
         """Consume results and sweep for timeouts until stopped (SIGTERM/SIGINT or stop())."""
         if self._running:
             raise CoordinatorAlreadyRunningError
+        if self._shut_down:
+            # Same reasoning as WorkerApp: shutdown closed the broker and store, and
+            # nothing reopens them.
+            raise CoordinatorAlreadyShutDownError
         self._running = True
         self._tasks = {
             asyncio.create_task(self._consume_results()),
@@ -214,11 +224,22 @@ class Coordinator:
         for task in self._tasks:
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
-        await self.broker.close()
-        await self.store.close()
-        self._remove_signal_handlers()
-        self._running = False
-        self._stop_event.clear()
+        try:
+            await self._safe_close(self.broker.close, "broker")
+            await self._safe_close(self.store.close, "store")
+        finally:
+            self._remove_signal_handlers()
+            self._running = False
+            self._shut_down = True
+            self._stop_event.clear()
+
+    @staticmethod
+    async def _safe_close(close: Callable[[], Awaitable[None]], what: str) -> None:
+        """Run one teardown step, logging rather than raising."""
+        try:
+            await close()
+        except Exception:
+            logger.exception("Failed to close cleanly during shutdown", component=what)
 
     def _remove_signal_handlers(self) -> None:
         """Hand SIGTERM/SIGINT back; ``add_signal_handler`` is loop-global."""
@@ -237,14 +258,22 @@ class Coordinator:
         stalled with no error anywhere.
         """
         async for delivery in self.broker.consume(self.results_topic):
+            settled = False
             try:
-                await self._handle_result(delivery)
+                settled = await self._handle_result(delivery)
             except asyncio.CancelledError:
-                await self._safe_nack(delivery)
+                # Only nack what was never settled. Cancellation can land after the
+                # ack, and nacking a settled delivery double-settles it — on RabbitMQ
+                # that republishes *and* acks again, re-running a node whose canvas
+                # already advanced. Worker._handle carries the same flag for the same
+                # reason; this loop was missing it.
+                if not settled:
+                    await self._safe_nack(delivery)
                 raise
             except Exception:
                 logger.exception("Unhandled error handling a result", topic=self.results_topic)
-                await self._safe_nack(delivery)
+                if not settled:
+                    await self._safe_nack(delivery)
 
     async def _safe_nack(self, delivery: Delivery) -> None:
         """Retry-or-drop this delivery, logging rather than raising.
@@ -258,15 +287,16 @@ class Coordinator:
         except Exception:
             logger.exception("Failed to nack a result", topic=self.results_topic)
 
-    async def _handle_result(self, delivery: Delivery) -> None:
+    async def _handle_result(self, delivery: Delivery) -> bool:
+        """Handle one result. Returns whether the delivery was settled (acked/nacked)."""
         envelope = self._decode_envelope(delivery.body)
         if envelope is None:
             await delivery.nack(requeue=False)
-            return
+            return True
         outcome = self._decode_outcome(envelope)
         if outcome is None:
             await delivery.nack(requeue=False)
-            return
+            return True
 
         # Claimed before advancing, and restored if that fails. Untracking is the
         # mutual exclusion against the sweeper (see _timeout_node), so it has to
@@ -283,8 +313,9 @@ class Coordinator:
         ):
             self._restore(claim)
             await self._retry_or_drop(delivery, envelope.node_id)
-            return
+            return True
         await delivery.ack()
+        return True
 
     async def _retry_or_drop(self, delivery: Delivery, node_id: str | None) -> None:
         """Requeue this result, or dead-letter it once ``max_attempts`` is spent.

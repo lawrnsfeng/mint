@@ -39,9 +39,18 @@ class ThreadPoolExecutor[T, RT]:
         return await loop.run_in_executor(self._pool, self._run_to_completion, fn, input_)
 
     async def aclose(self) -> None:
-        """Shut down the pool, if this executor built it. Never called from ``__del__``."""
-        if self._owns_pool:
-            self._pool.shutdown()
+        """Shut down the pool, if this executor built it. Never called from ``__del__``.
+
+        Off the event loop, and cancelling what has not started. ``shutdown()``
+        defaults to ``wait=True`` and blocks its caller — called directly from
+        ``WorkerApp._shutdown`` it blocks the *loop*, so a single hung thread
+        turns a graceful shutdown into an unkillable one. Cancelling a
+        ``run_in_executor`` future does not cancel the underlying work, so the
+        drain timeout leaves exactly that behind.
+        """
+        if not self._owns_pool:
+            return
+        await asyncio.to_thread(self._pool.shutdown, cancel_futures=True)
 
     @staticmethod
     def _run_to_completion(fn: Callable[[T], Awaitable[RT]], input_: T) -> RT:

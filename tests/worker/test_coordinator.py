@@ -21,7 +21,7 @@ from mint.worker.canvas.models import ChainNode, ErrorInfo, NodeOutcome, TaskNod
 from mint.worker.coordinator import Coordinator, CoordinatorConfig, InFlightNode
 from mint.worker.enums import CanvasStatus, ErrorPolicy, NodeStatus
 from mint.worker.envelope import Envelope
-from mint.worker.exc import CoordinatorAlreadyRunningError
+from mint.worker.exc import CoordinatorAlreadyRunningError, CoordinatorAlreadyShutDownError
 from mint.worker.stores.memory import MemoryCanvasStore
 
 CANVAS = "c1"
@@ -543,21 +543,20 @@ class TestShutdownReleasesResources:
 
         assert coordinator._running is False
 
-    async def test_an_instance_can_run_again_after_a_clean_shutdown(self) -> None:
-        """The stop event is cleared once serviced, so a stopped instance is reusable."""
+    async def test_running_again_after_shutdown_is_refused(self) -> None:
+        """Shutdown closed the broker and store, and nothing reopens them.
+
+        A second run would consume nothing at all while looking healthy, so it
+        fails loudly instead.
+        """
         coordinator = Coordinator(MemoryBroker(), MemoryCanvasStore(), RESULTS_TOPIC)
         first = asyncio.create_task(coordinator.run())
         await coordinator.stop()
         async with asyncio.timeout(1.0):
             await first
 
-        second = asyncio.create_task(coordinator.run())
-        await asyncio.sleep(0)
-        assert coordinator._running is True
-
-        await coordinator.stop()
-        async with asyncio.timeout(1.0):
-            await second
+        with pytest.raises(CoordinatorAlreadyShutDownError):
+            await coordinator.run()
 
 
 class FailFirstResultCoordinator(Coordinator):
@@ -581,14 +580,14 @@ class FailFirstResultCoordinator(Coordinator):
         self.handled: list[str] = []
         self.second_call = asyncio.Event()
 
-    async def _handle_result(self, delivery: Delivery) -> None:
+    async def _handle_result(self, delivery: Delivery) -> bool:
         """Raise on the first call, behave normally afterwards."""
         self.handled.append("call")
         if len(self.handled) == 1:
             detail = "ack failed"
             raise ConnectionResetError(detail)
         self.second_call.set()
-        await super()._handle_result(delivery)
+        return await super()._handle_result(delivery)
 
 
 class TestResultLoopSurvivesOneBadDelivery:

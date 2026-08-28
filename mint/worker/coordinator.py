@@ -394,15 +394,19 @@ class Coordinator:
         except WorkerError:
             logger.exception("Canvas engine error advancing node", node_id=node_id)
             return False
+        published = False
         try:
             await self.dispatch(dispatches, trace_id)
+            published = True
         except Exception:
             logger.exception("Failed to publish dispatch", node_id=node_id)
-            # Same reasoning as Worker._advance_canvas: a burned fan-in guard must be
-            # released or the redelivery this False triggers dispatches nothing.
-            await self.engine.rollback(dispatches)
-            return False
-        return True
+        finally:
+            if not published:
+                # Same reasoning as Worker._advance_canvas, including why this is a
+                # `finally`: `except Exception` misses the CancelledError a shutdown
+                # raises, and a guard burned without a rollback loses the dispatch.
+                await self.engine.rollback(dispatches)
+        return published
 
     def _decode_envelope(self, body: bytes) -> Envelope | None:
         try:

@@ -270,3 +270,35 @@ class TestCancelNodesMatchesRedis:
         node = await store.get_node("c1", "t1")
         assert node is not None
         assert node.status == NodeStatus.CANCELLED
+
+
+class TestSetNodeStatusMatchesRedis:
+    """The last unguarded status write, and the one that loses a race."""
+
+    async def test_a_terminal_status_is_not_overwritten(self) -> None:
+        """Concurrent handler tasks are exactly what this store's lock exists for.
+
+        Task A reads a node as RUNNING inside `_complete`, task B's ABORT cancels
+        it, and A's `_record` stamps it back to FINISHED — after which `_complete`'s
+        CANCELLED guard never fires. Under Redis it would not.
+        """
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+        await store.cancel_nodes("c1", ["t1"])
+
+        await store.set_node_status("c1", "t1", NodeStatus.FINISHED)
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.CANCELLED
+
+    async def test_a_pending_node_still_transitions(self) -> None:
+        """The guard must not stop ordinary progress."""
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+
+        await store.set_node_status("c1", "t1", NodeStatus.FINISHED)
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.FINISHED

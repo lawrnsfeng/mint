@@ -8,6 +8,7 @@ collisions, publish ordering) live in test_builder.py instead.
 
 import asyncio
 import sys
+from collections.abc import Sequence
 
 import pytest
 
@@ -1553,3 +1554,132 @@ class TestAbortRecordsBeforeTheCanvasGoesTerminal:
         await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
 
         assert order.index("record") < order.index("canvas:error")
+
+
+class TestGuardsAreReleasedWhenTheWalkFails:
+    """A guard burned mid-walk stays burned unless something releases it."""
+
+    async def _chord(self, store: MemoryCanvasStore) -> None:
+        await seed(
+            store,
+            task("leg1", "g"),
+            task("cb", "g", topic="callback"),
+            GroupNode(
+                id="g",
+                canvas_id=CANVAS,
+                parent_id=None,
+                children=["leg1"],
+                callback="cb",
+            ),
+        )
+
+    async def test_a_driver_error_after_the_guard_is_burned_releases_it(self) -> None:
+        """Only WorkerError is handled; a Redis blip escapes to the caller's catch-all.
+
+        The redelivery that catch-all triggers then finds the guard burned,
+        dispatches nothing, and acks — the canvas stays RUNNING with its callback
+        never sent.
+        """
+        failures: list[int] = []
+
+        class BlippingStore(MemoryCanvasStore):
+            async def get_results(
+                self,
+                canvas_id: str,
+                node_ids: Sequence[str],
+            ) -> dict[str, NodeOutcome]:
+                # Called immediately after mark_child_done has burned the guard.
+                if not failures:
+                    failures.append(1)
+                    detail = "redis blip"
+                    raise ConnectionError(detail)
+                return await super().get_results(canvas_id, node_ids)
+
+        store = BlippingStore()
+        engine = CanvasEngine(store)
+        await self._chord(store)
+
+        with pytest.raises(ConnectionError):
+            await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+
+        # The redelivery must still be able to fire the callback.
+        dispatches = await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+        assert len(dispatches) == 1
+        assert dispatches[0].node_id == "cb"
+
+    async def test_a_successful_walk_does_not_release_its_guards(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Releasing on success would let a redelivery fire the callback twice."""
+        await self._chord(store)
+
+        first = await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+        second = await engine.complete(CANVAS, "leg1", ok_outcome("leg1"))
+
+        assert len(first) == 1
+        assert second == []
+
+
+class TestCallbackFailureHonoursTheGroupPolicy:
+    """error_policy was only ever consulted for leg completions."""
+
+    async def _nested(self, store: MemoryCanvasStore, policy: ErrorPolicy) -> None:
+        await seed(
+            store,
+            task("a", "inner"),
+            task("icb", "inner", topic="inner-callback"),
+            GroupNode(
+                id="inner",
+                canvas_id=CANVAS,
+                parent_id="outer",
+                children=["a"],
+                callback="icb",
+                error_policy=policy,
+            ),
+            task("sibling", "outer"),
+            task("ocb", "outer", topic="outer-callback"),
+            GroupNode(
+                id="outer",
+                canvas_id=CANVAS,
+                parent_id=None,
+                children=["inner", "sibling"],
+                callback="ocb",
+                error_policy=ErrorPolicy.CONTINUE,
+            ),
+        )
+
+    async def test_a_callback_failing_under_abort_stops_the_canvas(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """ABORT promises nothing further dispatches; it silently became PROPAGATE.
+
+        The inner group bubbled the failure, the outer chord carried on under
+        CONTINUE, and its own callback fired.
+        """
+        await self._nested(store, ErrorPolicy.ABORT)
+        await engine.complete(CANVAS, "sibling", ok_outcome("sibling"))
+        await engine.complete(CANVAS, "a", ok_outcome("a"))
+
+        dispatches = await engine.complete(CANVAS, "icb", err_outcome("icb"))
+
+        assert dispatches == []
+        assert await store.get_canvas_status(CANVAS) == CanvasStatus.ERROR
+
+    async def test_a_callback_failing_under_propagate_still_bubbles(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """PROPAGATE coincided with the old behaviour and must keep working."""
+        await self._nested(store, ErrorPolicy.PROPAGATE)
+        await engine.complete(CANVAS, "sibling", ok_outcome("sibling"))
+        await engine.complete(CANVAS, "a", ok_outcome("a"))
+
+        dispatches = await engine.complete(CANVAS, "icb", err_outcome("icb"))
+
+        assert len(dispatches) == 1
+        assert dispatches[0].node_id == "ocb"

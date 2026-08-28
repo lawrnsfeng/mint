@@ -561,3 +561,31 @@ class TestReclaimGuardIsReleasedEvenOnFailure:
         await delivery.ack()
 
         assert (TOPIC, b"5-1") not in broker._inflight_ids
+
+
+class TestDeadLetterChainTerminates:
+    """Every other broker in the package stops at one level; this one did not."""
+
+    async def test_dead_lettering_from_a_dlq_stream_writes_nothing(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """A worker reprocessing `orders.dlq` would otherwise create `orders.dlq.dlq`."""
+        entry = StreamEntry(f"{TOPIC}{RedisBroker.DLQ_SUFFIX}", b"1-1", b"body", 1)
+
+        await broker.deadletter(entry)
+
+        mock_client.xadd.assert_not_awaited()
+        mock_client.xack.assert_awaited_once()
+
+    async def test_dead_lettering_from_a_normal_stream_still_writes(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """The guard must only catch the terminal case."""
+        await broker.deadletter(StreamEntry(TOPIC, b"1-1", b"body", 1))
+
+        mock_client.xadd.assert_awaited_once()
+        assert mock_client.xadd.await_args.args[0] == f"{TOPIC}{RedisBroker.DLQ_SUFFIX}"

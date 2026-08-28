@@ -244,3 +244,23 @@ class TestAtomicStatusTransitions:
         assert node.input == '{"tenant":"acme"}'
         assert node.parent_id == "chain"
         assert node.status == NodeStatus.RUNNING
+
+    async def test_a_transition_keeps_an_existing_ttl(self, store: RedisCanvasStore) -> None:
+        """A bare SET drops the key's expiry, which leaks the node key permanently.
+
+        A terminal canvas has already expired every key it tracks; a still-queued
+        message for a node that is nonetheless PENDING would clear the TTL just
+        applied, and `complete()` then short-circuits so nothing re-expires it —
+        with the registry that referenced it already gone.
+        """
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic")},
+        )
+        key = store._node_key(CANVAS, "t1")
+        await store.client.expire(key, 3600)
+        assert await store.client.ttl(key) > 0
+
+        await store.mark_node_running(CANVAS, "t1")
+
+        assert await store.client.ttl(key) > 0

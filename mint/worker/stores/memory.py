@@ -53,11 +53,20 @@ class MemoryCanvasStore:
         return self._nodes.get((canvas_id, node_id))
 
     async def set_node_status(self, canvas_id: str, node_id: str, status: NodeStatus) -> None:
-        """Update a node's status. A no-op if the node does not exist."""
+        """Move a node to ``status`` from a non-terminal one. A no-op otherwise.
+
+        Guarded exactly as ``RedisCanvasStore.set_node_status`` is. Concurrent
+        handler tasks are the whole reason this store takes a lock, so the race is
+        reachable here too: task A reads node N as RUNNING inside `_complete`, task
+        B's ABORT cancels N, and A's `_record` then stamps N back to FINISHED —
+        after which `_complete`'s CANCELLED guard never fires and the engine advances
+        a branch it had given up on. Under Redis it would not, and a stand-in store
+        that diverges makes every test written against it prove the wrong thing.
+        """
         async with self._lock:
             key = (canvas_id, node_id)
             node = self._nodes.get(key)
-            if node is None:
+            if node is None or node.status not in (NodeStatus.PENDING, NodeStatus.RUNNING):
                 return
             self._nodes[key] = node.model_copy(update={"status": status})
 

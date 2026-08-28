@@ -34,6 +34,11 @@ from mint.worker.stores.interface import GroupProgress
 # multi-process configuration by definition: an ABORT cancelling a node between
 # another process's PENDING check and its RUNNING write is silently overwritten,
 # which is exactly the guarantee ICanvasStore.mark_node_running documents.
+#
+# KEEPTTL because a bare SET drops the key's expiry. A terminal canvas has already
+# expired every key it tracks, and a still-queued message for a node that is
+# nonetheless PENDING would clear the TTL just applied — leaving the key alive
+# forever, with the registry that referenced it already gone.
 SET_STATUS_SCRIPT: Final[str] = """
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
@@ -44,7 +49,7 @@ for i = 2, #ARGV do
 end
 if not allowed then return 0 end
 node['status'] = ARGV[1]
-redis.call('SET', KEYS[1], cjson.encode(node))
+redis.call('SET', KEYS[1], cjson.encode(node), 'KEEPTTL')
 return 1
 """
 

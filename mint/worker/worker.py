@@ -397,17 +397,27 @@ class Worker[T: BaseModel, RT: BaseModel]:
             logger.exception("Canvas engine error advancing node", node_id=envelope.node_id)
             return False
 
+        published = False
         try:
             for dispatch in dispatches:
                 envelope_out = dispatch.to_envelope(trace_id=envelope.trace_id)
                 await binding.broker.publish(dispatch.topic, envelope_out.to_bytes())
+            published = True
         except Exception:
             logger.exception("Failed to publish dispatch", node_id=envelope.node_id)
-            # Release any fan-in guard complete() burned to authorise these dispatches,
-            # so the redelivery this False triggers can actually produce them again.
-            await binding.engine.rollback(dispatches)
-            return False
-        return True
+        finally:
+            if not published:
+                # A `finally`, not an `except Exception` — which does not catch
+                # CancelledError, and the drain timeout raises exactly that. A chord's
+                # callback dispatch cancelled mid-publish would otherwise leave the
+                # group's guard burned with no rollback: after restart the redelivery
+                # finds fired=False, dispatches nothing, and acks. The callback is lost
+                # on an ordinary graceful shutdown.
+                #
+                # Awaiting here is safe: a plain await in a finally completes normally
+                # after CancelledError has been delivered (verified, not assumed).
+                await binding.engine.rollback(dispatches)
+        return published
 
     async def _report_result(
         self,

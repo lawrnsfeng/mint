@@ -32,7 +32,10 @@ from uuid import uuid4
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
+from mint.logger import get_logger
 from mint.worker.enums import DeliveryGuarantee
+
+logger = get_logger(__name__)
 
 BUSYGROUP_MARKER: Final[str] = "BUSYGROUP"
 
@@ -278,6 +281,16 @@ class RedisBroker:
         Same ordering as ``redeliver``, for the same reason: write first, retire
         second, so a crash duplicates rather than drops.
         """
+        if entry.topic.endswith(self.DLQ_SUFFIX):
+            # Terminate rather than extend, as every other broker here does. A worker
+            # pointed at `orders.dlq` to reprocess failures would otherwise create and
+            # write an `orders.dlq.dlq` stream once a message exhausted max_attempts.
+            logger.warning(
+                "Dropping a message already on a dead-letter stream",
+                topic=entry.topic,
+            )
+            await self._retire(entry)
+            return
         fields = _stream_fields(entry.body, entry.headers)
         await self.client.xadd(f"{entry.topic}{self.DLQ_SUFFIX}", fields)
         await self._retire(entry)

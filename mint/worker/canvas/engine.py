@@ -133,7 +133,40 @@ class CanvasEngine:
         # Every group guard burned during this walk, so a caller whose publish fails
         # can release all of them rather than only the one that dispatched.
         claimed: list[str] = []
-        current_id, current_outcome, parent_id = node_id, outcome, node.parent_id
+        try:
+            return await self._walk(canvas_id, node, outcome, visited, claimed)
+        except BaseException:
+            # A guard burned mid-walk stays burned unless something releases it. Only
+            # WorkerError is handled above; a driver-level error (a Redis blip during
+            # `_record`, say) escapes to the caller's catch-all, which requeues — and
+            # the redelivery then finds the guard burned, dispatches nothing, and acks.
+            # The canvas is RUNNING forever with its callback never sent. This is the
+            # same release `rollback()` performs for a failed publish.
+            await self._release(canvas_id, claimed)
+            raise
+
+    async def _release(self, canvas_id: str, group_ids: Sequence[str]) -> None:
+        """Release fan-in guards, never masking the failure that prompted it."""
+        for group_id in group_ids:
+            try:
+                await self.store.reset_group_fired(canvas_id, group_id)
+            except Exception:
+                logger.exception(
+                    "Could not release a fan-in guard",
+                    canvas_id=canvas_id,
+                    group_id=group_id,
+                )
+
+    async def _walk(
+        self,
+        canvas_id: str,
+        node: AnyNode,
+        outcome: NodeOutcome,
+        visited: set[str],
+        claimed: list[str],
+    ) -> list[Dispatch]:
+        """Walk from a completed node up to its root, dispatching whatever comes next."""
+        current_id, current_outcome, parent_id = node.id, outcome, node.parent_id
 
         while parent_id is not None:
             if parent_id in visited:
@@ -154,7 +187,7 @@ class CanvasEngine:
                     )
                 case GroupNode() if current_id == parent.callback:
                     dispatch = None
-                    bubbled = current_outcome.model_copy(update={"node_id": parent.id})
+                    bubbled = await self._callback_outcome(canvas_id, parent, current_outcome)
                 case GroupNode():
                     dispatch, bubbled = await self._advance_group(
                         canvas_id,
@@ -399,6 +432,30 @@ class CanvasEngine:
                 canvas_id=canvas_id,
             )
         return node
+
+    async def _callback_outcome(
+        self,
+        canvas_id: str,
+        group: GroupNode,
+        outcome: NodeOutcome,
+    ) -> NodeOutcome | None:
+        """Turn a callback's own outcome into its group's, honouring the error policy.
+
+        ``error_policy`` was only ever consulted for *leg* completions, so a group
+        whose callback failed bubbled that failure regardless — which happens to
+        match PROPAGATE, and silently downgrades ABORT to it. ABORT promises to mark
+        the whole canvas ERROR immediately so nothing further dispatches; without
+        this an enclosing CONTINUE container carried on and fired its own callback.
+        """
+        if outcome.status == NodeStatus.ERROR and group.error_policy == ErrorPolicy.ABORT:
+            await self._record(
+                canvas_id,
+                group.id,
+                NodeOutcome(node_id=group.id, status=NodeStatus.ERROR, error=outcome.error),
+            )
+            await self._abort_canvas(canvas_id, [])
+            return None
+        return outcome.model_copy(update={"node_id": group.id})
 
     async def _apply_group_error_policy(
         self,

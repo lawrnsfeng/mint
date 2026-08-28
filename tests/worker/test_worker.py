@@ -1065,3 +1065,69 @@ class TestSettlementIsRecordedBeforeTheAck:
         await asyncio.gather(task, return_exceptions=True)
 
         assert nacked == []
+
+
+class TestRollbackSurvivesCancellation:
+    """`except Exception` does not catch CancelledError, and the drain raises exactly that."""
+
+    async def test_a_cancelled_dispatch_publish_still_rolls_back(self) -> None:
+        """A chord's callback would otherwise be lost on an ordinary graceful shutdown.
+
+        The guard is burned inside `complete()`, the publish is cancelled by the
+        drain timeout, and without a rollback the redelivery finds `fired=False`,
+        dispatches nothing, and acks.
+        """
+        publishing = asyncio.Event()
+
+        class HangingPublishBroker(MemoryBroker):
+            async def publish(
+                self,
+                topic: str,
+                message: bytes,
+                *,
+                headers: Mapping[str, str] | None = None,
+            ) -> None:
+                if topic == "callback":
+                    publishing.set()
+                    await asyncio.sleep(3600)
+                await super().publish(topic, message, headers=headers)
+
+        worker = DoublingWorker()
+        broker = HangingPublishBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(
+            CANVAS,
+            {
+                "leg1": TaskNode(id="leg1", canvas_id=CANVAS, parent_id="g", topic=TOPIC),
+                "cb": TaskNode(id="cb", canvas_id=CANVAS, parent_id="g", topic="callback"),
+                "g": GroupNode(
+                    id="g",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["leg1"],
+                    callback="cb",
+                ),
+            },
+        )
+
+        task = asyncio.create_task(
+            worker._handle(
+                envelope_delivery(broker, "leg1", CANVAS, '{"value": 5}'),
+                binding,
+            ),
+        )
+        async with asyncio.timeout(NEXT_MESSAGE_TIMEOUT):
+            await publishing.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        # The guard must be released, so a healthy retry can dispatch the callback.
+        healthy = MemoryBroker()
+        retry_binding = bind_worker(worker, healthy, store)
+        await worker._handle(
+            envelope_delivery(healthy, "leg1", CANVAS, '{"value": 5}'),
+            retry_binding,
+        )
+
+        assert (await next_envelope(healthy, "callback")).node_id == "cb"

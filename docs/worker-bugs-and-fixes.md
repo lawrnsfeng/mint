@@ -146,6 +146,13 @@ is the expanded, "how do I actually fix this" version.
 - [100. Redis status writes are read-modify-write](#100-redis-status-writes-are-read-modify-write)
 - [101. A leaked reclaim guard makes its message unreclaimable](#101-a-leaked-reclaim-guard-makes-its-message-unreclaimable)
 
+**Part 12 — Bugs found by an eleventh review round**
+
+- [102. A store blip kills the coordinator and strands the swept node](#102-a-store-blip-kills-the-coordinator-and-strands-the-swept-node)
+- [103. The memory store cancels nodes the Redis store would not](#103-the-memory-store-cancels-nodes-the-redis-store-would-not)
+- [104. ABORT records its outcome after the TTL sweep has run](#104-abort-records-its-outcome-after-the-ttl-sweep-has-run)
+- [105. Kafka `publish` duplicates a caller-supplied attempt header](#105-kafka-publish-duplicates-a-caller-supplied-attempt-header)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3754,6 +3761,111 @@ reclaimable.
 
 ---
 
+## Part 12 — Bugs found by an eleventh review round
+
+This round cleared the coordinator's mutual exclusion explicitly — after three
+consecutive rounds of finding it incomplete, #97's fix held. What it found instead
+was the *other* half of that code path: what happens when the store itself fails.
+
+### 102. A store blip kills the coordinator and strands the swept node
+
+**Where:** `mint/worker/coordinator.py::_sweep_loop`, `::_timeout_node`
+
+**Symptom:** Redis hiccups for a second. The coordinator process exits, and one
+canvas is left RUNNING forever with no way to advance it.
+
+**Root cause:** `_advance` converts two things into a `False` return —
+`WorkerError` from the engine, and any exception from the dispatch publish. A
+*driver-level* error out of `engine.complete` is neither. `complete()` calls
+`store.get_canvas_status` before its own `try`, so a `redis.ConnectionError` there
+propagates straight through `_advance` and out of `_timeout_node`.
+
+Three separate consequences, each worse than the last:
+
+1. `_timeout_node` had already claimed the node — untracked it — and recorded it in
+   `_timed_out`. The raise skips the restore, so the node is invisible to every
+   future sweep.
+2. It is still in `_timed_out`, so when the real result finally arrives
+   `_handle_result` discards it and acks. The canvas can never advance.
+3. The exception unwinds `_sweep_once` and `_sweep_loop`, `_on_task_exit` (issue
+   #44) sees a task that ended on its own, and the entire coordinator shuts down.
+
+`_consume_results` was given a catch-all in issue #45 for precisely this class of
+failure. The sweeper — the other long-lived loop, three methods away — never was.
+
+**The practical fix:** A per-iteration guard on the sweep loop, and treating a
+raising `_advance` exactly like a returned `False`:
+
+```python
+try:
+    advanced = await self._advance(entry.canvas_id, entry.node_id, outcome)
+except Exception:
+    logger.exception("Timing out a node failed", node_id=entry.node_id)
+    advanced = False
+```
+
+---
+
+### 103. The memory store cancels nodes the Redis store would not
+
+**Where:** `mint/worker/stores/memory.py::cancel_nodes`
+
+**Symptom:** The same canvas ends in two different states depending on which store
+it ran against.
+
+**Root cause:** Issue #100 guarded `RedisCanvasStore.cancel_nodes` to
+`(PENDING, RUNNING)` so a leg that genuinely FINISHED keeps its record — and left
+`MemoryCanvasStore.cancel_nodes` writing CANCELLED unconditionally. The fifth
+instance in this catalogue of a rule applied to one half of a pair.
+
+It matters more than a status label: issue #99's `_cancel_subtrees` expands
+through `_descendants`, so a *grandchild* that already completed is routinely in
+the cancel list — and issue #99 also made `_complete` discard any outcome for a
+CANCELLED node, so an at-least-once redelivery of that finished step is now
+silently dropped. `CanvasEngine._unfinished` filters only direct children, which
+is why the engine can't catch this itself.
+
+**The practical fix:** The same guard, in the same words. A stand-in store that
+diverges makes every test written against it prove the wrong thing.
+
+---
+
+### 104. ABORT records its outcome after the TTL sweep has run
+
+**Where:** `mint/worker/canvas/engine.py::_advance_chain`,
+`::_apply_group_error_policy`
+
+**Symptom:** Two Redis keys per aborted container, never reclaimed.
+
+**Root cause:** Issue #94 added the container's own outcome to both ABORT
+branches, placing the `_record` after the existing abort call. But
+`set_canvas_status(ERROR)` is what makes `RedisCanvasStore` expire every key in
+the canvas registry *and the registry itself*. Writing afterwards therefore lands
+a plain `SET` on the node key — clearing the TTL that was just applied — and a
+result key registered into a registry that is already expiring. Both outlive the
+canvas with nothing left referencing them.
+
+A correct fix, placed one line too late.
+
+**The practical fix:** Record before the canvas goes terminal, in both branches.
+
+---
+
+### 105. Kafka `publish` duplicates a caller-supplied attempt header
+
+**Where:** `mint/worker/brokers/kafka.py::publish`
+
+**Root cause:** `redeliver` strips any existing `ATTEMPT_HEADER` before appending
+its own; `publish` only appended. Kafka headers are a *list of pairs*, not a map,
+so a caller passing `x-mint-attempt` really does put the key on the wire twice.
+`KafkaDelivery` reads them through `dict()`, where last-wins happens to give the
+right answer — which is exactly why this survived: the only reader in the package
+is the one that can't see it.
+
+**The practical fix:** Strip before appending, matching `redeliver`.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -3928,3 +4040,14 @@ adding a new broker, executor, or engine transition:
   solved (issue #100).
 - **Release a resource in a `finally`, not on the success path** — especially
   where the failure is deliberately swallowed elsewhere (issue #101).
+- **Every long-lived loop needs the same catch-all.** `_consume_results` got one;
+  the sweeper three methods away did not, and a one-second store blip took the
+  whole coordinator down (issue #102).
+- **Know which errors your "returns False on failure" helper actually converts.**
+  `_advance` handled `WorkerError` and publish failures, so a driver error walked
+  straight past every caller that trusted the boolean (issue #102).
+- **Order matters around anything that triggers a sweep.** A write after
+  `set_canvas_status(ERROR)` lands in an already-expiring registry and clears the
+  TTL it should have inherited (issue #104).
+- **A field the package only ever reads through `dict()` can still be wrong on the
+  wire.** Kafka headers are a list of pairs (issue #105).

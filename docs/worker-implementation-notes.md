@@ -3,9 +3,9 @@
 `mint.worker` is a decentralized async canvas-orchestration library — chains and
 chords (fan-out/fan-in) of tasks dispatched over a broker, similar in spirit to
 Celery's `chain`/`chord` but fully asynchronous, ported from an internal
-predecessor (`mini.worker`) and hardened against 101 confirmed bugs — 17 inherited
+predecessor (`mini.worker`) and hardened against 105 confirmed bugs — 17 inherited
 from `mini.worker`, 5 found live while building this package test-first against
-real containers, and 79 across ten review rounds afterwards. Twenty-four of those were
+real containers, and 83 across eleven review rounds afterwards. Twenty-six of those were
 introduced by an earlier round's own fix, which is why every round reviewed the
 fixes and not just the original code. This
 page is the permanent reference for *why* it's built the way it is, a summary of
@@ -24,7 +24,7 @@ design choice this port never questioned. Everything else was fixed.
 ## mini vs. mint: bugs found and fixed
 
 The 17 bugs inherited from `mini.worker`. Bugs #18-22 (found live while building
-this package) and #23-101 (found by the ten review rounds) are catalogued in
+this package) and #23-105 (found by the eleven review rounds) are catalogued in
 [`worker-bugs-and-fixes.md`](worker-bugs-and-fixes.md).
 
 | # | Bug | mini location | Fix |

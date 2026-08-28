@@ -107,6 +107,11 @@ in place.
 
 `register()` rejects two workers claiming the same topic, and validates
 `Input`/`Output`/`topic` exist before the app ever starts consuming.
+
+Shutdown cancels the consume loops, drains what is in flight, and only then
+releases each worker's broker resources — a handler finishing during the drain
+still needs a live channel to ack on. An app that has shut down cleanly can be
+`run()` again, and the SIGTERM/SIGINT handlers it installed are handed back.
 `app.stop()` triggers the same graceful shutdown programmatically. A worker
 still in flight when the drain timeout (`WorkerApp(..., drain_timeout=5.0)`)
 expires is nacked for redelivery, not dropped.

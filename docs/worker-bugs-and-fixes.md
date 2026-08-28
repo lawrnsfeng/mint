@@ -108,6 +108,18 @@ is the expanded, "how do I actually fix this" version.
 - [74. The Redis reclaim guard is keyed by stream id alone](#74-the-redis-reclaim-guard-is-keyed-by-stream-id-alone)
 - [75. Kafka offset tracking wedges on a rebalance](#75-kafka-offset-tracking-wedges-on-a-rebalance)
 
+**Part 8 — Bugs found by a seventh review round**
+
+- [76. Shutdown tears down the transport under in-flight handlers](#76-shutdown-tears-down-the-transport-under-in-flight-handlers)
+- [77. A `WorkerApp` cannot be restarted](#77-a-workerapp-cannot-be-restarted)
+- [78. Signal handlers are installed and never removed](#78-signal-handlers-are-installed-and-never-removed)
+- [79. A failed request publish leaks its pending entry](#79-a-failed-request-publish-leaks-its-pending-entry)
+- [80. Kafka records offsets that were never queued](#80-kafka-records-offsets-that-were-never-queued)
+- [81. Dropping offset bookkeeping loses in-flight commits silently](#81-dropping-offset-bookkeeping-loses-in-flight-commits-silently)
+- [82. An empty `Chain`/`Chord` escapes the `WorkerError` hierarchy](#82-an-empty-chainchord-escapes-the-workererror-hierarchy)
+- [83. The Redis key registry inherits a TTL across a `canvas_id` reuse](#83-the-redis-key-registry-inherits-a-ttl-across-a-canvas_id-reuse)
+- [84. One slow handler blocks reclaiming abandoned entries](#84-one-slow-handler-blocks-reclaiming-abandoned-entries)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3041,6 +3053,224 @@ offset; a revert-and-watch-it-fail check is what caught that.
 
 ---
 
+## Part 8 — Bugs found by a seventh review round
+
+The headline one, #76, is a case of two correct requirements pulling in opposite
+directions — and an earlier fix satisfying one of them by breaking the other
+without anyone noticing, because the code that made it a problem arrived two
+rounds later.
+
+### 76. Shutdown tears down the transport under in-flight handlers
+
+**Where:** `mint/worker/app.py::_shutdown`
+
+**Symptom:** After a graceful shutdown, a node that had already completed runs
+again on restart — sometimes twice.
+
+**Root cause:** Two requirements that the ordering has to satisfy at once:
+
+- Bug #19 established **cancel the consume loops before draining**, or a loop
+  left alive picks up whatever a drain timeout just requeued and re-nacks it.
+- Issue #49 later gave RabbitMQ consumers their own channel, closed in
+  `consume()`'s `finally`. Kafka's `finally` stops its consumer and forgets its
+  offsets.
+
+Cancelling `run()` unwinds its `async for`, which finalises that generator and
+runs the cleanup. So by the time `_drain_workers()` ran, the channel a handler
+needs in order to `ack()` was already closed. The ack raises, `_handle`'s
+catch-all nacks, `redeliver()` republishes a duplicate through the still-open
+*publish* pool, and RabbitMQ redelivers the unacked original too. The canvas has
+already advanced, so the node re-runs — twice.
+
+This is exactly what `_drain_workers`' own docstring says the two-phase drain
+prevents. The protection was defeated one step earlier, at the cancel, by a fix
+that landed two rounds after the docstring was written.
+
+**The practical fix:** Separate *stopping the loop* from *releasing the
+transport*, so both orderings can hold.
+
+```python
+# Worker keeps its own generator rather than iterating an anonymous one
+self._consumer = binding.broker.consume(self.topic)
+async for delivery in self._consumer:
+    ...
+```
+
+```python
+# app._shutdown
+for task in self._tasks.values():
+    task.cancel()
+await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+await self._drain_workers()                     # transport still alive
+for worker in self._workers.values():
+    await worker.close_consumer()               # released only now
+```
+
+---
+
+### 77. A `WorkerApp` cannot be restarted
+
+**Where:** `mint/worker/app.py::_shutdown`
+
+**Symptom:** A second `app.run()` consumes nothing, exits immediately, and
+increments one topic's attempt counter on the way out.
+
+**Root cause:** `_shutdown` resets `_running` and clears `_stop_event` — work that
+is only meaningful if `run()` may be called again, which the
+`AppAlreadyRunningError` guard implies it may. But `Worker._stopped`, set by
+`stop_consuming()`, was never cleared anywhere. On the second run every worker
+takes the `if self._stopped.is_set()` branch on its first delivery, nacks it with
+`attempt + 1`, and returns; `_on_worker_exit` (issue #44) then sees a loop that
+exited on its own and stops the app again.
+
+Two fixes agreeing on half a contract each: the app reset its own state, the
+worker never reset its.
+
+**The practical fix:** `Worker.resume_consuming()`, called for every worker at the
+end of `_shutdown`.
+
+---
+
+### 78. Signal handlers are installed and never removed
+
+**Where:** `mint/worker/app.py::_install_signal_handlers`,
+`mint/worker/coordinator.py` (same shape)
+
+**Symptom:** After `run()` returns, Ctrl-C does nothing. The process is
+uninterruptible for whatever runs next.
+
+**Root cause:** `loop.add_signal_handler(sig, self._stop_event.set)` is
+loop-global and outlives the app. Once `run()` completes, SIGINT/SIGTERM still
+route to an event nothing is awaiting — and the default handler, which would have
+raised `KeyboardInterrupt` or terminated the process, has been displaced.
+
+**The practical fix:** `loop.remove_signal_handler(sig)` in `_shutdown`,
+suppressing both `NotImplementedError` (platforms without signal support, matching
+the install side) and `ValueError`.
+
+---
+
+### 79. A failed request publish leaks its pending entry
+
+**Where:** `mint/worker/executors/amqp_rpc.py::_call`
+
+**Symptom:** `_pending` grows by one entry — and one future nothing will ever
+resolve — for every RPC attempted while the broker is down.
+
+**Root cause:** The correlation id is registered *before* publishing, correctly:
+a reply can arrive the instant the request lands. But only `_await_reply`'s
+`finally` pops the map, and a raising publish never reaches it. This is the same
+unbounded leak bug #11 fixed for lost replies and issue #51 fixed for cancelled
+calls, arriving from the third direction.
+
+**The practical fix:** A `try/except` around the publish that pops and re-raises.
+Keeping the registration before the publish (rather than moving it after) is
+deliberate — the race it guards against is real.
+
+---
+
+### 80. Kafka records offsets that were never queued
+
+**Where:** `mint/worker/brokers/kafka.py::settle`
+
+**Symptom:** A commit advances past a record whose handler is still running —
+silent loss on a later crash.
+
+**Root cause:** `settle` added the offset to `_settled` before checking it was
+actually in flight. That is reachable precisely *because* issue #75 made `track`
+deduplicate: after a rebalance two `KafkaDelivery` objects exist for one offset
+but only one queue entry does. The first settle pops it; the second adds the
+offset to `_settled` with nothing to pop, and it stays there. If that offset is
+tracked again after a later rebalance, it counts as settled the moment it reaches
+the head of the queue.
+
+**The practical fix:** `if inflight is None or record.offset not in inflight:
+return None`. The fix for a duplicate in one structure has to be mirrored in the
+other structure that indexes it.
+
+---
+
+### 81. Dropping offset bookkeeping loses in-flight commits silently
+
+**Where:** `mint/worker/brokers/kafka.py::_forget_offsets`
+
+**Symptom:** Messages in flight when a consumer stops are reprocessed on restart,
+with nothing in the logs to say so.
+
+**Root cause:** `_forget_offsets` runs in `consume()`'s `finally` — on shutdown
+cancellation, or on a broker error propagating out of the iterator — while
+handlers may still be running. Their later `ack()` reaches `settle()`, finds no
+in-flight list, and returns `None`, so `_commit()` commits nothing at all.
+
+With issue #76's fix the generator now closes *after* the drain, so the common
+path is clean. The error path is not, and reprocessing is at-least-once behaviour
+rather than a correctness break — but it should be visible.
+
+**The practical fix:** Log a warning naming the topic, partition, and how many
+offsets were dropped unsettled. Not every fix is a behaviour change; some are
+just refusing to be silent.
+
+---
+
+### 82. An empty `Chain`/`Chord` escapes the `WorkerError` hierarchy
+
+**Where:** `mint/worker/canvas/builder.py`
+
+**Symptom:** `Chain([])` raises a raw pydantic `ValidationError` from `build()`
+(or `IndexError` from `publish_entries` first), neither of which is a
+`WorkerError`.
+
+**Root cause:** Nothing validated the constructor argument; the failure was left
+to `ChainNode.children`'s `min_length=1`, several calls later. `exc.py` establishes
+that every DSL failure is a typed `WorkerError` — `ChildNotInParentError`'s
+docstring spells out that exact reasoning for `list.index` — and this slipped
+through it.
+
+**The practical fix:** `EmptyContainerError`, raised in both constructors. Note
+there is deliberately *no* second check after flattening: an inner chain raises at
+its own construction, so flattening can never produce an empty one. That check was
+written, found unreachable, and removed rather than left as reassuring dead code.
+
+---
+
+### 83. The Redis key registry inherits a TTL across a `canvas_id` reuse
+
+**Where:** `mint/worker/stores/redis.py::create_canvas`
+
+**Symptom:** A retried canvas leaks its node and result keys permanently.
+
+**Root cause:** `set_canvas_status` expires the key-registry set along with the
+data. `create_canvas` for a reused `canvas_id` — the retry path issue #68 exists
+to support — rewrites the node keys via `MSET`, which clears *their* TTL, but
+`_track`'s `SADD` does not clear the registry's. If the retry outlives that
+expiry the registry vanishes mid-run, and every key tracked before that point is
+invisible to the final expire sweep.
+
+**The practical fix:** `PERSIST` the registry key in `create_canvas`. Same class
+of bug as #68 — a reused canvas inheriting the previous attempt's expiry state —
+found one key deeper.
+
+---
+
+### 84. One slow handler blocks reclaiming abandoned entries
+
+**Where:** `mint/worker/brokers/redis.py::_reclaim`
+
+**Symptom:** A genuinely dead consumer's messages are never recovered while this
+consumer has one slow handler running.
+
+**Root cause:** Issue #70 made `_reclaim` skip entries this consumer already
+holds. But `XAUTOCLAIM` scans in id order from `0-0` with `count=1`, so a
+self-owned entry past `reclaim_idle_ms` is the one returned *every* poll — and
+returning `None` there means nothing behind it is ever examined. The guard that
+stopped self-duplication introduced a head-of-line block.
+
+**The practical fix:** Advance the cursor past self-owned entries and keep
+looking, bounded by `RECLAIM_SCAN_LIMIT` per poll so a large pending list cannot
+stall the consume loop.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -3155,3 +3385,21 @@ adding a new broker, executor, or engine transition:
   passed against the broken code, because the duplicate only blocks the *next*
   offset. Reverting the fix and watching the test fail is what exposed it
   (issue #75).
+- **A docstring describing an ordering is a constraint on every later change.**
+  Bug #19 fixed the shutdown order; issue #49 later made that order unsafe, and
+  nothing connected the two for two rounds (issue #76).
+- **When two requirements conflict, look for the separation that satisfies both.**
+  Cancel-before-drain and release-transport-after-drain only conflicted while the
+  loop and the transport were the same lifetime (issue #76).
+- **Lifecycle state lives in more than one object.** The app reset its own and
+  left the workers', so restarting silently did nothing (issue #77).
+- **Anything installed process-wide has to be uninstalled** — signal handlers
+  outlive the object that added them (issue #78).
+- **De-duplicating one structure invalidates every structure that indexes it.**
+  Making `track` skip duplicates left `settle` recording offsets with nothing to
+  pop (issue #80).
+- **A guard that returns early can become a head-of-line block.** Skipping
+  self-owned entries stopped self-duplication and stopped everything behind them
+  too (issue #84).
+- **Delete a check you find unreachable** rather than leaving it as reassuring
+  dead code (issue #82).

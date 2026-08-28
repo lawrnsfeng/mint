@@ -294,6 +294,13 @@ class Worker[T: BaseModel, RT: BaseModel]:
             await delivery.nack(requeue=False)
             return DeliveryOutcome(settled=True)
 
+        # Marked before the work starts, so a canvas stuck mid-flight is diagnosable:
+        # without this a node reads PENDING right up until it terminates, and
+        # "dispatched and running" is indistinguishable from "never dispatched".
+        # Bug #13 claimed every transition writes its status; this is the one that
+        # was still missing.
+        await self._safe_mark_running(envelope, binding)
+
         outcome, result = await self._run_task(input_obj, envelope.node_id, binding.executor)
 
         if not await self._advance(envelope, outcome, binding):
@@ -322,6 +329,21 @@ class Worker[T: BaseModel, RT: BaseModel]:
             await delivery.nack(requeue=False)
             return
         await delivery.nack(requeue=True)
+
+    async def _safe_mark_running(self, envelope: Envelope, binding: WorkerBinding) -> None:
+        """Record that this node is running, logging rather than raising.
+
+        Observability must never cost a message: a store hiccup here would
+        otherwise fail work that is about to run perfectly well.
+        """
+        try:
+            await binding.store.mark_node_running(envelope.canvas_id, envelope.node_id)
+        except Exception:
+            logger.exception(
+                "Could not mark a node running",
+                node_id=envelope.node_id,
+                canvas_id=envelope.canvas_id,
+            )
 
     async def _safe_retry_or_drop(self, delivery: Delivery) -> None:
         """Retry-or-drop, logging rather than raising — nothing above would catch it."""

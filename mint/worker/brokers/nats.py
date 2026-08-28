@@ -26,10 +26,13 @@ from nats import connect
 from nats.aio.msg import Msg
 from nats.js import JetStreamContext
 
+from mint.logger import get_logger
 from mint.worker.enums import DeliveryGuarantee
 
 if TYPE_CHECKING:
     from nats.aio.client import Client
+
+logger = get_logger(__name__)
 
 
 class NatsDelivery:
@@ -155,7 +158,21 @@ class NatsBroker:
                 yield NatsDelivery(self, msg)
 
     async def deadletter(self, msg: Msg) -> None:
-        """Publish ``msg`` to its subject's dead-letter subject."""
+        """Publish ``msg`` to its subject's dead-letter subject, if it has one.
+
+        A message already on a ``.dlq`` subject has nowhere further to go: its
+        would-be target ``foo.dlq.dlq`` belongs to no stream, because
+        ``_ensure_stream`` deliberately stops the chain at one level — so
+        publishing there fails outright. ``_ensure_stream`` learned that rule; this
+        side had not, so dead-lettering a message consumed *from* a DLQ raised
+        instead of terminating.
+        """
+        if msg.subject.endswith(self.DLQ_SUFFIX):
+            logger.warning(
+                "Dropping a message already on a dead-letter subject",
+                subject=msg.subject,
+            )
+            return
         jetstream = await self._connect()
         await jetstream.publish(f"{msg.subject}{self.DLQ_SUFFIX}", msg.data, headers=msg.headers)
 

@@ -50,6 +50,15 @@ class MemoryCanvasStore:
                 return
             self._nodes[key] = node.model_copy(update={"status": status})
 
+    async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
+        """Move a node from PENDING to RUNNING. A no-op from any other status."""
+        async with self._lock:
+            key = (canvas_id, node_id)
+            node = self._nodes.get(key)
+            if node is None or node.status != NodeStatus.PENDING:
+                return
+            self._nodes[key] = node.model_copy(update={"status": NodeStatus.RUNNING})
+
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
         """Mark every listed node CANCELLED."""
         for node_id in node_ids:

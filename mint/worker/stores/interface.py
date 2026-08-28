@@ -40,6 +40,14 @@ class ICanvasStore(Protocol):
         """Update a node's status. A no-op if the node does not exist."""
         ...
 
+    async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
+        """Move a node from PENDING to RUNNING. A no-op from any other status.
+
+        Only from PENDING, deliberately: a stale delivery for a node an
+        ``ErrorPolicy.ABORT`` already CANCELLED must not resurrect it as RUNNING.
+        """
+        ...
+
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
         """Mark every listed node CANCELLED."""
         ...

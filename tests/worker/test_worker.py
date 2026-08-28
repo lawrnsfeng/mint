@@ -931,3 +931,58 @@ class TestEngineErrorDuringComplete:
 
         redelivered = await anext(broker.consume(TOPIC))
         assert redelivered.attempt == 2
+
+
+class TestNodeIsObservablyRunning:
+    """A worker must record that it picked a node up, not just that it finished."""
+
+    async def test_processing_marks_the_node_running(self) -> None:
+        """Bug #13 promised every transition writes its status; RUNNING never did.
+
+        A canvas stuck mid-flight was indistinguishable from one never dispatched.
+        """
+        seen: list[NodeStatus] = []
+
+        class ObservingWorker(DoublingWorker):
+            async def process(self, input_obj: DoublingIn) -> DoublingOut:
+                node = await self._require_binding().store.get_node(CANVAS, "t1")
+                assert node is not None
+                seen.append(node.status)
+                return await super().process(input_obj)
+
+        worker = ObservingWorker()
+        broker = MemoryBroker()
+        store = MemoryCanvasStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._handle(
+            envelope_delivery(broker, "t1", CANVAS, '{"value": 5}'),
+            binding,
+        )
+
+        assert seen == [NodeStatus.RUNNING]
+
+    async def test_a_store_failure_marking_running_does_not_fail_the_message(self) -> None:
+        """Observability must never cost a message that is about to run fine."""
+
+        class RefusingStore(MemoryCanvasStore):
+            async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
+                del canvas_id, node_id
+                detail = "status write refused"
+                raise ConnectionResetError(detail)
+
+        worker = DoublingWorker()
+        broker = MemoryBroker()
+        store = RefusingStore()
+        binding = bind_worker(worker, broker, store)
+        await store.create_canvas(CANVAS, {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic=TOPIC)})
+
+        await worker._handle(
+            envelope_delivery(broker, "t1", CANVAS, '{"value": 5}'),
+            binding,
+        )
+
+        recorded = await store.get_result(CANVAS, "t1")
+        assert recorded is not None
+        assert recorded.status == NodeStatus.FINISHED

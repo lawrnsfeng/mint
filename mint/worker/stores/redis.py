@@ -143,6 +143,13 @@ class RedisCanvasStore:
             updated.model_dump_json().encode(),
         )
 
+    async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
+        """Move a node from PENDING to RUNNING. A no-op from any other status."""
+        node = await self.get_node(canvas_id, node_id)
+        if node is None or node.status != NodeStatus.PENDING:
+            return
+        await self.set_node_status(canvas_id, node_id, NodeStatus.RUNNING)
+
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
         """Mark every listed node CANCELLED."""
         for node_id in node_ids:

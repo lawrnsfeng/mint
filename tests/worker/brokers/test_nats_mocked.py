@@ -337,3 +337,45 @@ class TestDeadLetterStreamOwnership:
 
         _, kwargs = mock_jetstream.add_stream.await_args
         assert f"{TOPIC_A}.dlq.dlq" not in kwargs["subjects"]
+
+
+class TestDeadLetterChainTerminates:
+    """A message already on a `.dlq` subject has nowhere further to go."""
+
+    async def test_dead_lettering_from_a_dlq_subject_publishes_nothing(
+        self,
+        broker: NatsBroker,
+        mock_jetstream: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """`foo.dlq.dlq` belongs to no stream, so publishing there raises outright.
+
+        `_ensure_stream` stops the chain at one level; this side had not learned
+        the same rule, so dead-lettering a message consumed *from* a DLQ failed
+        instead of terminating.
+        """
+        msg = mocker.MagicMock()
+        msg.subject = f"{TOPIC_A}{NatsBroker.DLQ_SUFFIX}"
+        msg.data = b"already dead"
+        msg.headers = None
+
+        await broker.deadletter(msg)
+
+        mock_jetstream.publish.assert_not_awaited()
+
+    async def test_dead_lettering_from_a_normal_subject_still_publishes(
+        self,
+        broker: NatsBroker,
+        mock_jetstream: AsyncMock,
+        mocker: "MockerFixture",
+    ) -> None:
+        """The guard must only catch the terminal case."""
+        msg = mocker.MagicMock()
+        msg.subject = TOPIC_A
+        msg.data = b"doomed"
+        msg.headers = None
+
+        await broker.deadletter(msg)
+
+        mock_jetstream.publish.assert_awaited_once()
+        assert mock_jetstream.publish.await_args.args[0] == f"{TOPIC_A}{NatsBroker.DLQ_SUFFIX}"

@@ -163,3 +163,42 @@ class TestCanvasIdReuse:
         await store.create_canvas("c1", {"t1": node})
 
         assert await store.get_canvas_status("c1") == CanvasStatus.RUNNING
+
+
+class TestMarkNodeRunning:
+    """A node must be observably RUNNING between dispatch and completion."""
+
+    async def test_a_pending_node_becomes_running(self) -> None:
+        """Without this a node reads PENDING until it terminates.
+
+        "Dispatched and running" and "never dispatched" were indistinguishable —
+        exactly what bug #13 said writing statuses explicitly would fix.
+        """
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+
+        await store.mark_node_running("c1", "t1")
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.RUNNING
+
+    async def test_a_cancelled_node_is_not_resurrected(self) -> None:
+        """A stale delivery for a node ABORT already cancelled must not un-cancel it."""
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+        await store.cancel_nodes("c1", ["t1"])
+
+        await store.mark_node_running("c1", "t1")
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.CANCELLED
+
+    async def test_an_unknown_node_is_a_no_op(self) -> None:
+        """Marking a node that doesn't exist must not raise or create anything."""
+        store = MemoryCanvasStore()
+
+        await store.mark_node_running("c1", "missing")
+
+        assert await store.get_node("c1", "missing") is None

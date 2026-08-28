@@ -198,17 +198,22 @@ class CanvasEngine:
         if outcome.status == NodeStatus.ERROR:
             remaining = self._chain_remaining(chain, finished_child_id)
             if chain.error_policy == ErrorPolicy.ABORT:
-                await self._abort_canvas(canvas_id, remaining)
+                # Recorded *before* the canvas goes terminal, not after. A terminal
+                # canvas status makes RedisCanvasStore expire every key it tracks —
+                # so a later write lands a plain SET on a node key (clearing the TTL
+                # just applied) and a result key into an already-expiring registry.
+                # Both then live forever, unreclaimed and unreferenced.
+                #
                 # Recorded but not bubbled: ABORT ends the canvas, so nothing above
                 # should advance — but the chain itself must not be left reading
-                # PENDING with no result while its children are ERROR/CANCELLED and
-                # the canvas is ERROR. The compound node would misreport as "never
-                # started". PROPAGATE already records this by bubbling.
+                # PENDING with no result while its children are ERROR/CANCELLED.
+                # PROPAGATE already records this by bubbling.
                 await self._record(
                     canvas_id,
                     chain.id,
                     NodeOutcome(node_id=chain.id, status=NodeStatus.ERROR, error=outcome.error),
                 )
+                await self._abort_canvas(canvas_id, remaining)
                 return None, None
             if chain.error_policy == ErrorPolicy.PROPAGATE:
                 await self._cancel_subtrees(canvas_id, remaining)
@@ -420,13 +425,15 @@ class CanvasEngine:
             # Cancels the callback along with the unfinished legs — an aborting group
             # never dispatches it, so leaving it PENDING misreports it as expected.
             await self._cancel_group_remainder(canvas_id, group, finished_child_id)
-            await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
-            # Same reasoning as the chain's ABORT branch: record, don't bubble.
+            # Same reasoning as the chain's ABORT branch: record, don't bubble — and
+            # record before the canvas goes terminal, or the write outlives the TTL
+            # sweep it should have been part of.
             await self._record(
                 canvas_id,
                 group.id,
                 NodeOutcome(node_id=group.id, status=NodeStatus.ERROR, error=outcome.error),
             )
+            await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
             return None, None
         if group.error_policy == ErrorPolicy.PROPAGATE:
             if not await self.store.claim_group_terminal(canvas_id, group.id):

@@ -182,7 +182,15 @@ class KafkaBroker:
         """Publish ``message`` to ``topic``, creating it if needed, and wait for the ack."""
         await self._ensure_topic(topic)
         producer = await self._ensure_producer()
-        kafka_headers = [(key, value.encode()) for key, value in (headers or {}).items()]
+        # The attempt header is this broker's to own: a caller-supplied one is
+        # dropped rather than duplicated, matching what redeliver() already does.
+        # Kafka headers are a list of pairs, so a duplicate key really is carried on
+        # the wire — only dict()-based readers happen not to notice.
+        kafka_headers = [
+            (key, value.encode())
+            for key, value in (headers or {}).items()
+            if key != ATTEMPT_HEADER
+        ]
         kafka_headers.append((ATTEMPT_HEADER, b"1"))
         await producer.send_and_wait(topic, value=message, headers=kafka_headers)
 

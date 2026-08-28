@@ -238,3 +238,35 @@ class TestRecreatingACanvasClearsFanInState:
         await store.create_canvas("cv", {"leg": node})
 
         assert await store.get_result("cv", "leg") is None
+
+
+class TestCancelNodesMatchesRedis:
+    """A stand-in store must behave identically, or tests prove the wrong thing."""
+
+    async def test_a_finished_node_is_not_cancelled(self) -> None:
+        """RedisCanvasStore guards this transition; the memory store did not.
+
+        Cancellation expands through whole subtrees, so grandchildren that already
+        completed are routinely in the list — and `_complete` then discards a
+        redelivery of a CANCELLED node's outcome.
+        """
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+        await store.set_node_status("c1", "t1", NodeStatus.FINISHED)
+
+        await store.cancel_nodes("c1", ["t1"])
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.FINISHED
+
+    async def test_a_pending_node_is_still_cancelled(self) -> None:
+        """The guard must not stop cancellation doing its job."""
+        store = MemoryCanvasStore()
+        await store.create_canvas("c1", {"t1": TaskNode(id="t1", canvas_id="c1", topic="t")})
+
+        await store.cancel_nodes("c1", ["t1"])
+
+        node = await store.get_node("c1", "t1")
+        assert node is not None
+        assert node.status == NodeStatus.CANCELLED

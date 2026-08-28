@@ -950,3 +950,65 @@ class TestTheSweeperClaimsBeforeItAwaits:
                 while True:
                     dispatched.append(await anext(broker.consume("topic-t2")))
         assert len(dispatched) == 1
+
+
+class TestTheSweeperSurvivesAStoreError:
+    """`_advance` only converts WorkerError and publish failures into False."""
+
+    async def _canvas(self, store: MemoryCanvasStore) -> None:
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic-t1")},
+        )
+
+    async def test_a_raising_advance_leaves_the_node_recoverable(self) -> None:
+        """A driver-level error propagated, skipping the restore entirely.
+
+        The node stayed untracked so no sweep revisited it, *and* stayed in
+        `_timed_out` so its real result was discarded on arrival — the canvas hangs
+        RUNNING forever.
+        """
+
+        class BlippingStore(MemoryCanvasStore):
+            async def get_canvas_status(self, canvas_id: str) -> CanvasStatus:
+                del canvas_id
+                detail = "connection reset"
+                raise ConnectionResetError(detail)
+
+        store = BlippingStore()
+        coordinator = Coordinator(MemoryBroker(), store, RESULTS_TOPIC)
+        entry = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        coordinator._in_flight[CANVAS, "t1"] = entry
+
+        await coordinator._timeout_node(entry)
+
+        assert (CANVAS, "t1") in coordinator._in_flight
+        assert (CANVAS, "t1") not in coordinator._timed_out
+
+    async def test_a_failing_sweep_does_not_kill_the_loop(self) -> None:
+        """Unguarded, the loop died and `_on_task_exit` took the coordinator with it."""
+        sweeps: list[int] = []
+        swept_again = asyncio.Event()
+
+        class FailingSweepCoordinator(Coordinator):
+            async def _sweep_once(self) -> None:
+                sweeps.append(1)
+                if len(sweeps) == 1:
+                    detail = "store blip"
+                    raise ConnectionResetError(detail)
+                swept_again.set()
+
+        coordinator = FailingSweepCoordinator(
+            MemoryBroker(),
+            MemoryCanvasStore(),
+            RESULTS_TOPIC,
+            config=CoordinatorConfig(sweep_interval=0.001),
+        )
+
+        task = asyncio.create_task(coordinator._sweep_loop())
+        async with asyncio.timeout(1.0):
+            await swept_again.wait()
+
+        assert not task.done()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

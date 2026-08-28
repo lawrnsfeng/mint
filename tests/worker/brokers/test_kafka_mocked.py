@@ -550,3 +550,25 @@ class TestOffsetTrackingSurvivesRebalance:
 
         assert broker._inflight == {}
         assert broker._settled == {}
+
+
+class TestAttemptHeaderIsNotDuplicated:
+    """The attempt header is the broker's to own, on publish as well as redeliver."""
+
+    @pytest.mark.usefixtures("mock_admin_cls")
+    async def test_publish_drops_a_caller_supplied_attempt_header(
+        self,
+        mock_producer_cls: AsyncMock,
+    ) -> None:
+        """Kafka headers are a list of pairs, so a duplicate key is really on the wire.
+
+        `redeliver` already strips it; `publish` appended alongside, and only
+        `dict()`-based readers happened not to notice.
+        """
+        broker = KafkaBroker("localhost:9092")
+
+        await broker.publish(TOPIC, b"body", headers={ATTEMPT_HEADER: "3", "trace": "abc"})
+
+        _, kwargs = mock_producer_cls.return_value.send_and_wait.await_args
+        assert [value for key, value in kwargs["headers"] if key == ATTEMPT_HEADER] == [b"1"]
+        assert ("trace", b"abc") in kwargs["headers"]

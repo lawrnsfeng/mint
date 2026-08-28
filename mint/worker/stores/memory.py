@@ -71,9 +71,25 @@ class MemoryCanvasStore:
             self._nodes[key] = node.model_copy(update={"status": NodeStatus.RUNNING})
 
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
-        """Mark every listed node CANCELLED."""
-        for node_id in node_ids:
-            await self.set_node_status(canvas_id, node_id, NodeStatus.CANCELLED)
+        """Mark every listed node CANCELLED, unless it already reached a terminal status.
+
+        Guarded exactly as ``RedisCanvasStore.cancel_nodes`` is: a leg that
+        genuinely FINISHED before the cancellation reached it did run, and stamping
+        it CANCELLED erases that — and `_complete` then discards a redelivery of its
+        outcome. Cancellation expands through whole subtrees, so grandchildren that
+        already completed are routinely in the list.
+
+        Divergence here would be worse than the bug: this store exists to be a
+        faithful single-process stand-in, so the same canvas must behave the same
+        way under both.
+        """
+        async with self._lock:
+            for node_id in node_ids:
+                key = (canvas_id, node_id)
+                node = self._nodes.get(key)
+                if node is None or node.status not in (NodeStatus.PENDING, NodeStatus.RUNNING):
+                    continue
+                self._nodes[key] = node.model_copy(update={"status": NodeStatus.CANCELLED})
 
     async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
         """Persist a node's terminal outcome."""

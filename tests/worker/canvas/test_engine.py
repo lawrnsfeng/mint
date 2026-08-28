@@ -1468,3 +1468,88 @@ class TestCancelledSubtreesStopRunning:
         node = await store.get_node(CANVAS, "b1")
         assert node is not None
         assert node.status == NodeStatus.CANCELLED
+
+
+class TestAbortRecordsBeforeTheCanvasGoesTerminal:
+    """A terminal canvas status is what triggers Redis's TTL sweep."""
+
+    async def test_the_container_outcome_is_written_before_the_canvas_status(
+        self,
+    ) -> None:
+        """Writing after left the container's keys unreclaimed forever in Redis.
+
+        `set_canvas_status(ERROR)` expires every key the canvas registry tracks, so
+        a later `set_result` lands in an already-expiring registry and a later
+        `set_node_status` clears the TTL just applied to the node key.
+        """
+        order: list[str] = []
+
+        class OrderingStore(MemoryCanvasStore):
+            async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
+                if node_id == "chain":
+                    order.append("record")
+                await super().set_result(canvas_id, node_id, outcome)
+
+            async def set_canvas_status(self, canvas_id: str, status: CanvasStatus) -> None:
+                order.append(f"canvas:{status.value}")
+                await super().set_canvas_status(canvas_id, status)
+
+        ordering = OrderingStore()
+        engine = CanvasEngine(ordering)
+        chain = ChainNode(
+            id="chain",
+            canvas_id=CANVAS,
+            parent_id=None,
+            children=["s1", "s2"],
+            error_policy=ErrorPolicy.ABORT,
+        )
+        await ordering.create_canvas(
+            CANVAS,
+            {
+                "s1": task("s1", "chain"),
+                "s2": task("s2", "chain"),
+                "chain": chain,
+            },
+        )
+
+        await engine.complete(CANVAS, "s1", err_outcome("s1"))
+
+        assert order.index("record") < order.index("canvas:error")
+
+    async def test_a_group_abort_records_before_the_canvas_status_too(
+        self,
+    ) -> None:
+        """The group branch had the identical ordering."""
+        order: list[str] = []
+
+        class OrderingStore(MemoryCanvasStore):
+            async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
+                if node_id == "g":
+                    order.append("record")
+                await super().set_result(canvas_id, node_id, outcome)
+
+            async def set_canvas_status(self, canvas_id: str, status: CanvasStatus) -> None:
+                order.append(f"canvas:{status.value}")
+                await super().set_canvas_status(canvas_id, status)
+
+        ordering = OrderingStore()
+        engine = CanvasEngine(ordering)
+        await ordering.create_canvas(
+            CANVAS,
+            {
+                "leg1": task("leg1", "g"),
+                "leg2": task("leg2", "g"),
+                "g": GroupNode(
+                    id="g",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["leg1", "leg2"],
+                    callback=None,
+                    error_policy=ErrorPolicy.ABORT,
+                ),
+            },
+        )
+
+        await engine.complete(CANVAS, "leg1", err_outcome("leg1"))
+
+        assert order.index("record") < order.index("canvas:error")

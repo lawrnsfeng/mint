@@ -415,9 +415,19 @@ class Coordinator:
             return None
 
     async def _sweep_loop(self) -> None:
+        """Sweep for timeouts until cancelled, surviving anything one sweep can throw.
+
+        Unguarded, a transient store error killed the loop outright — and since
+        ``_on_task_exit`` treats a task that ended on its own as fatal, took the
+        whole coordinator down with it. ``_consume_results`` was hardened against
+        exactly this; the sweeper never was.
+        """
         while True:
             await asyncio.sleep(self.sweep_interval)
-            await self._sweep_once()
+            try:
+                await self._sweep_once()
+            except Exception:
+                logger.exception("Sweep failed", topic=self.results_topic)
 
     async def _sweep_once(self) -> None:
         now = datetime.now(UTC)
@@ -457,7 +467,18 @@ class Coordinator:
                 message=f"No result within {self.max_age}s",
             ),
         )
-        if not await self._advance(entry.canvas_id, entry.node_id, outcome):
+        # A raise is treated exactly like a returned False. `_advance` only converts
+        # WorkerError and publish failures into False — a driver-level error out of
+        # `engine.complete` (a Redis blip in `get_canvas_status`, say) propagates,
+        # and would otherwise skip the restore below: the node stays untracked so no
+        # sweep revisits it, *and* stays in `_timed_out` so its real result is
+        # discarded when it arrives. The canvas would hang RUNNING forever.
+        try:
+            advanced = await self._advance(entry.canvas_id, entry.node_id, outcome)
+        except Exception:
+            logger.exception("Timing out a node failed", node_id=entry.node_id)
+            advanced = False
+        if not advanced:
             # There is no delivery behind a synthetic timeout, so nothing else will
             # ever retry this. Put it back and let the next sweep try again, rather
             # than leaving the canvas RUNNING with no error recorded at all.

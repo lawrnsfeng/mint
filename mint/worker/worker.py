@@ -8,6 +8,7 @@ than leaving its delivery stranded unacked.
 """
 
 import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -28,7 +29,7 @@ logger = get_logger(__name__)
 DEFAULT_MAX_CONCURRENCY: Final[int] = 32
 # Runtime state a Worker must not carry into a child process; see __getstate__.
 _UNPICKLABLE_RUNTIME_STATE: Final[frozenset[str]] = frozenset(
-    {"_binding", "_inflight", "_stopped", "_slots"},
+    {"_binding", "_inflight", "_stopped", "_slots", "_consumer"},
 )
 DEFAULT_MAX_ATTEMPTS: Final[int] = 5
 
@@ -108,6 +109,11 @@ class Worker[T: BaseModel, RT: BaseModel]:
         # in run() and releases in the handler task, and the limiter's ContextVar
         # reentrancy assumes both happen in the same task.
         self._slots = asyncio.Semaphore(self.max_concurrency)
+        # Held so the app can close it *after* draining. Cancelling run() unwinds the
+        # `async for`, and letting the generator be finalised then would run its
+        # cleanup — closing the RabbitMQ channel / stopping the Kafka consumer that
+        # in-flight handlers still need in order to ack.
+        self._consumer: AsyncIterator[Delivery] | None = None
 
     def __getstate__(self) -> dict[str, object]:
         """Drop this worker's runtime state so ``process`` can cross a process boundary.
@@ -136,6 +142,7 @@ class Worker[T: BaseModel, RT: BaseModel]:
         self._inflight = set()
         self._stopped = asyncio.Event()
         self._slots = asyncio.Semaphore(self.max_concurrency)
+        self._consumer = None
 
     async def process(self, input_obj: T) -> RT:
         """Do the actual work for one message. Must be implemented by subclasses."""
@@ -157,6 +164,28 @@ class Worker[T: BaseModel, RT: BaseModel]:
     def stop_consuming(self) -> None:
         """Stop pulling new messages; in-flight handling continues until ``drain()``."""
         self._stopped.set()
+
+    def resume_consuming(self) -> None:
+        """Clear the stop flag so this worker can run again.
+
+        ``WorkerApp._shutdown`` resets its own state for a restart, and ``run()``'s
+        ``AppAlreadyRunningError`` guard implies restarting is allowed — but a
+        worker whose ``_stopped`` was never cleared nacks its first delivery and
+        exits immediately on the second run, taking the app down with it.
+        """
+        self._stopped = asyncio.Event()
+
+    async def close_consumer(self) -> None:
+        """Release the broker resources this worker's consume loop holds.
+
+        Called by the app only after draining, so a handler finishing late still
+        has a live channel to ack on.
+        """
+        if self._consumer is None:
+            return
+        consumer, self._consumer = self._consumer, None
+        if isinstance(consumer, AsyncGenerator):
+            await consumer.aclose()
 
     async def drain(self) -> None:
         """Wait for every in-flight handler to finish.
@@ -183,7 +212,8 @@ class Worker[T: BaseModel, RT: BaseModel]:
         still set, nack it again, and spin forever.
         """
         binding = self._require_binding()
-        async for delivery in binding.broker.consume(self.topic):
+        self._consumer = binding.broker.consume(self.topic)
+        async for delivery in self._consumer:
             if self._stopped.is_set():
                 await delivery.nack(requeue=True)
                 return

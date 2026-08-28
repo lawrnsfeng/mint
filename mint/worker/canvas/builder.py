@@ -26,6 +26,7 @@ from mint.worker.envelope import Envelope
 from mint.worker.exc import (
     ConflictingErrorPolicyError,
     DuplicateNodeIdError,
+    EmptyContainerError,
     MissingInputError,
 )
 from mint.worker.stores.interface import ICanvasStore
@@ -97,6 +98,8 @@ class Chain:
         """
         self.id = id or str(uuid4())
         self.error_policy = error_policy
+        if not steps:
+            raise EmptyContainerError(container="Chain", container_id=self.id)
         self.steps: list[Node] = []
         for step in steps:
             if isinstance(step, Chain):
@@ -172,6 +175,8 @@ class Chord:
         isn't any single leg's output (the originating request, a tenant id).
         """
         self.id = id or str(uuid4())
+        if not legs:
+            raise EmptyContainerError(container="Chord", container_id=self.id)
         self.legs = legs
         self.callback = callback
         self.input = input

@@ -1,6 +1,7 @@
 """WorkerApp: registration validation, run/stop lifecycle, and graceful shutdown."""
 
 import asyncio
+import signal
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -310,3 +311,88 @@ class TestRunStopLifecycle:
         await asyncio.sleep(0)
         await app.stop()
         await run_task  # must not raise
+
+
+class TestShutdownKeepsTheTransportAliveForDraining:
+    """In-flight handlers must still be able to ack when the drain runs."""
+
+    async def test_consumers_are_released_only_after_draining(self) -> None:
+        """A handler finishing mid-drain must still have a live channel to ack on.
+
+        Cancelling run() unwinds its `async for`, and finalising the generator
+        there would close the RabbitMQ channel / stop the Kafka consumer it needs.
+        """
+        order: list[str] = []
+
+        class RecordingWorker(SignalingWorker):
+            async def drain(self) -> None:
+                order.append("drain")
+                await super().drain()
+
+            async def close_consumer(self) -> None:
+                order.append("close_consumer")
+                await super().close_consumer()
+
+        app = WorkerApp(MemoryBroker(), MemoryCanvasStore())
+        app.register(RecordingWorker())
+
+        run_task = asyncio.create_task(app.run())
+        await asyncio.sleep(0)
+        await app.stop()
+        async with asyncio.timeout(2.0):
+            await run_task
+
+        assert order == ["drain", "close_consumer"]
+
+
+class TestAppCanRunAgain:
+    """_shutdown resets the app's own state, so a worker's must be reset too."""
+
+    async def test_a_second_run_still_consumes(self) -> None:
+        """A worker's stop flag must be cleared along with the app's own state.
+
+        `Worker._stopped` was never cleared, so every worker nacked its first
+        delivery and exited immediately on the second run, taking the app with it.
+        """
+        app = WorkerApp(MemoryBroker(), MemoryCanvasStore())
+        worker = SignalingWorker()
+        app.register(worker)
+
+        first = asyncio.create_task(app.run())
+        await asyncio.sleep(0)
+        await app.stop()
+        async with asyncio.timeout(2.0):
+            await first
+
+        assert worker._stopped.is_set() is False
+
+        second = asyncio.create_task(app.run())
+        await asyncio.sleep(0)
+        assert app._running is True
+        await app.stop()
+        async with asyncio.timeout(2.0):
+            await second
+
+
+class TestSignalHandlersAreReleased:
+    """add_signal_handler is loop-global and outlives the app."""
+
+    async def test_shutdown_removes_the_handlers_it_installed(self) -> None:
+        """SIGTERM/SIGINT must go back to whatever owned them before run().
+
+        Left installed, a later Ctrl-C routes to an event nothing awaits — with the
+        default handler gone, the process becomes uninterruptible.
+        """
+        app = WorkerApp(MemoryBroker(), MemoryCanvasStore())
+        app.register(SignalingWorker())
+
+        run_task = asyncio.create_task(app.run())
+        await asyncio.sleep(0)
+        await app.stop()
+        async with asyncio.timeout(2.0):
+            await run_task
+
+        loop = asyncio.get_running_loop()
+        # remove_signal_handler returns False when nothing was installed.
+        assert loop.remove_signal_handler(signal.SIGTERM) is False
+        assert loop.remove_signal_handler(signal.SIGINT) is False

@@ -114,6 +114,11 @@ class RedisCanvasStore:
         }
         await self.client.mset(mp_str_bytes)
         await self._track(canvas_id, *(str(key) for key in mp_str_bytes))
+        # SADD does not clear an existing TTL, so a reused canvas_id would inherit
+        # the previous run's expiry on the registry. If the retry outlived it the
+        # registry would vanish mid-run and every key tracked before that point
+        # would be invisible to the final expire sweep — leaked permanently.
+        await self.client.persist(self._key_registry_key(canvas_id))
         # Explicitly RUNNING, not merely absent. apply() accepts a caller-supplied
         # canvas_id for idempotent retries, and a terminal status from a previous
         # attempt outlives the data by design (see set_canvas_status) — so without

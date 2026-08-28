@@ -128,22 +128,48 @@ class WorkerApp:
                 loop.add_signal_handler(sig, self._stop_event.set)
 
     async def _shutdown(self) -> None:
-        # Stop pulling new messages first: cancel every consume loop before draining
-        # in-flight work. A consume loop left alive during drain() can pick up a
-        # message drain's own timeout just requeued and immediately re-nack it —
-        # not incorrect, but an avoidable extra round-trip; cancelling the loops up
-        # front removes that race entirely.
+        # Order matters, and two separate bugs pin it down.
+        #
+        # Cancel the consume loops before draining (bug #19): a loop left alive
+        # during drain() picks up whatever a drain timeout just requeued and
+        # re-nacks it, inflating the attempt count.
+        #
+        # But release the *transport* only after draining. Cancelling run() unwinds
+        # its `async for`, and finalising the generator there would run the broker's
+        # cleanup — closing the RabbitMQ channel, stopping the Kafka consumer — that
+        # in-flight handlers still need to ack on. A handler completing during the
+        # drain would then fail its ack, fall into the catch-all, nack, and have the
+        # node re-run despite the canvas already having advanced. Each worker holds
+        # its own consume generator so the two can be separated.
         for worker in self._workers.values():
             worker.stop_consuming()
         for task in self._tasks.values():
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         await self._drain_workers()
+        for worker in self._workers.values():
+            await worker.close_consumer()
         await self.broker.close()
         await self.store.close()
         await self._close_executors()
+        self._remove_signal_handlers()
+        for worker in self._workers.values():
+            worker.resume_consuming()
         self._running = False
         self._stop_event.clear()
+
+    def _remove_signal_handlers(self) -> None:
+        """Hand SIGTERM/SIGINT back to whatever owned them before ``run()``.
+
+        ``add_signal_handler`` is loop-global and outlives the app: left installed,
+        every later Ctrl-C routes to a ``_stop_event`` nothing is awaiting, with the
+        default handler gone — so the process becomes uninterruptible for any work
+        that follows.
+        """
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.remove_signal_handler(sig)
 
     async def _drain_workers(self) -> None:
         """Let in-flight handlers finish, then make sure the timed-out ones are done too.

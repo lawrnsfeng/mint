@@ -10,6 +10,7 @@ from mint.worker.envelope import Envelope
 from mint.worker.exc import (
     ConflictingErrorPolicyError,
     DuplicateNodeIdError,
+    EmptyContainerError,
     MissingInputError,
 )
 from mint.worker.stores.memory import MemoryCanvasStore
@@ -371,3 +372,31 @@ class TestNestedContainerIdCollision:
         assert isinstance(outer_node, GroupNode)
         assert "inner" in outer_node.children
         assert "outer" not in outer_node.children
+
+
+class TestEmptyContainers:
+    """Every DSL failure must be a WorkerError, not a leaked pydantic/IndexError."""
+
+    def test_an_empty_chain_is_rejected(self) -> None:
+        """`build()` would raise a raw pydantic ValidationError from min_length=1."""
+        with pytest.raises(EmptyContainerError):
+            Chain([])
+
+    def test_a_nested_empty_chain_is_rejected_at_its_own_construction(self) -> None:
+        """The inner chain raises before the outer one ever sees it.
+
+        Which is why flattening can never produce an empty chain, and there is no
+        second guard after it.
+        """
+        with pytest.raises(EmptyContainerError):
+            Chain([Chain([]), Node(topic="a")])
+
+    def test_an_empty_chord_is_rejected(self) -> None:
+        """Same contract for a chord's legs."""
+        with pytest.raises(EmptyContainerError):
+            Chord([])
+
+    def test_a_non_empty_container_is_unaffected(self) -> None:
+        """The guard must not reject ordinary graphs."""
+        assert len(Chain([Node(topic="a")]).steps) == 1
+        assert len(Chord([Node(topic="a")]).legs) == 1

@@ -185,16 +185,25 @@ class AMQPRPCExecutor[T: BaseModel, RT: BaseModel]:
         correlation_id = str(uuid4())
         loop = asyncio.get_running_loop()
         future: asyncio.Future[RT] = loop.create_future()
+        # Registered before publishing, because a reply can arrive the instant the
+        # request lands — but a failed publish then has to undo it. Only
+        # _await_reply's finally pops the map, and a raise here never reaches it,
+        # so every call during a broker outage would leak an entry and a future
+        # that nothing will ever resolve.
         self._pending[correlation_id] = future
-        await channel.default_exchange.publish(
-            Message(
-                input_.model_dump_json().encode(),
-                correlation_id=correlation_id,
-                reply_to=reply_queue.name,
-                delivery_mode=DeliveryMode.PERSISTENT,
-            ),
-            routing_key=self.queue,
-        )
+        try:
+            await channel.default_exchange.publish(
+                Message(
+                    input_.model_dump_json().encode(),
+                    correlation_id=correlation_id,
+                    reply_to=reply_queue.name,
+                    delivery_mode=DeliveryMode.PERSISTENT,
+                ),
+                routing_key=self.queue,
+            )
+        except Exception:
+            self._pending.pop(correlation_id, None)
+            raise
         return await self._await_reply(correlation_id, future)
 
     @staticmethod

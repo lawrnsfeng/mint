@@ -216,8 +216,16 @@ class Coordinator:
         await asyncio.gather(*self._tasks, return_exceptions=True)
         await self.broker.close()
         await self.store.close()
+        self._remove_signal_handlers()
         self._running = False
         self._stop_event.clear()
+
+    def _remove_signal_handlers(self) -> None:
+        """Hand SIGTERM/SIGINT back; ``add_signal_handler`` is loop-global."""
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, ValueError):
+                loop.remove_signal_handler(sig)
 
     async def _consume_results(self) -> None:
         """Consume results until cancelled, surviving anything one delivery can throw.

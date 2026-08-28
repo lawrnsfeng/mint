@@ -85,6 +85,21 @@ class MissingInputError(WorkerError):
 
 
 @dataclass
+class EmptyContainerError(WorkerError):
+    """A Chain or Chord was built with no children.
+
+    Caught in the DSL so it surfaces as a ``WorkerError`` like every other builder
+    failure. Left to ``build()`` it becomes a raw pydantic ``ValidationError`` from
+    the node's ``min_length=1``, and ``publish_entries`` would ``IndexError`` before
+    that — neither of which any caller is watching for.
+    """
+
+    TEMPLATE = "{container} {container_id} has no children"
+    container: str
+    container_id: str
+
+
+@dataclass
 class ChildNotInParentError(WorkerError):
     """A node's parent does not list it as one of its children.
 

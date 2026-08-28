@@ -48,10 +48,13 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
 
+from mint.logger import get_logger
 from mint.worker.enums import DeliveryGuarantee
 
 if TYPE_CHECKING:
     from aiokafka.structs import ConsumerRecord
+
+logger = get_logger(__name__)
 
 ATTEMPT_HEADER: Final[str] = "x-mint-attempt"
 
@@ -210,6 +213,19 @@ class KafkaBroker:
         partition for the lifetime of the broker if the topic is consumed again.
         """
         for key in [key for key in self._inflight if key[0] == topic]:
+            unsettled = [
+                offset for offset in self._inflight[key] if offset not in self._settled[key]
+            ]
+            if unsettled:
+                # Their acks can no longer commit anything, so those records will be
+                # reprocessed on restart. At-least-once, but say so rather than
+                # letting it happen silently.
+                logger.warning(
+                    "Dropping offset bookkeeping with work still in flight",
+                    topic=topic,
+                    partition=key[1],
+                    unsettled=len(unsettled),
+                )
             del self._inflight[key]
             self._settled.pop(key, None)
 
@@ -238,7 +254,12 @@ class KafkaBroker:
         """
         key = (record.topic, record.partition)
         inflight = self._inflight.get(key)
-        if inflight is None:
+        if inflight is None or record.offset not in inflight:
+            # Not queued: either the consumer already stopped, or this is the second
+            # KafkaDelivery for an offset track() deliberately deduplicated. Recording
+            # it anyway would leave a settled marker with nothing to pop, and if that
+            # offset is ever tracked again it would count as settled the moment it
+            # reached the head — committing past a handler still running.
             return None
         self._settled[key].add(record.offset)
 

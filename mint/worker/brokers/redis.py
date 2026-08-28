@@ -103,6 +103,9 @@ class RedisBroker:
     ATTEMPT_FIELD: Final[bytes] = b"attempt"
     DEFAULT_BLOCK_MS: Final[int] = 5_000
     DEFAULT_RECLAIM_IDLE_MS: Final[int] = 60_000
+    # How many self-owned entries to skip past per poll before giving up until the
+    # next one. Bounded so a large pending list can't stall the consume loop.
+    RECLAIM_SCAN_LIMIT: Final[int] = 8
 
     def __init__(
         self,
@@ -196,23 +199,29 @@ class RedisBroker:
         Returns None when there is nothing idle enough to claim, which is the
         normal case — the cost of this is one ``XAUTOCLAIM`` per poll.
         """
-        response = await self.client.xautoclaim(
-            topic,
-            self.group,
-            self.consumer_name,
-            self.reclaim_idle_ms,
-            start_id="0-0",
-            count=1,
-        )
-        # XAUTOCLAIM replies (next_cursor, entries[, deleted]) — the third element
-        # only exists on Redis >= 7, so unpack positionally rather than by arity.
-        entries = response[1] if len(response) > 1 else []
-        if not entries:
-            return None
-        message_id, fields = entries[0]
-        if (topic, message_id) in self._inflight_ids:
-            return None
-        return self._entry(topic, message_id, fields)
+        cursor: bytes | str = "0-0"
+        for _ in range(self.RECLAIM_SCAN_LIMIT):
+            response = await self.client.xautoclaim(
+                topic,
+                self.group,
+                self.consumer_name,
+                self.reclaim_idle_ms,
+                start_id=cursor,
+                count=1,
+            )
+            # XAUTOCLAIM replies (next_cursor, entries[, deleted]) — the third element
+            # only exists on Redis >= 7, so unpack positionally rather than by arity.
+            entries = response[1] if len(response) > 1 else []
+            if not entries:
+                return None
+            message_id, fields = entries[0]
+            if (topic, message_id) not in self._inflight_ids:
+                return self._entry(topic, message_id, fields)
+            # One of ours, still running. XAUTOCLAIM scans in id order, so returning
+            # here would let a single slow handler hide every abandoned entry behind
+            # it — advance past it and keep looking instead.
+            cursor = response[0]
+        return None
 
     def _entry(
         self,

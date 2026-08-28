@@ -508,3 +508,41 @@ class TestReplyConsumerDoesNotAck:
 
         _, kwargs = mock_channel.declare_queue.return_value.consume.await_args
         assert kwargs["no_ack"] is True
+
+
+class TestFailedPublishDoesNotLeak:
+    """Only _await_reply's finally pops _pending, and a failed publish never reaches it."""
+
+    async def test_a_publish_failure_clears_the_pending_entry(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """Every call during a broker outage leaked an id and an unresolved future.
+
+        That is the same unbounded leak the module docstring says it closed for
+        lost replies and cancelled calls, reached through the request side.
+        """
+        detail = "broker unreachable"
+        mock_channel.default_exchange.publish.side_effect = ConnectionError(detail)
+
+        with pytest.raises(ConnectionError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+        assert executor._pending == {}
+
+    async def test_a_publish_failure_still_releases_the_reply_queue(
+        self,
+        executor: AMQPRPCExecutor[EchoInput, EchoOutput],
+        mock_channel: AsyncMock,
+    ) -> None:
+        """The queue teardown must not be skipped by the new re-raise."""
+        queue = mock_channel.declare_queue.return_value
+        queue.consume.return_value = "ctag-fail"
+        detail = "broker unreachable"
+        mock_channel.default_exchange.publish.side_effect = ConnectionError(detail)
+
+        with pytest.raises(ConnectionError):
+            await executor.execute(None, EchoInput(value="hi"))
+
+        queue.cancel.assert_awaited_once_with("ctag-fail")

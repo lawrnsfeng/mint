@@ -130,6 +130,14 @@ is the expanded, "how do I actually fix this" version.
 - [90. Closing an executor pool blocks the event loop](#90-closing-an-executor-pool-blocks-the-event-loop)
 - [91. A task cancelled before it starts leaks its concurrency slot](#91-a-task-cancelled-before-it-starts-leaks-its-concurrency-slot)
 
+**Part 10 — Bugs found by a ninth review round**
+
+- [92. A late result completes a node the sweeper already timed out](#92-a-late-result-completes-a-node-the-sweeper-already-timed-out)
+- [93. Recreating a canvas leaves the previous attempt's fan-in state](#93-recreating-a-canvas-leaves-the-previous-attempts-fan-in-state)
+- [94. `ABORT` never records its container's own outcome](#94-abort-never-records-its-containers-own-outcome)
+- [95. Kafka and MemoryBroker extend the dead-letter chain](#95-kafka-and-memorybroker-extend-the-dead-letter-chain)
+- [96. `NatsBroker.consume` never unsubscribes](#96-natsbrokerconsume-never-unsubscribes)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3456,6 +3464,152 @@ the release belongs there too.
 
 ---
 
+## Part 10 — Bugs found by a ninth review round
+
+Two of these are the same shape as bugs from the two rounds before them: a fix
+that satisfied one half of its own contract and was signed off anyway.
+
+### 92. A late result completes a node the sweeper already timed out
+
+**Where:** `mint/worker/coordinator.py::_handle_result`
+
+**Symptom:** A chain's next step is dispatched twice, on a canvas that passed
+`max_age` and then reported.
+
+**Root cause:** Issue #72 introduced `_claim` precisely so the sweeper and a live
+result could not both complete a node, and `_timeout_node` checks it:
+
+```python
+if self._claim(entry.canvas_id, entry.node_id) is None:
+    return
+```
+
+`_handle_result` calls the same method — but only to hold something it can
+`_restore` if the advance fails. It never inspects the result:
+
+```python
+claim = self._claim(envelope.canvas_id, envelope.node_id)
+if not await self._advance(...):     # runs whether or not the claim was won
+```
+
+So the exclusion held one way. The sweeper times out node `a`, the chain
+(`CONTINUE`) dispatches `b`, the real result for `a` arrives, `_claim` returns
+`None`, and `b` is dispatched a second time.
+
+**Why the obvious fix is wrong.** Standing down on a `None` claim breaks
+centralized mode outright: an entry node dispatched with a bare `broker.publish`
+was never tracked either — the coordinator's own docstring says so — and its
+result must still advance the canvas. A failed claim genuinely means two different
+things.
+
+**The practical fix:** Make the sweeper's decision explicit rather than inferring
+it from an absence.
+
+```python
+self._timed_out.add((entry.canvas_id, entry.node_id))   # after a successful timeout advance
+...
+if key in self._timed_out:                              # in _handle_result
+    self._timed_out.discard(key)
+    await delivery.ack()
+    return True
+```
+
+Entries are consumed by the late result they exist for, and dropped per canvas on
+`cancel()`.
+
+---
+
+### 93. Recreating a canvas leaves the previous attempt's fan-in state
+
+**Where:** `mint/worker/stores/memory.py::create_canvas`,
+`mint/worker/stores/redis.py::create_canvas`
+
+**Symptom:** Retrying `Chord.apply(..., canvas_id="cv")` after a failed attempt
+does nothing. The legs run, the callback never fires, the canvas stalls RUNNING.
+
+**Root cause:** Issue #68 made `create_canvas` reset the canvas *status*, so a
+retry under a caller-supplied id would not inherit a terminal one. It stopped
+there. The group done-sets, the fired guards and the recorded results all
+survived — so `mark_child_done` reported `fired=False` on every retry and the
+callback was never dispatched again.
+
+The retry escapes exactly one of the two ways the previous attempt could have
+stalled, which is worse than not supporting retries at all: the caller is told the
+canvas was recreated.
+
+This is the same shape as issue #87 one round earlier — reset one piece of state,
+declare the contract met. Both were fixes to *my own* previous fixes.
+
+**The practical fix:** Purge everything the previous attempt touched before
+writing the new graph. Redis already maintains a key registry for the TTL sweep,
+which is exactly the list needed.
+
+---
+
+### 94. `ABORT` never records its container's own outcome
+
+**Where:** `mint/worker/canvas/engine.py::_advance_chain`,
+`::_apply_group_error_policy`
+
+**Symptom:** After an abort, the chain or group node reads `PENDING` with no
+result — while its children read `ERROR`/`CANCELLED` and the canvas reads `ERROR`.
+The compound node misreports as never started.
+
+**Root cause:** Both ABORT branches cancel the remainder, mark the canvas, and
+return `(None, None)`. Returning no bubbled outcome is correct — ABORT ends the
+canvas, so nothing above should advance — but `_complete` only records what is
+bubbled, so nothing recorded the container itself. The PROPAGATE branches record
+theirs as a side effect of bubbling, which is why the gap was only on this side.
+
+**The practical fix:** Record explicitly, still without bubbling.
+
+Three existing tests asserted `get_result(container) is None` after an abort.
+They were encoding the gap, so they changed — but only after checking that the
+container genuinely had failed and that PROPAGATE already recorded the same
+thing. A failing test after a fix deserves the second look; sometimes the second
+look agrees with the fix.
+
+---
+
+### 95. Kafka and MemoryBroker extend the dead-letter chain
+
+**Where:** `mint/worker/brokers/kafka.py::deadletter`,
+`mint/worker/brokers/memory.py::deadletter`
+
+**Symptom:** Dead-lettering a message consumed from `foo.dlq` publishes it to
+`foo.dlq.dlq` — and, on Kafka, auto-creates that topic. One new level per pass.
+
+**Root cause:** `RabbitMQBroker._declare_topic` learned to terminate the chain in
+bug #21 and `NatsBroker` in issue #86. Kafka and `MemoryBroker` never did. That
+`MemoryBroker` differs matters beyond tidiness: it is what the whole fast test
+lane runs on, so a test using it sees a shape production does not have.
+
+**The practical fix:** Drop rather than extend, in both.
+
+Fourth instance in this catalogue of a rule applied to one half of a pair, after
+#69 (ABORT/PROPAGATE), #80 (track/settle) and #86 (declare/publish). It is by far
+the most repeated mistake here.
+
+---
+
+### 96. `NatsBroker.consume` never unsubscribes
+
+**Where:** `mint/worker/brokers/nats.py::consume`
+
+**Symptom:** A JetStream subscription outlives the consume loop that created it.
+
+**Root cause:** No `try/finally` around `pull_subscribe`, so
+`Worker.close_consumer()`'s `aclose()` unwinds the generator without releasing
+anything. `RabbitMQBroker.consume` closes its channel in a `finally` and
+`KafkaBroker.consume` stops its consumer; NATS relied on `close()` tearing down
+the whole client — which issue #76 deliberately stopped doing at that point, since
+`close_consumer` now runs before the broker closes.
+
+**The practical fix:** A `finally` that unsubscribes, suppressing failures so
+teardown can't mask the real exit.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -3603,3 +3757,15 @@ adding a new broker, executor, or engine transition:
 - **Prefer refusing to pretending.** Reopening brokers was a bigger contract than
   the package offers, so `run()`-after-shutdown raises instead of silently
   consuming nothing (issue #87).
+- **A half-satisfied contract is worse than an unsupported one**, because the
+  caller is told it worked. Retrying a canvas reset the status but not the fan-in
+  guards (issue #93); restarting an app cleared the stop flag but not the closed
+  broker (issue #87). Both were fixes to earlier fixes.
+- **Check every caller of a guard you add, not just the one you wrote it for.**
+  `_claim` was honoured by the sweeper and ignored by the result path for three
+  rounds (issue #92).
+- **When one value means two different things, make the distinction explicit.**
+  A failed `_claim` meant both "someone else won" and "never tracked"; the fix was
+  a separate record, not a cleverer inference (issue #92).
+- **The in-memory broker is part of the contract.** It backs the whole fast lane,
+  so a rule it doesn't implement is a rule the tests can't see (issue #95).

@@ -18,9 +18,11 @@ waiting a result for" purely in memory.
 import asyncio
 import contextlib
 import signal
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Final
 
 from pydantic import ValidationError
 
@@ -74,6 +76,8 @@ class Coordinator:
     canvas's entry node(s) were dispatched at all.
     """
 
+    MAX_TIMED_OUT: Final[int] = 10_000
+
     def __init__(
         self,
         broker: IBroker,
@@ -96,11 +100,18 @@ class Coordinator:
         # in two canvases at once is supported usage — and a bare node_id key means
         # one canvas silently evicts the other from the sweeper.
         self._in_flight: dict[tuple[str, str], InFlightNode] = {}
-        # Nodes the sweeper has already failed. A late real result for one of these
-        # must stand down, or the node completes twice. This can't be inferred from
-        # a failed _claim: an entry node dispatched with a bare broker.publish was
+        # Nodes the sweeper has taken over. A late real result for one of these must
+        # stand down, or the node completes twice. This can't be inferred from a
+        # failed _claim: an entry node dispatched with a bare broker.publish was
         # never tracked either, and its result must still advance the canvas.
-        self._timed_out: set[tuple[str, str]] = set()
+        #
+        # Bounded, and ordered by insertion: an entry is normally consumed by the
+        # late result it exists for, but a node whose worker genuinely died never
+        # produces one, so without a cap a long-running coordinator accumulates one
+        # tuple per timed-out node forever. Evicting the oldest risks double-completing
+        # a result that arrives after MAX_TIMED_OUT further timeouts, which is a
+        # trade worth making against unbounded growth.
+        self._timed_out: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._by_canvas: dict[str, set[str]] = {}
         self._running = False
         self._shut_down = False
@@ -131,7 +142,8 @@ class Coordinator:
             for node_id in node_ids:
                 self._untrack(canvas_id, node_id)
         # This canvas is over; nothing will arrive late for it any more.
-        self._timed_out -= {key for key in self._timed_out if key[0] == canvas_id}
+        for stale in [key for key in self._timed_out if key[0] == canvas_id]:
+            self._timed_out.pop(stale, None)
         await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
 
     async def run(self) -> None:
@@ -185,6 +197,13 @@ class Coordinator:
     def _track(self, canvas_id: str, node_id: str) -> None:
         self._in_flight[canvas_id, node_id] = InFlightNode(canvas_id, node_id, datetime.now(UTC))
         self._by_canvas.setdefault(canvas_id, set()).add(node_id)
+
+    def _record_timed_out(self, key: tuple[str, str]) -> None:
+        """Mark a node as taken over by the sweeper, evicting the oldest if full."""
+        self._timed_out[key] = None
+        self._timed_out.move_to_end(key)
+        while len(self._timed_out) > self.MAX_TIMED_OUT:
+            self._timed_out.popitem(last=False)
 
     def _claim(self, canvas_id: str, node_id: str) -> InFlightNode | None:
         """Take exclusive ownership of a tracked node, returning what was claimed.
@@ -313,9 +332,9 @@ class Coordinator:
         # then dead-letters from escaping the sweeper entirely.
         key = (envelope.canvas_id, envelope.node_id)
         if key in self._timed_out:
-            # The sweeper already completed this node with a synthetic timeout.
-            # Advancing again dispatches a chain's next step a second time.
-            self._timed_out.discard(key)
+            # The sweeper already took this node over. Advancing again dispatches a
+            # chain's next step a second time.
+            self._timed_out.pop(key, None)
             logger.warning(
                 "Discarding a result for a node already timed out",
                 node_id=envelope.node_id,
@@ -420,8 +439,16 @@ class Coordinator:
         double-counts a group leg. Untracking *is* the check: whichever of the two
         removes the entry first is the one that gets to complete the node.
         """
+        key = (entry.canvas_id, entry.node_id)
         if self._claim(entry.canvas_id, entry.node_id) is None:
             return
+        # Recorded *before* the await, not after it. Marking it afterwards left the
+        # whole of engine.complete() plus the dispatch publish as a window in which
+        # the real result could arrive, find nothing in _timed_out, get None from
+        # _claim (indistinguishable from an untracked entry node) and complete the
+        # node a second time. With MemoryCanvasStore there is barely a suspension
+        # point; against Redis it is a full round trip.
+        self._record_timed_out(key)
         outcome = NodeOutcome(
             node_id=entry.node_id,
             status=NodeStatus.ERROR,
@@ -435,5 +462,7 @@ class Coordinator:
             # ever retry this. Put it back and let the next sweep try again, rather
             # than leaving the canvas RUNNING with no error recorded at all.
             self._restore(entry)
+            # Not actually timed out after all — the node is tracked again and a
+            # real result must still be able to complete it.
+            self._timed_out.pop(key, None)
             return
-        self._timed_out.add((entry.canvas_id, entry.node_id))

@@ -14,6 +14,7 @@ from collections.abc import Sequence
 from dataclasses import replace
 from typing import Final, assert_never
 
+from mint.logger import get_logger
 from mint.worker.canvas.dispatch import Dispatch
 from mint.worker.canvas.models import (
     AnyNode,
@@ -36,6 +37,8 @@ from mint.worker.exc import (
     WorkerError,
 )
 from mint.worker.stores.interface import ICanvasStore
+
+logger = get_logger(__name__)
 
 
 class CanvasEngine:
@@ -112,6 +115,18 @@ class CanvasEngine:
         outcome: NodeOutcome,
     ) -> list[Dispatch]:
         node = await self._require_node(canvas_id, node_id)
+        if node.status == NodeStatus.CANCELLED:
+            # Already-dispatched work under a cancelled subtree still reports when it
+            # finishes. Advancing from it dispatches the *next* step of a branch that
+            # was cancelled — side effects happening after the cancellation was
+            # recorded. Recording its outcome would also overwrite the CANCELLED
+            # status that says why it stopped.
+            logger.info(
+                "Discarding an outcome for a cancelled node",
+                node_id=node_id,
+                canvas_id=canvas_id,
+            )
+            return []
         await self._record(canvas_id, node_id, outcome)
 
         visited = {node_id}
@@ -196,7 +211,7 @@ class CanvasEngine:
                 )
                 return None, None
             if chain.error_policy == ErrorPolicy.PROPAGATE:
-                await self.store.cancel_nodes(canvas_id, remaining)
+                await self._cancel_subtrees(canvas_id, remaining)
                 return None, NodeOutcome(
                     node_id=chain.id,
                     status=NodeStatus.ERROR,
@@ -309,9 +324,41 @@ class CanvasEngine:
         raise InvalidParentTypeError(node_id=node.id, canvas_id=canvas_id)
 
     async def _abort_canvas(self, canvas_id: str, remaining: Sequence[str]) -> None:
-        if remaining:
-            await self.store.cancel_nodes(canvas_id, remaining)
+        await self._cancel_subtrees(canvas_id, remaining)
         await self.store.set_canvas_status(canvas_id, CanvasStatus.ERROR)
+
+    async def _cancel_subtrees(self, canvas_id: str, node_ids: Sequence[str]) -> None:
+        """Cancel these nodes and everything beneath them.
+
+        Marking only the named node leaves a compound leg's children untouched, so a
+        step already in flight inside a cancelled chain completes, is recorded, and
+        dispatches the next step — work running, and having side effects, under a
+        branch the engine has already given up on.
+        """
+        if not node_ids:
+            return
+        await self.store.cancel_nodes(canvas_id, await self._descendants(canvas_id, node_ids))
+
+    async def _descendants(self, canvas_id: str, node_ids: Sequence[str]) -> list[str]:
+        """Return ``node_ids`` plus every node underneath them, breadth-first."""
+        collected: list[str] = []
+        seen: set[str] = set()
+        queue = list(node_ids)
+        while queue:
+            current = queue.pop(0)
+            if current in seen:
+                continue
+            seen.add(current)
+            collected.append(current)
+            node = await self.store.get_node(canvas_id, current)
+            match node:
+                case ChainNode() | GroupNode():
+                    queue.extend(node.children)
+                    if isinstance(node, GroupNode) and node.callback is not None:
+                        queue.append(node.callback)
+                case _:
+                    pass
+        return collected
 
     async def _record(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
         if outcome.result is not None:
@@ -417,8 +464,7 @@ class CanvasEngine:
         ]
         if group.callback is not None:
             remaining.append(group.callback)
-        if remaining:
-            await self.store.cancel_nodes(canvas_id, remaining)
+        await self._cancel_subtrees(canvas_id, remaining)
 
     async def _unfinished(self, canvas_id: str, group: GroupNode) -> list[str]:
         """Return the group's children that have no recorded outcome yet.

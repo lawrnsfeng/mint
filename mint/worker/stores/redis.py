@@ -29,6 +29,25 @@ from mint.worker.canvas.models import AnyNode, NodeAdapter, NodeOutcome
 from mint.worker.enums import CanvasStatus, NodeStatus
 from mint.worker.stores.interface import GroupProgress
 
+# Compare-and-set on a node's status, so a transition can't lose to a concurrent
+# one. A plain get/check/set is a read-modify-write, and this store is the
+# multi-process configuration by definition: an ABORT cancelling a node between
+# another process's PENDING check and its RUNNING write is silently overwritten,
+# which is exactly the guarantee ICanvasStore.mark_node_running documents.
+SET_STATUS_SCRIPT: Final[str] = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local node = cjson.decode(raw)
+local allowed = false
+for i = 2, #ARGV do
+    if node['status'] == ARGV[i] then allowed = true end
+end
+if not allowed then return 0 end
+node['status'] = ARGV[1]
+redis.call('SET', KEYS[1], cjson.encode(node))
+return 1
+"""
+
 FAN_IN_SCRIPT: Final[str] = """
 local added = redis.call('SADD', KEYS[1], ARGV[1])
 local done_count = redis.call('SCARD', KEYS[1])
@@ -74,6 +93,7 @@ class RedisCanvasStore:
         )
         self._client: Redis[bytes] | None = None
         self._fan_in_script: AsyncScript | None = None
+        self._set_status_script: AsyncScript | None = None
 
     @property
     def client(self) -> "Redis[bytes]":
@@ -161,15 +181,40 @@ class RedisCanvasStore:
 
     async def mark_node_running(self, canvas_id: str, node_id: str) -> None:
         """Move a node from PENDING to RUNNING. A no-op from any other status."""
-        node = await self.get_node(canvas_id, node_id)
-        if node is None or node.status != NodeStatus.PENDING:
-            return
-        await self.set_node_status(canvas_id, node_id, NodeStatus.RUNNING)
+        await self._transition(canvas_id, node_id, NodeStatus.RUNNING, (NodeStatus.PENDING,))
 
     async def cancel_nodes(self, canvas_id: str, node_ids: Sequence[str]) -> None:
-        """Mark every listed node CANCELLED."""
+        """Mark every listed node CANCELLED, unless it already reached a terminal status.
+
+        Guarded rather than unconditional: a leg that genuinely FINISHED before the
+        cancellation reached it did run, and stamping it CANCELLED would erase that.
+        """
         for node_id in node_ids:
-            await self.set_node_status(canvas_id, node_id, NodeStatus.CANCELLED)
+            await self._transition(
+                canvas_id,
+                node_id,
+                NodeStatus.CANCELLED,
+                (NodeStatus.PENDING, NodeStatus.RUNNING),
+            )
+
+    async def _transition(
+        self,
+        canvas_id: str,
+        node_id: str,
+        to: NodeStatus,
+        allowed_from: tuple[NodeStatus, ...],
+    ) -> None:
+        """Atomically move a node to ``to``, only from one of ``allowed_from``."""
+        script = self._ensure_set_status_script()
+        await script(
+            keys=[self._node_key(canvas_id, node_id)],
+            args=[to.value, *(status.value for status in allowed_from)],
+        )
+
+    def _ensure_set_status_script(self) -> AsyncScript:
+        if self._set_status_script is None:
+            self._set_status_script = self.client.register_script(SET_STATUS_SCRIPT)
+        return self._set_status_script
 
     async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
         """Persist a node's terminal outcome."""

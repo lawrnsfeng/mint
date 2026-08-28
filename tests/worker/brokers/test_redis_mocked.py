@@ -515,3 +515,49 @@ class TestReclaimGuardIsScopedToItsTopic:
         second = await anext(broker.consume("other.topic"))
 
         assert second.body == b"topic-b"
+
+
+class TestReclaimGuardIsReleasedEvenOnFailure:
+    """A guard entry that outlives its delivery makes that message unreclaimable."""
+
+    async def test_a_failing_nack_still_releases_the_guard(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """`Worker._safe_retry_or_drop` logs a failing nack rather than raising.
+
+        Releasing only on success left the id in `_inflight_ids` forever, so
+        `_reclaim` skipped that pending entry on every future pass — with a single
+        consumer, the message is stuck until the process restarts.
+        """
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"5-1", {RedisBroker.BODY_FIELD: b"body"})],
+            [],
+        ]
+        delivery = await anext(broker.consume(TOPIC))
+        assert (TOPIC, b"5-1") in broker._inflight_ids
+        mock_client.xadd.side_effect = ConnectionError("broker gone")
+
+        with pytest.raises(ConnectionError):
+            await delivery.nack(requeue=True)
+
+        assert (TOPIC, b"5-1") not in broker._inflight_ids
+
+    async def test_a_successful_ack_releases_the_guard(
+        self,
+        broker: RedisBroker,
+        mock_client: AsyncMock,
+    ) -> None:
+        """The ordinary path must keep working."""
+        mock_client.xautoclaim.return_value = [
+            b"0-0",
+            [(b"5-1", {RedisBroker.BODY_FIELD: b"body"})],
+            [],
+        ]
+        delivery = await anext(broker.consume(TOPIC))
+
+        await delivery.ack()
+
+        assert (TOPIC, b"5-1") not in broker._inflight_ids

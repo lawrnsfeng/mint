@@ -374,24 +374,76 @@ class TestClientConstruction:
 
 
 class TestCancelNodes:
-    """cancel_nodes must mark every listed node CANCELLED via set_node_status."""
+    """cancel_nodes must transition every listed node, atomically."""
 
-    async def test_cancel_nodes_updates_every_existing_node(
+    async def test_cancel_nodes_transitions_every_listed_node(
         self,
         store: RedisCanvasStore,
         mock_client: AsyncMock,
     ) -> None:
-        """Two node ids must each be read and rewritten with CANCELLED status."""
-        node = TaskNode(id="t1", canvas_id=CANVAS, topic="topic")
-        mock_client.get.return_value = node.model_dump_json().encode()
+        """One compare-and-set per node, rather than a read-modify-write per node."""
+        script = mock_client.register_script.return_value
 
         await store.cancel_nodes(CANVAS, ["t1", "t2"])
 
-        assert mock_client.get.await_count == 2
-        assert mock_client.set.await_count == 2
-        for call in mock_client.set.await_args_list:
-            _, written = call.args
-            assert b'"status":"cancelled"' in written
+        assert script.await_count == 2
+        keys = [call.kwargs["keys"][0] for call in script.await_args_list]
+        assert keys == [
+            f"mint-worker:canvas:{CANVAS}:node:t1",
+            f"mint-worker:canvas:{CANVAS}:node:t2",
+        ]
+
+    async def test_cancelling_is_refused_from_a_terminal_status(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """A leg that genuinely finished did run; stamping it CANCELLED erases that.
+
+        The guard lives in the Lua script, so the assertion is on which source
+        statuses it is told to accept.
+        """
+        script = mock_client.register_script.return_value
+
+        await store.cancel_nodes(CANVAS, ["t1"])
+
+        allowed = script.await_args.kwargs["args"][1:]
+        assert set(allowed) == {NodeStatus.PENDING.value, NodeStatus.RUNNING.value}
+        assert NodeStatus.FINISHED.value not in allowed
+
+
+class TestAtomicStatusTransitions:
+    """A read-modify-write loses to a concurrent transition in another process."""
+
+    async def test_mark_node_running_is_a_compare_and_set(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """`mark_node_running` documents that a CANCELLED node must not be resurrected.
+
+        With get/check/set that only held within one process — and this store is
+        the multi-process configuration by definition.
+        """
+        script = mock_client.register_script.return_value
+
+        await store.mark_node_running(CANVAS, "t1")
+
+        script.assert_awaited_once()
+        args = script.await_args.kwargs["args"]
+        assert args[0] == NodeStatus.RUNNING.value
+        assert args[1:] == [NodeStatus.PENDING.value]
+
+    async def test_a_transition_never_reads_then_writes(
+        self,
+        store: RedisCanvasStore,
+        mock_client: AsyncMock,
+    ) -> None:
+        """The whole point is that no gap exists between the check and the write."""
+        await store.mark_node_running(CANVAS, "t1")
+
+        mock_client.get.assert_not_awaited()
+        mock_client.set.assert_not_awaited()
 
 
 class TestGetResult:

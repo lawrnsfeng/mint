@@ -171,3 +171,76 @@ class TestNodeStatusPersistence:
         fetched = await store.get_node(CANVAS, "g")
 
         assert fetched == group
+
+
+class TestAtomicStatusTransitions:
+    """The compare-and-set has to work against a real server, cjson round-trip included."""
+
+    async def test_mark_node_running_moves_a_pending_node(
+        self,
+        store: RedisCanvasStore,
+    ) -> None:
+        """The happy path, through actual Lua and a real cjson encode/decode."""
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic")},
+        )
+
+        await store.mark_node_running(CANVAS, "t1")
+
+        node = await store.get_node(CANVAS, "t1")
+        assert node is not None
+        assert node.status == NodeStatus.RUNNING
+
+    async def test_a_cancelled_node_is_not_resurrected_as_running(
+        self,
+        store: RedisCanvasStore,
+    ) -> None:
+        """The guarantee `ICanvasStore.mark_node_running` documents, verified for real."""
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic")},
+        )
+        await store.cancel_nodes(CANVAS, ["t1"])
+
+        await store.mark_node_running(CANVAS, "t1")
+
+        node = await store.get_node(CANVAS, "t1")
+        assert node is not None
+        assert node.status == NodeStatus.CANCELLED
+
+    async def test_a_finished_node_is_not_cancelled(self, store: RedisCanvasStore) -> None:
+        """A leg that really ran must keep saying so."""
+        await store.create_canvas(
+            CANVAS,
+            {"t1": TaskNode(id="t1", canvas_id=CANVAS, topic="topic")},
+        )
+        await store.set_node_status(CANVAS, "t1", NodeStatus.FINISHED)
+
+        await store.cancel_nodes(CANVAS, ["t1"])
+
+        node = await store.get_node(CANVAS, "t1")
+        assert node is not None
+        assert node.status == NodeStatus.FINISHED
+
+    async def test_the_rewritten_node_still_validates(self, store: RedisCanvasStore) -> None:
+        """The script re-encodes the whole node via cjson, so every field must survive."""
+        original = GroupNode(
+            id="g",
+            canvas_id=CANVAS,
+            parent_id="chain",
+            children=["a", "b"],
+            callback="cb",
+            input='{"tenant":"acme"}',
+        )
+        await store.create_canvas(CANVAS, {"g": original})
+
+        await store.mark_node_running(CANVAS, "g")
+
+        node = await store.get_node(CANVAS, "g")
+        assert isinstance(node, GroupNode)
+        assert node.children == ["a", "b"]
+        assert node.callback == "cb"
+        assert node.input == '{"tenant":"acme"}'
+        assert node.parent_id == "chain"
+        assert node.status == NodeStatus.RUNNING

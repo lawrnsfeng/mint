@@ -884,3 +884,69 @@ class TestALateResultLosesToTheSweeper:
 
         async with asyncio.timeout(1.0):
             assert await anext(broker.consume("topic-t2")) is not None
+
+
+class TestTheSweeperClaimsBeforeItAwaits:
+    """The window is the advance itself, so the test has to suspend inside it."""
+
+    async def test_a_result_arriving_mid_timeout_advance_does_not_double_complete(
+        self,
+    ) -> None:
+        """Marking the node timed-out *after* the advance leaves the whole advance open.
+
+        The sweeper claims the node (untracking it), then suspends inside
+        `engine.complete()`; the real result arrives, finds nothing in `_timed_out`,
+        gets `None` from `_claim` — indistinguishable from an untracked entry node —
+        and completes the node a second time. `MemoryCanvasStore` has barely a
+        suspension point, so this store introduces one deliberately; against Redis
+        the window is a full round trip.
+        """
+        released = asyncio.Event()
+        entered = asyncio.Event()
+
+        class SuspendingStore(MemoryCanvasStore):
+            async def set_result(self, canvas_id: str, node_id: str, outcome: NodeOutcome) -> None:
+                if node_id == "t1" and not entered.is_set():
+                    entered.set()
+                    await released.wait()
+                await super().set_result(canvas_id, node_id, outcome)
+
+        store = SuspendingStore()
+        await store.create_canvas(
+            CANVAS,
+            {
+                "t1": TaskNode(id="t1", canvas_id=CANVAS, parent_id="chain", topic="topic-t1"),
+                "t2": TaskNode(id="t2", canvas_id=CANVAS, parent_id="chain", topic="topic-t2"),
+                "chain": ChainNode(
+                    id="chain",
+                    canvas_id=CANVAS,
+                    parent_id=None,
+                    children=["t1", "t2"],
+                    error_policy=ErrorPolicy.CONTINUE,
+                ),
+            },
+        )
+        broker = MemoryBroker()
+        coordinator = Coordinator(broker, store, RESULTS_TOPIC)
+        coordinator._track(CANVAS, "t1")
+
+        stale = InFlightNode(CANVAS, "t1", datetime.now(UTC) - timedelta(seconds=999))
+        sweep = asyncio.create_task(coordinator._timeout_node(stale))
+        async with asyncio.timeout(1.0):
+            await entered.wait()
+
+        # The real result lands while the sweeper is still inside its advance.
+        await publish_result(broker, "t1", ok_outcome("t1"))
+        delivery = await anext(broker.consume(RESULTS_TOPIC))
+        await coordinator._handle_result(delivery)
+
+        released.set()
+        async with asyncio.timeout(1.0):
+            await sweep
+
+        dispatched = []
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(0.2):
+                while True:
+                    dispatched.append(await anext(broker.consume("topic-t2")))
+        assert len(dispatched) == 1

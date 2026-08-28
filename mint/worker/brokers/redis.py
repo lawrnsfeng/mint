@@ -83,14 +83,28 @@ class RedisStreamDelivery:
 
     async def ack(self) -> None:
         """Acknowledge this message, removing it from the consumer group's pending list."""
-        await self._broker.ack(self._entry)
+        try:
+            await self._broker.ack(self._entry)
+        finally:
+            self._broker.release(self._entry)
 
     async def nack(self, *, requeue: bool) -> None:
-        """Requeue with an incremented attempt (headers preserved), or dead-letter."""
-        if requeue:
-            await self._broker.redeliver(replace(self._entry, attempt=self._entry.attempt + 1))
-        else:
-            await self._broker.deadletter(self._entry)
+        """Requeue with an incremented attempt (headers preserved), or dead-letter.
+
+        The reclaim guard is released whether or not the settle succeeded. Releasing
+        it only on success meant a swallowed nack — ``Worker._safe_retry_or_drop``
+        logs rather than raises — left the id in ``_inflight_ids`` forever, and
+        ``_reclaim`` then skipped that pending entry on every future pass. With a
+        single consumer on the topic, that message is stuck unacked and undelivered
+        until the process restarts, in a broker declaring at-least-once.
+        """
+        try:
+            if requeue:
+                await self._broker.redeliver(replace(self._entry, attempt=self._entry.attempt + 1))
+            else:
+                await self._broker.deadletter(self._entry)
+        finally:
+            self._broker.release(self._entry)
 
 
 class RedisBroker:
@@ -268,9 +282,12 @@ class RedisBroker:
         await self.client.xadd(f"{entry.topic}{self.DLQ_SUFFIX}", fields)
         await self._retire(entry)
 
+    def release(self, entry: StreamEntry) -> None:
+        """Drop ``entry`` from the reclaim guard, settled or not."""
+        self._inflight_ids.discard((entry.topic, entry.message_id))
+
     async def _retire(self, entry: StreamEntry) -> None:
         """Ack ``entry`` out of the pending list and delete it from its stream."""
-        self._inflight_ids.discard((entry.topic, entry.message_id))
         # types-redis declares xack() without annotations, so mypy sees an untyped
         # call in a typed context. Nothing on our side can make it typed.
         await self.client.xack(  # type: ignore[no-untyped-call]

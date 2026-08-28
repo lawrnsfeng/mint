@@ -1390,3 +1390,81 @@ class TestRollbackReleasesEveryGuardBurned:
         assert len(authorised) == 1
         assert len(redelivered) == 1
         assert redelivered[0].node_id == "cb"
+
+
+class TestCancelledSubtreesStopRunning:
+    """Cancelling a compound leg must stop everything inside it, not just label it."""
+
+    async def _nested(self, store: MemoryCanvasStore) -> None:
+        """Build root=[grp, tail] (CONTINUE), grp=PROPAGATE over [a, B], B=chain [b1, b2]."""
+        await seed(
+            store,
+            task("a", "grp"),
+            task("b1", "B"),
+            task("b2", "B"),
+            ChainNode(id="B", canvas_id=CANVAS, parent_id="grp", children=["b1", "b2"]),
+            GroupNode(
+                id="grp",
+                canvas_id=CANVAS,
+                parent_id="root",
+                children=["a", "B"],
+                callback=None,
+                error_policy=ErrorPolicy.PROPAGATE,
+            ),
+            task("tail", "root", topic="tail"),
+            ChainNode(
+                id="root",
+                canvas_id=CANVAS,
+                parent_id=None,
+                children=["grp", "tail"],
+                error_policy=ErrorPolicy.CONTINUE,
+            ),
+        )
+
+    async def test_cancelling_a_compound_leg_cancels_its_children(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Only the leg's own node was marked; its steps were left PENDING."""
+        await self._nested(store)
+
+        await engine.complete(CANVAS, "a", err_outcome("a"))
+
+        for node_id in ("B", "b1", "b2"):
+            node = await store.get_node(CANVAS, node_id)
+            assert node is not None
+            assert node.status == NodeStatus.CANCELLED
+
+    async def test_work_already_in_flight_under_a_cancelled_leg_dispatches_nothing(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """`b1` was already dispatched when `B` was cancelled, and still reports.
+
+        Advancing from it dispatched `b2` — side effects under a branch the engine
+        had already given up on.
+        """
+        await self._nested(store)
+        await engine.complete(CANVAS, "a", err_outcome("a"))
+
+        dispatches = await engine.complete(CANVAS, "b1", ok_outcome("b1"))
+
+        assert dispatches == []
+
+    async def test_a_cancelled_nodes_outcome_is_not_recorded(
+        self,
+        engine: CanvasEngine,
+        store: MemoryCanvasStore,
+    ) -> None:
+        """Recording it would overwrite the CANCELLED status that says why it stopped."""
+        await self._nested(store)
+        await engine.complete(CANVAS, "a", err_outcome("a"))
+
+        await engine.complete(CANVAS, "b1", ok_outcome("b1"))
+
+        assert await store.get_result(CANVAS, "b1") is None
+        node = await store.get_node(CANVAS, "b1")
+        assert node is not None
+        assert node.status == NodeStatus.CANCELLED

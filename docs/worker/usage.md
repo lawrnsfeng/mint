@@ -216,14 +216,12 @@ Construction never requires a running event loop — every broker builds its
 connection pool lazily, on first actual use, so ordinary synchronous
 DI/container setup works.
 
-**Hold a `consume()` generator for as long as you need its deliveries.** A
-consumer owns broker resources (a RabbitMQ channel, a Kafka consumer) and
-releases them when the generator is finalized, so `await anext(broker.consume(t))`
-as a throwaway expression can close the channel out from under a delivery you
-still intend to ack. `Worker.run()` does the right thing by construction
-(`async for delivery in broker.consume(self.topic):`, held for the loop's
-lifetime); anything driving a broker directly should keep the generator in a
-variable and pull every delivery from that same one.
+**Broker resources belong to the broker, not to the `consume()` generator.** A
+consumer's channel/subscription lives until `broker.close()`, so cancelling a
+consume loop — which is what shutdown does — leaves in-flight deliveries with a
+live transport to ack on. Anything driving a broker directly should still pull
+every delivery from one generator rather than calling `anext(broker.consume(t))`
+repeatedly, since each call opens a consumer for that topic.
 
 ## Executors
 

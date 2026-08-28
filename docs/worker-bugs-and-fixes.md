@@ -153,6 +153,15 @@ is the expanded, "how do I actually fix this" version.
 - [104. ABORT records its outcome after the TTL sweep has run](#104-abort-records-its-outcome-after-the-ttl-sweep-has-run)
 - [105. Kafka `publish` duplicates a caller-supplied attempt header](#105-kafka-publish-duplicates-a-caller-supplied-attempt-header)
 
+**Part 13 — Bugs found by a twelfth review round**
+
+- [106. Cancelling a consume loop still tears down its transport](#106-cancelling-a-consume-loop-still-tears-down-its-transport)
+- [107. Settlement is recorded after the ack, not before](#107-settlement-is-recorded-after-the-ack-not-before)
+- [108. The last read-modify-write in the Redis store](#108-the-last-read-modify-write-in-the-redis-store)
+- [109. A timed-out node is forgotten before its result is acked](#109-a-timed-out-node-is-forgotten-before-its-result-is-acked)
+- [110. An empty `create_canvas` skips the purge and the status reset](#110-an-empty-create_canvas-skips-the-purge-and-the-status-reset)
+- [111. `cancel_nodes` documents a contract neither store honours](#111-cancel_nodes-documents-a-contract-neither-store-honours)
+
 ---
 
 ## Part 1 — Bugs in the original `mini.worker`
@@ -3866,6 +3875,143 @@ is the one that can't see it.
 
 ---
 
+## Part 13 — Bugs found by a twelfth review round
+
+#106 is the most instructive entry in this catalogue. It is not a fix that missed
+half its contract, or a rule applied to one side of a pair. It is a fix built on a
+belief about Python that was wrong, asserted confidently in a commit message and a
+docstring, and left in place for five rounds because nobody checked it.
+
+### 106. Cancelling a consume loop still tears down its transport
+
+**Where:** `mint/worker/app.py::_shutdown` and every broker's `consume`
+
+**Symptom:** Exactly the symptom issue #76 claimed to have fixed. SIGTERM, a
+handler mid-`process()`, and after restart that node runs again — even though the
+canvas had already advanced and the next dispatch had been published.
+
+**Root cause:** Issue #76 needed two things that seemed to conflict: cancel the
+consume loops before draining (bug #19), but keep the transport alive *through*
+the drain. It resolved this by having `Worker` hold a reference to the consume
+generator, so the app could close it explicitly after draining, and stated:
+
+> Cancelling `run()` unwinds the `async for`, and letting the generator be
+> finalised then would run its cleanup
+
+...with the implication that holding a reference stops that. It does not. Holding
+a reference prevents *garbage-collection-driven* finalisation. Cancellation is a
+different mechanism entirely: it raises `CancelledError` inside the generator at
+its suspension point, which unwinds it and runs its `finally` — awaits and all —
+before the cancelling `gather` returns.
+
+Twenty lines confirm it:
+
+```python
+async def gen():
+    try:
+        while True:
+            await asyncio.sleep(3600); yield 1
+    finally:
+        log.append("entered"); await asyncio.sleep(0); log.append("completed")
+
+t = asyncio.create_task(consumer(g))   # g held in scope throughout
+await asyncio.sleep(0.05); t.cancel(); await asyncio.gather(t, return_exceptions=True)
+# log == ['entered', 'completed']
+```
+
+So `await channel.close()` ran before the drain, every time, and
+`worker.close_consumer()` was dead code from the moment it was written.
+
+**The practical fix:** Stop asking the generator to own the resource. The broker
+owns its consumers — a channel per topic for RabbitMQ, a subscription per topic
+for NATS — and releases them in `close()`, which `_shutdown` calls *after* the
+drain. `KafkaBroker` already worked this way: it kept a `_consumers` map that
+`close()` stopped, and its `finally` was both redundant and harmful. `Worker` no
+longer tracks a generator at all.
+
+**What to take from it.** The reasoning was plausible, written down twice, and
+never tested — the fix's own regression test asserted the *order* of two calls,
+which held perfectly well while the real cleanup happened somewhere else entirely.
+When a fix depends on a claim about how the language behaves, the claim is the
+thing to test.
+
+---
+
+### 107. Settlement is recorded after the ack, not before
+
+**Where:** `mint/worker/worker.py::_handle`
+
+**Root cause:** `DeliveryOutcome.settled` was introduced (issue #42) so a
+cancellation could not nack an already-acked delivery. But `settled` is assigned
+from the *return value* of `_process_delivery`, and the ack happened inside it —
+so a `CancelledError` arriving while `await delivery.ack()` was in flight
+propagated with the flag still `False`, and `_safe_retry_or_drop` nacked. The flag
+guarded the `on_success` window; it never guarded the ack it was written for.
+
+**The practical fix:** Move the ack into `_handle` and set `settled = True`
+*before* awaiting it. A cancellation mid-ack genuinely cannot tell you whether the
+ack reached the broker, so the choice is which way to be wrong: an ack that
+silently failed costs a redelivery, while a nack after a successful ack
+double-settles — republishing *and* acking again on RabbitMQ, re-running a node
+that finished.
+
+---
+
+### 108. The last read-modify-write in the Redis store
+
+**Where:** `mint/worker/stores/redis.py::set_node_status`
+
+**Root cause:** Issue #100 made `mark_node_running` and `cancel_nodes` atomic and
+left `set_node_status` as a client-side get/copy/set — the sixth instance of a
+rule applied to one half of a pair, and the half that actually loses the race.
+Process B cancels a node via the CAS between process A's read and A's write; A
+writes FINISHED over it, and `_complete`'s cancelled-node guard (issue #99) then
+never fires — the engine advances from a branch it had given up on, causing the
+side effects that guard exists to stop.
+
+**The practical fix:** The same `_transition`, refusing to overwrite a terminal
+status. A node that finished, errored or was cancelled has reached its conclusion.
+
+---
+
+### 109. A timed-out node is forgotten before its result is acked
+
+**Where:** `mint/worker/coordinator.py::_handle_result`
+
+**Root cause:** The key was popped from `_timed_out` before `await delivery.ack()`.
+A failing ack leaves `settled` false, `_consume_results` requeues — and the
+redelivery finds the key gone, passes the result to `_advance`, and completes the
+node a second time. Precisely the double-completion the set exists to prevent,
+reintroduced by cleaning up one line too early.
+
+---
+
+### 110. An empty `create_canvas` skips the purge and the status reset
+
+**Where:** `mint/worker/stores/redis.py::create_canvas`
+
+**Root cause:** An early `return` on an empty `nodes` mapping, where
+`MemoryCanvasStore` does both unconditionally. For a reused `canvas_id` whose
+previous attempt ended ERROR, Redis left the status ERROR while the memory store
+reset it to RUNNING — the two stand-ins diverging on a path `ICanvasStore` does
+not exclude.
+
+---
+
+### 111. `cancel_nodes` documents a contract neither store honours
+
+**Where:** `mint/worker/stores/interface.py`
+
+**Root cause:** The Protocol said "Mark every listed node CANCELLED". Both
+implementations deliberately skip nodes already in a terminal state — correctly,
+and each says so in its own docstring. The one place the guard is *not* written
+down is the contract, and it is load-bearing: `_cancel_subtrees` routinely lists
+already-finished grandchildren, and `_complete` discards outcomes for CANCELLED
+nodes, so honouring the documented contract literally would silently drop a
+redelivery of finished work.
+
+---
+
 ## Practical checklist for anyone extending `mint.worker`
 
 Distilled from every bug above — the recurring patterns to watch for when
@@ -4051,3 +4197,16 @@ adding a new broker, executor, or engine transition:
   TTL it should have inherited (issue #104).
 - **A field the package only ever reads through `dict()` can still be wrong on the
   wire.** Kafka headers are a list of pairs (issue #105).
+- **When a fix rests on a claim about the language, test the claim.** Holding a
+  reference to an async generator does not stop cancellation running its
+  `finally`; twenty lines would have shown that, and five rounds did not
+  (issue #106).
+- **A test that asserts call *order* proves nothing about a call happening
+  somewhere else.** #76's regression test passed throughout, while the cleanup it
+  was written to sequence ran in a different mechanism entirely (issue #106).
+- **Don't ask a generator to own a resource its consumer outlives.** Give it to
+  the object with the matching lifetime — the broker (issue #106).
+- **Set the "already settled" flag before the settling await, not after.** You
+  cannot find out afterwards whether it landed (issue #107).
+- **Clean up bookkeeping after the operation it guards succeeds**, not before
+  (issue #109).

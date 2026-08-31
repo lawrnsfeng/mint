@@ -31,6 +31,14 @@ db = [
     "psycopg2-binary>=2.9.10",
     "pydantic-settings>=2.6.0",
 ]
+worker = [
+    "redis>=5.2.1",
+    "types-redis>=4.6.0.20241004",
+    "aio-pika>=9.5.5",
+    "nats-py>=2.10.0",
+    "aiokafka>=0.12.0",
+    "grpcio>=1.68.0",
+]
 docs = [
     "mkdocs>=1.6.0",
     "mkdocs-material>=9.5.0",
@@ -52,6 +60,9 @@ test = [
     "testcontainers[azurite]>=4.0.0",
     "testcontainers[localstack]>=4.0.0",
     "testcontainers[postgres]>=4.0.0",
+    "testcontainers[redis]>=4.0.0",
+    "testcontainers[rabbitmq]>=4.0.0",
+    "testcontainers[kafka]>=4.0.0",
 ]
 
 [build-system]
@@ -83,6 +94,8 @@ line-length = 99
 select = ["ALL"]
 exclude = ["*mock*.py"]
 ignore = [
+    "CPY001",  # missing-copyright-notice — new in ruff 0.16 and part of ALL; this
+    # project carries no copyright headers on any file, by choice.
     "D100",  # undocumented-public-module
     "D104",  # undocumented-public-package
     "D105",  # undocumented-magic-method
@@ -103,6 +116,22 @@ ignore = [
     "D100",
     "D101",
     "D102",
+]
+"mint/worker/canvas/builder.py" = [
+    "A002",  # id/input are the DSL's actual public kwargs: Node(topic=..., input=..., id=...)
+]
+"mint/worker/worker.py" = [
+    "BLE001",  # process()'s task-execution boundary must turn any exception into an
+    # ERROR NodeOutcome rather than crash the worker — the blind catch is the point.
+]
+"tests/worker/executors/test_thread_pool.py" = [
+    "ASYNC251",  # the whole point of this fixture is a `process`-shaped coroutine that
+    # blocks synchronously — proving ThreadPoolExecutor isolates exactly that.
+]
+"tests/worker/executors/test_process_pool.py" = [
+    "ASYNC251",  # same as test_thread_pool.py, for ProcessPoolExecutor.
+    "S301",  # round-tripping a Worker's own bound process() through pickle is the
+    # property under test — the data is produced by the same test, not untrusted.
 ]
 
 [tool.mypy]

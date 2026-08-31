@@ -100,3 +100,46 @@ class CopySourceTooLargeError(FileStorageError):
     path: str
     size: int
     max_bytes: int
+
+
+@dataclass
+class ClientNotInitializedError(FileStorageError):
+    """Storage client accessed outside a client-bound operation."""
+
+    TEMPLATE = "client is not initialized for {storage}"
+    storage: str
+
+
+@dataclass
+class ProviderClosedError(FileStorageError):
+    """A client was requested from a provider that has been closed."""
+
+    TEMPLATE = "{provider} is closed and can no longer hand out clients"
+    provider: str
+
+
+@dataclass
+class IncompatibleClientError(FileStorageError):
+    """An injected client does not satisfy the required client protocol."""
+
+    TEMPLATE = "{got} does not satisfy {expected}; missing: {missing}"
+    expected: str
+    got: str
+    missing: list[str]
+
+
+@dataclass
+class FactoryNotConfiguredError(FileStorageError):
+    """A client factory was invoked on a provider that has none."""
+
+    TEMPLATE = "{provider} has no client_factory configured"
+    provider: str
+
+
+@dataclass
+class ConflictingClientSourceError(FileStorageError):
+    """More than one source was given for the same storage client."""
+
+    TEMPLATE = "{storage} accepts only one of provider, client or client_factory; got {given}"
+    storage: str
+    given: str

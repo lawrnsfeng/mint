@@ -21,7 +21,7 @@ storage = AzureBlobStorage(
     container_name="my-container",
     storage_account_name="my-account",
     connection_string="<connection-string>",
-    max_concurrent_clients=10,
+    max_concurrent_ops=10,
 )
 ```
 
@@ -39,7 +39,8 @@ storage = S3Storage(
     endpoint_url="http://localhost:4566",  # e.g. LocalStack; omit for AWS
     access_key="...",
     secret_key="...",
-    max_concurrent_clients=10,
+    max_pool_connections=64,
+    max_concurrent_ops=10,
 )
 ```
 
@@ -47,11 +48,49 @@ Credentials are resolved in priority order: explicit `access_key`/
 `secret_key` → `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars →
 `~/.aws/credentials` shared profile → IAM role/instance metadata.
 
-`max_concurrent_clients` (both backends) caps concurrent underlying client
-operations via `ConcurrencyLimiter`, and matters more for `S3Storage`
-specifically — each top-level call opens a new `aiobotocore`
-client/session, so unlimited concurrency can overwhelm a lightweight
-single-process endpoint like LocalStack.
+## Client caching
+
+Both backends borrow their SDK client from a **provider** that keeps one client
+per (configuration, event loop), instead of building one per operation. Nothing
+is required to opt in — the credential arguments select a shared provider, so
+two storages configured alike reuse a single client:
+
+```python
+a = S3Storage(bucket_name="one", endpoint_url=..., access_key=..., secret_key=...)
+b = S3Storage(bucket_name="two", endpoint_url=..., access_key=..., secret_key=...)
+assert a.provider is b.provider
+```
+
+This matters most on S3, where building a client per call also rebuilt the
+botocore session — re-running the whole credential chain, including the EC2
+instance-metadata probe. For 100 concurrent operations that was a median
+12 313 ms and 100 clients; it is now 458 ms and one — roughly 28x.
+
+Close the cache during your application's shutdown, from inside the event loop:
+
+```python
+from mint.fs.asynk.s3_provider import S3ClientProvider
+
+await S3ClientProvider.aclose_shared()
+```
+
+If you forget, a fallback closes each loop's clients when that loop tears down.
+
+See [Client Caching](client-caching.md) for the full picture: how the cache key
+is built, how Azure was affected differently, how to inject your own client, and
+the caveats.
+
+### Concurrency knobs
+
+- `max_pool_connections` — per-client HTTP pool size, and the one that matters
+  now: with a single shared client it is the process-wide concurrency ceiling.
+  mint defaults it to 64 rather than inheriting botocore's 10; raise it for
+  wider fan-out.
+- `max_concurrent_ops` — caps concurrent *operations* via
+  `ConcurrencyLimiter`, useful against a lightweight single-process endpoint
+  like LocalStack.
+- `max_concurrent_clients` — **deprecated** alias for `max_concurrent_ops`.
+  It once bounded client creation; clients are cached now, so nothing does.
 
 ## Basic operations
 

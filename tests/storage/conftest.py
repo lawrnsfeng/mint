@@ -16,7 +16,28 @@ from testcontainers.core.wait_strategies import (
 )
 
 from mint.fs.asynk.abs import AzureBlobStorage
+from mint.fs.asynk.abs_provider import BlobClientProvider
 from mint.fs.asynk.s3 import S3Storage
+from mint.fs.asynk.s3_provider import S3ClientProvider
+
+
+@pytest.fixture(autouse=True)
+async def _close_shared_providers() -> AsyncGenerator[None]:
+    """Close process-default providers while their event loop is still alive.
+
+    Providers cache one client per (configuration, event loop). pytest-asyncio
+    gives every test its own loop, so without this the previous test's client
+    would linger until some later test's sweep noticed the loop was closed --
+    by which point it can only be dropped, not closed, leaking the connector.
+    Closing here also exercises the shutdown path on every test.
+
+    Yields:
+        None. Cleanup runs after the test.
+
+    """
+    yield
+    await S3ClientProvider.aclose_shared()
+    await BlobClientProvider.aclose_shared()
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,13 +379,11 @@ async def s3_storage(
     after the test completes.
 
     Note:
-        `max_concurrent_clients=20` bounds how many aiobotocore client
-        sessions can be created simultaneously. Each top-level call
-        without a client already bound to the coroutine context opens
-        a brand-new session (see `S3Storage._ensure_client`); LocalStack's
-        single-process dev server cannot reliably serve hundreds of these
-        opening at once, so tests exercising high concurrency are capped
-        accordingly.
+        One cached client now serves every operation, so the ceiling that
+        matters is `max_pool_connections` -- botocore's default of 10 would
+        otherwise serialise the concurrency tests. `max_concurrent_ops` still
+        bounds in-flight operations so LocalStack's single-process dev server
+        is not overwhelmed.
 
     Args:
         s3_endpoint_url: LocalStack S3 endpoint URL.
@@ -379,7 +398,8 @@ async def s3_storage(
         access_key=LocalStackContainer.ACCESS_KEY,
         secret_key=LocalStackContainer.SECRET_KEY,
         region_name=LocalStackContainer.DEFAULT_REGION,
-        max_concurrent_clients=20,
+        max_pool_connections=64,
+        max_concurrent_ops=20,
     )
     await storage.ensure_bucket()
 

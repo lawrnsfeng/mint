@@ -84,5 +84,7 @@ per async context and only actually acquires/releases the underlying
   an arbitrary block instead of an entire method.
 
 This is the mechanism behind `AzureBlobStorage`/`S3Storage`'s
-`max_concurrent_clients` constructor option (see
-[File Storage usage](../fs/usage.md#construction)).
+`max_concurrent_ops` constructor option (see
+[File Storage usage](../fs/usage.md#concurrency-knobs)). It bounds concurrent
+*operations*; the SDK clients themselves are cached per (configuration, event
+loop), and their HTTP pool size is set by `max_pool_connections` instead.

@@ -80,8 +80,21 @@ Support four credential modes in priority order:
 4. IAM role / instance metadata fallback
 
 ### FR-04: Client Lifecycle
-Use `ContextVar` for per-coroutine client isolation. Support optional
-`max_concurrent_clients` via `ConcurrencyLimiter`.
+**Superseded by `003-storage-client-cache`.**
+
+Originally: open a client per top-level call, using `ContextVar` for
+per-coroutine isolation, with optional `max_concurrent_clients` via
+`ConcurrencyLimiter` to bound concurrent client creation.
+
+That per-call construction was the defect 003 fixes — a fresh `AioSession` per
+operation re-ran the whole credential chain, including the EC2 instance-metadata
+probe, and discarded a warm TLS pool every time (measured: a median 12 313 ms
+vs 458 ms for 100 concurrent operations, roughly 28x).
+
+Now: a provider owns one client per (configuration, event loop) and the
+`ContextVar` binds a *borrowed* client for the duration of a call rather than a
+freshly constructed one. `max_concurrent_clients` is deprecated in favour of
+`max_concurrent_ops`; see `specs/003-storage-client-cache/spec.md`.
 
 ### FR-05: No Async Recursion
 Pagination (`list`, `list_detailed`) uses iterative `while` loops with

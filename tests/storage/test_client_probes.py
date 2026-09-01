@@ -913,7 +913,7 @@ class TestBuildFailureCleanup:
         )
 
         for _ in range(3):
-            with pytest.raises(ValueError, match=r"[Cc]onnection [Ss]tring"):
+            with pytest.raises(ValueError, match=r"(?i)connection string"):
                 async with provider.borrow():
                     pass
 

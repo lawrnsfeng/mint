@@ -235,6 +235,17 @@ class ClientProviderBase[T](ABC):
         return self._closed
 
     @property
+    def has_caller_supplied_client(self) -> bool:
+        """Whether the caller supplied this provider's client or its factory.
+
+        Such a provider is specific to whoever supplied it and must never be
+        registered as a process default: the configuration digest says nothing
+        about an injection, so an unrelated storage with matching credentials
+        would silently borrow someone else's client.
+        """
+        return self._injected is not None or self._client_factory is not None
+
+    @property
     def created_count(self) -> int:
         """How many clients this provider has built. Diagnostics and tests."""
         return self._created
@@ -294,7 +305,7 @@ class ClientProviderBase[T](ABC):
             The provider that should actually be used.
 
         """
-        if candidate._injected is not None or candidate._client_factory is not None:
+        if candidate.has_caller_supplied_client:
             # An injected client or factory is caller-specific and invisible to
             # config_digest, so registering it would let an unrelated storage
             # with matching credentials silently borrow someone else's client.

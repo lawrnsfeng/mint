@@ -91,20 +91,9 @@ b = S3Storage(bucket_name="two", endpoint_url=..., access_key=..., secret_key=..
 assert a.provider is b.provider
 ```
 
-Build a provider explicitly when you want to own its lifetime or tune it:
-
-```python
-from mint.fs.asynk.s3_provider import S3ClientProvider
-
-provider = S3ClientProvider(
-    endpoint_url="http://localhost:4566",
-    access_key="...",
-    secret_key="...",
-    max_pool_connections=64,
-    idle_ttl_seconds=900,   # None to never evict
-)
-storage = S3Storage(bucket_name="my-bucket", provider=provider)
-```
+See [Choosing how the client is supplied](#choosing-how-the-client-is-supplied)
+for the explicit-provider, bring-your-own-client and factory forms, on both
+backends.
 
 An idle client is closed and dropped after `idle_ttl_seconds`, swept lazily on
 borrow rather than by a background task. A client with an operation in flight is
@@ -142,6 +131,155 @@ buy nothing and add a second lifetime to reason about, so `AzureBlobStorage`
 still derives its container client per access. The inverse is the trap worth
 knowing: building a `ContainerClient` directly from a URL gets a brand-new
 transport and a cold token cache.
+
+## Choosing how the client is supplied
+
+Four ways, in increasing order of how much you take on. The first is the default
+and needs no code.
+
+### 1. No provider — configuration only
+
+Pass credentials to the storage and let it resolve a shared, process-default
+provider. Two storages configured alike get the same client.
+
+```python
+from mint.fs.asynk.abs import AzureBlobStorage
+from mint.fs.asynk.s3 import S3Storage
+
+s3 = S3Storage(
+    bucket_name="my-bucket",
+    endpoint_url="http://localhost:4566",   # omit for AWS
+    access_key="...",
+    secret_key="...",
+    region_name="us-east-1",
+)
+
+blob = AzureBlobStorage(
+    container_name="my-container",
+    storage_account_name="my-account",
+    connection_string="<connection-string>",
+)
+```
+
+Shut down with the class method, since the provider is shared:
+
+```python
+from mint.fs.asynk.abs_provider import BlobClientProvider
+from mint.fs.asynk.s3_provider import S3ClientProvider
+
+await S3ClientProvider.aclose_shared()
+await BlobClientProvider.aclose_shared()
+```
+
+### 2. An explicit provider — when you want to own the lifetime or tune it
+
+Only a provider you built yourself should be closed with `provider.aclose()`.
+
+```python
+provider = S3ClientProvider(
+    endpoint_url="http://localhost:4566",
+    access_key="...",
+    secret_key="...",
+    region_name="us-east-1",
+    max_pool_connections=64,     # default; raise for wider fan-out
+    idle_ttl_seconds=900,        # None to never evict
+)
+storage = S3Storage(bucket_name="my-bucket", provider=provider)
+...
+await provider.aclose()
+```
+
+The Azure equivalent takes the account name positionally and the same credential
+arguments as `AzureBlobStorage`:
+
+```python
+provider = BlobClientProvider(
+    "my-account",
+    connection_string="<connection-string>",
+    max_pool_connections=64,
+)
+storage = AzureBlobStorage(
+    container_name="my-container",
+    storage_account_name="my-account",
+    provider=provider,
+)
+...
+await provider.aclose()
+```
+
+### 3. Your own client — mint drives it and never closes it
+
+Use this when something else already owns the client: an instrumented or
+retry-wrapped wrapper, or a client shared with code outside mint. Its lifetime
+stays entirely yours — no eviction, no shutdown hook, no exit sweep touches it.
+
+```python
+from aiobotocore.session import AioSession
+
+session = AioSession()
+async with session.create_client("s3", endpoint_url=..., region_name=...) as client:
+    storage = S3Storage(bucket_name="my-bucket", client=client)
+    await storage.save("path/to/file.txt", b"hello")
+    # `client` is still open here, and still yours to close
+```
+
+```python
+from azure.storage.blob.aio import BlobServiceClient
+
+client = BlobServiceClient.from_connection_string("<connection-string>")
+try:
+    storage = AzureBlobStorage(
+        container_name="my-container",
+        storage_account_name="my-account",
+        client=client,
+    )
+    await storage.save("path/to/file.txt", b"hello")
+finally:
+    await client.close()
+```
+
+The client is checked at construction against `IS3Client` /
+`IBlobServiceClient` — protocols naming only the members mint calls — so a wrong
+shape raises `IncompatibleClientError` naming what is missing, rather than
+failing deep inside an operation later.
+
+### 4. A factory — your construction, mint's lifetime
+
+A single client you build yourself is bound to one event loop. A factory lets
+mint call you once per cache miss, so it still gets one client *per loop*, and it
+adopts the teardown. Use this to apply configuration mint does not expose.
+
+```python
+from aiobotocore.config import AioConfig
+from aiobotocore.session import AioSession
+
+def make_client():
+    # Returned either bare or as an async context manager; mint owns whichever.
+    return AioSession().create_client(
+        "s3",
+        endpoint_url="http://localhost:4566",
+        region_name="us-east-1",
+        config=AioConfig(retries={"max_attempts": 10, "mode": "adaptive"}),
+    )
+
+storage = S3Storage(bucket_name="my-bucket", client_factory=make_client)
+```
+
+Unlike an injected client, a factory's result **is** owned by mint: it is closed
+on eviction and at shutdown. Its result is checked against the protocol the first
+time the factory runs, not at construction.
+
+### Which to pick
+
+| | Who closes it | Cached per loop | Checked when |
+|---|---|---|---|
+| Configuration only | `aclose_shared()` | yes | n/a |
+| Explicit provider | `provider.aclose()` | yes | n/a |
+| `client=` | **you** | no — used verbatim | at construction |
+| `client_factory=` | mint | yes | first call |
+
+`provider=`, `client=` and `client_factory=` are mutually exclusive; passing more
+than one raises `ConflictingClientSourceError` rather than silently picking.
 
 ## Shutting down
 

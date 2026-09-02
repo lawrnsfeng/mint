@@ -77,8 +77,10 @@ await S3ClientProvider.aclose_shared()
 If you forget, a fallback closes each loop's clients when that loop tears down.
 
 See [Client Caching](client-caching.md) for the full picture: how the cache key
-is built, how Azure was affected differently, how to inject your own client, and
-the caveats.
+is built, how Azure was affected differently, and the caveats. In particular,
+[Choosing how the client is supplied](client-caching.md#choosing-how-the-client-is-supplied)
+has worked examples for both backends of all four forms — configuration only, an
+explicit provider, your own `client=`, and a `client_factory=`.
 
 ### Concurrency knobs
 

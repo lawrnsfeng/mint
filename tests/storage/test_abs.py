@@ -2,10 +2,11 @@
 
 import asyncio
 import base64
+import itertools
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import aiofiles.tempfile
 import pytest
@@ -13,9 +14,11 @@ from azure.storage.blob import UserDelegationKey
 from azure.storage.blob.aio import BlobServiceClient, ContainerClient
 
 from mint.fs.asynk.abs import AzureBlobStorage
+from mint.fs.asynk.abs_provider import BlobClientProvider
 from mint.fs.exc import (
     AmbiguousFolderPathError,
     FolderAlreadyExistsError,
+    IncompatibleClientError,
     ObjectNotFoundError,
     TrailingSlashNotAllowedError,
     UnsupportedRefTypeError,
@@ -2092,3 +2095,199 @@ async def test_unlimited_concurrent_clients_when_none(
     assert len(results) == 50
 
     await storage.remove("unlimited/", recursive=True)
+
+
+# =============================================================================
+# Client and Credential Caching Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_gather_shares_one_client(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Concurrent top-level calls borrow a single cached client.
+
+    Args:
+        azure_storage: AzureBlobStorage fixture.
+        test_container: Container client fixture.
+
+    """
+    blob = test_container.get_blob_client("reuse/probe.txt")
+    await blob.upload_blob(b"data", overwrite=True)
+    before = azure_storage.provider.created_count
+
+    await asyncio.gather(*[azure_storage.stat("reuse/probe.txt") for _ in range(50)])
+
+    assert azure_storage.provider.created_count - before <= 1
+    assert azure_storage.provider.cached_count == 1
+
+
+@pytest.mark.asyncio
+async def test_sequential_calls_share_one_client(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """Consecutive top-level calls reuse the client rather than rebuilding it.
+
+    Args:
+        azure_storage: AzureBlobStorage fixture.
+        test_container: Container client fixture.
+
+    """
+    blob = test_container.get_blob_client("reuse/seq.txt")
+    await blob.upload_blob(b"data", overwrite=True)
+    await azure_storage.stat("reuse/seq.txt")
+    before = azure_storage.provider.created_count
+
+    await azure_storage.stat("reuse/seq.txt")
+    await azure_storage.stat("reuse/seq.txt")
+
+    assert azure_storage.provider.created_count == before
+
+
+@pytest.mark.asyncio
+async def test_container_client_is_derived_per_access(
+    azure_storage: AzureBlobStorage,
+    test_container: ContainerClient,
+) -> None:
+    """`container` is deliberately not cached.
+
+    `get_container_client` costs ~0.14 ms and shares the parent's transport and
+    policies through `AsyncTransportWrapper`, whose `close()` is a no-op, so
+    caching it would add a lifetime to reason about and buy nothing.
+
+    Args:
+        azure_storage: AzureBlobStorage fixture.
+        test_container: Container client fixture.
+
+    """
+    blob = test_container.get_blob_client("reuse/derived.txt")
+    await blob.upload_blob(b"data", overwrite=True)
+
+    async with azure_storage.provider.borrow() as client:
+        token = azure_storage._client_ctx.set(client)
+        try:
+            first = azure_storage.container
+            second = azure_storage.container
+        finally:
+            azure_storage._client_ctx.reset(token)
+
+    assert first is not second
+
+
+@pytest.mark.asyncio
+async def test_injected_client_is_used_and_not_closed(
+    azurite_connection_string: str,
+    test_container_name: str,
+    test_container: ContainerClient,
+) -> None:
+    """A caller-owned client is borrowed verbatim and left open.
+
+    Args:
+        azurite_connection_string: Connection string for Azurite.
+        test_container_name: Name of the test container.
+        test_container: Container client fixture.
+
+    """
+    owned = BlobServiceClient.from_connection_string(azurite_connection_string)
+    try:
+        storage = AzureBlobStorage(
+            container_name=test_container_name,
+            storage_account_name="devstoreaccount1",
+            client=owned,
+        )
+        await storage.save("reuse/injected.txt", b"data")
+
+        assert storage.provider.created_count == 0
+        await storage.provider.aclose()
+        # Still usable: mint never closes a client it does not own.
+        assert await owned.get_container_client(test_container_name).exists()
+    finally:
+        await owned.close()
+
+
+@pytest.mark.asyncio
+async def test_token_credential_is_cached_and_closed(
+    mocker: "MockerFixture",
+) -> None:
+    """A token credential is built once per loop and dropped on shutdown.
+
+    Guards the leak the old `_create_client` had: it built a fresh
+    `ClientSecretCredential` per operation and never closed it, so every call
+    discarded a `TokenCache` and stranded an `AioHttpTransport` session.
+
+    No token is ever requested, so this test makes no network call -- which is
+    also why the credential needs no close; see the assertion below.
+
+    Args:
+        mocker: pytest-mock fixture.
+
+    """
+    provider = BlobClientProvider(
+        "devstoreaccount1",
+        tenant_id="tenant",
+        client_id="client",
+        client_secret="secret",  # noqa: S106
+    )
+    loop = asyncio.get_running_loop()
+
+    first = provider._token_credential(loop)
+    second = provider._token_credential(loop)
+
+    assert first is second
+
+    close_spy = mocker.patch.object(first, "close", new_callable=mocker.AsyncMock)
+    await provider.aclose()
+
+    # This credential never issued a token request, so its transport never
+    # opened a session and there is nothing to release. Closing it anyway
+    # would be the redundant close the shutdown probes exist to prevent.
+    close_spy.assert_not_awaited()
+    assert provider._credentials == {}
+
+    await first.close()
+
+
+@pytest.mark.asyncio
+async def test_evicted_client_is_never_reused(
+    azurite_connection_string: str,
+) -> None:
+    """Eviction is terminal; a closed transport is never handed back.
+
+    Azure's `AioHttpTransport.open()` raises once closed, so recycling an
+    evicted client would be a hard failure rather than a slow path.
+
+    Args:
+        azurite_connection_string: Connection string for Azurite.
+
+    """
+    provider = BlobClientProvider(
+        "devstoreaccount1",
+        connection_string=azurite_connection_string,
+        idle_ttl_seconds=0,
+    )
+    try:
+        # Hold the objects, not their ids: an evicted client is collected
+        # promptly and CPython reuses the address, so comparing ids here is
+        # flaky by construction.
+        seen: list[BlobServiceClient] = []
+        for _ in range(3):
+            async with provider.borrow() as client:
+                await client.get_service_properties()
+                seen.append(client)
+        assert all(a is not b for a, b in itertools.combinations(seen, 2))
+    finally:
+        await provider.aclose()
+
+
+@pytest.mark.asyncio
+async def test_non_conforming_client_is_rejected() -> None:
+    """A wrong-shaped client fails at construction, not mid-operation."""
+    with pytest.raises(IncompatibleClientError):
+        AzureBlobStorage(
+            container_name="c",
+            storage_account_name="a",
+            client=cast("BlobServiceClient", object()),
+        )

@@ -1,7 +1,7 @@
 """Azure Blob Storage implementation of IFileStorage interface."""
 
 import asyncio
-import os
+import warnings
 from collections.abc import Callable, Collection, Coroutine, Sequence
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
@@ -14,7 +14,6 @@ from typing import (
     Any,
     Concatenate,
     Final,
-    cast,
 )
 from urllib.parse import quote
 
@@ -24,7 +23,6 @@ from azure.core.exceptions import (
     ResourceNotFoundError,
     ServiceRequestError,
 )
-from azure.identity.aio import ClientSecretCredential, DefaultAzureCredential
 from azure.storage.blob import (
     BlobSasPermissions,
     generate_blob_sas,
@@ -36,6 +34,7 @@ from azure.storage.blob.aio import (
 
 from mint.fs.exc import (
     AmbiguousFolderPathError,
+    ClientNotInitializedError,
     FileAlreadyExistsError,
     FileStorageError,
     FolderAlreadyExistsError,
@@ -57,17 +56,25 @@ from mint.logger import get_logger
 from mint.utils.batch import Batch
 from mint.utils.limiter import ConcurrencyLimiter
 
+from .abs_provider import BlobClientProvider
 from .interface import IFileStorage
-from .structs import AzureCredentialMode, AzureSessionParams
+from .lifecycle import reject_conflicting_sources
 
 if TYPE_CHECKING:
     from azure.core.async_paging import AsyncItemPaged
     from azure.storage.blob._models import BlobProperties
 
+    from .provider import ClientFactory
+    from .structs import AzureCredentialMode, AzureSessionParams
+
 logger = get_logger(__name__)
 type Coro[T] = Coroutine[Any, Any, T]
 
-_ERR_CLIENT_NOT_INITIALIZED = "Client is not initialized"
+_DEPRECATED_MAX_CLIENTS: Final[str] = (
+    "max_concurrent_clients is deprecated; use max_concurrent_ops. Clients are now "
+    "cached and shared per (configuration, event loop), so this bounds concurrent "
+    "operations rather than client creation."
+)
 
 
 class AzureBlobStorage(IFileStorage[BlobServiceClient]):
@@ -104,7 +111,13 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         tenant_id: str | None = None,
         client_id: str | None = None,
         *,
+        provider: BlobClientProvider | None = None,
+        client: BlobServiceClient | None = None,
+        client_factory: "ClientFactory[BlobServiceClient] | None" = None,
+        max_pool_connections: int | None = None,
+        max_concurrent_ops: int | None = None,
         max_concurrent_clients: int | None = None,
+        auto_shutdown: bool = True,
     ) -> None:
         """Initialize AzureBlobStorage with credentials.
 
@@ -126,8 +139,24 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
             sas_token: Shared access signature token.
             tenant_id: Azure AD tenant ID for service principal.
             client_id: Azure AD client/application ID.
-            max_concurrent_clients: Maximum number of concurrent clients.
-                Use None for unlimited (default).
+            provider: Client provider to borrow from. When omitted, the
+                credential arguments select a process-default provider, so two
+                storages configured alike share one cached client and one
+                cached credential.
+            client: A caller-owned BlobServiceClient, used verbatim and never
+                closed by mint. Test doubles must be spec'd.
+            client_factory: Called per cache miss to build a client, so mint
+                still gets one client per event loop. Mint owns the result.
+            max_pool_connections: Per-client HTTP pool size. When set, the
+                client is given an explicit transport over a bounded connector.
+            max_concurrent_ops: Cap on concurrent operations, via
+                ConcurrencyLimiter. None for unlimited.
+            max_concurrent_clients: Deprecated alias for ``max_concurrent_ops``.
+                Clients are cached now, so nothing bounds client creation.
+            auto_shutdown: Close this loop's clients automatically when the
+                event loop tears down, as a fallback for callers who never get
+                to close the provider. Ignored when ``provider`` is supplied --
+                that provider's own setting wins.
 
         """
         self.container_name = container_name
@@ -138,37 +167,135 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
         self.tenant_id = tenant_id
         self.client_id = client_id
         self.client_secret = client_secret
+        self.max_pool_connections = max_pool_connections
 
-        self.mode, self.params = self._init_credential_mode()
+        if max_concurrent_clients is not None:
+            warnings.warn(_DEPRECATED_MAX_CLIENTS, DeprecationWarning, stacklevel=2)
+        ops_limit = (
+            max_concurrent_ops if max_concurrent_ops is not None else max_concurrent_clients
+        )
+
+        reject_conflicting_sources(
+            storage=type(self).__name__,
+            provider=provider,
+            client=client,
+            client_factory=client_factory,
+        )
+        # Build the limiter first: it validates ops_limit, and registering a
+        # provider before that would leave the failed construction's provider
+        # in the process-global registry for the next caller to inherit.
+        self._limiter: ConcurrencyLimiter | None = (
+            ConcurrencyLimiter(ops_limit) if ops_limit is not None else None
+        )
+        self._auto_shutdown = auto_shutdown
+        self._owns_provider = provider is None and client is None and client_factory is None
+        self._provider = provider or self._build_provider(
+            client=client,
+            client_factory=client_factory,
+            auto_shutdown=auto_shutdown,
+        )
         self._client_ctx: ContextVar[BlobServiceClient | None] = ContextVar(
             f"_abs_client_{id(self)}",
             default=None,
         )
-        self._limiter: ConcurrencyLimiter | None = (
-            ConcurrencyLimiter(max_concurrent_clients)
-            if max_concurrent_clients is not None
-            else None
+
+    def _build_provider(
+        self,
+        *,
+        client: BlobServiceClient | None,
+        client_factory: "ClientFactory[BlobServiceClient] | None",
+        auto_shutdown: bool,
+    ) -> BlobClientProvider:
+        """Build this storage's provider, sharing one when the config allows.
+
+        Args:
+            client: Caller-owned client, if any.
+            client_factory: Caller-supplied factory, if any.
+            auto_shutdown: Whether to arm the loop-teardown fallback.
+
+        Returns:
+            The provider this storage should borrow from.
+
+        """
+        candidate = BlobClientProvider(
+            self.storage_account_name,
+            client_secret=self.client_secret,
+            shared_access_key=self.shared_access_key,
+            connection_string=self.connection_string,
+            sas_token=self.sas_token,
+            tenant_id=self.tenant_id,
+            client_id=self.client_id,
+            client=client,
+            client_factory=client_factory,
+            max_pool_connections=self.max_pool_connections,
+            auto_shutdown=auto_shutdown,
         )
+        if client is not None or client_factory is not None:
+            return candidate
+        return BlobClientProvider.shared(candidate)
+
+    @property
+    def provider(self) -> BlobClientProvider:
+        """The provider this storage borrows its client from.
+
+        Re-resolves a process-default provider that has since been closed, so
+        that ``aclose_shared()`` at the end of one event loop does not
+        permanently break a storage held at module scope. A provider the caller
+        passed in stays closed: its lifetime is theirs, and
+        ``ProviderClosedError`` is the honest signal.
+        """
+        if self._owns_provider and self._provider.is_closed:
+            self._provider = self._build_provider(
+                client=None,
+                client_factory=None,
+                auto_shutdown=self._auto_shutdown,
+            )
+        return self._provider
+
+    @property
+    def mode(self) -> "AzureCredentialMode":
+        """Credential mode resolved by the provider."""
+        return self._provider.mode
+
+    @property
+    def params(self) -> "AzureSessionParams":
+        """Session parameters resolved by the provider."""
+        return self._provider.params
+
+    @property
+    def account_url(self) -> str:
+        """Get the Azure storage account URL.
+
+        Returns:
+            The formatted account URL.
+
+        """
+        return self._provider.account_url
 
     @property
     def client(self) -> BlobServiceClient:
         """Get the underlying BlobServiceClient.
 
         Returns:
-            The initialized BlobServiceClient instance.
+            The BlobServiceClient bound to the current operation.
 
         Raises:
-            RuntimeError: If client is not initialized.
+            ClientNotInitializedError: If accessed outside an operation.
 
         """
         client = self._client_ctx.get()
         if client is None:
-            raise RuntimeError(_ERR_CLIENT_NOT_INITIALIZED)
+            raise ClientNotInitializedError(storage=type(self).__name__)
         return client
 
     @property
     def container(self) -> ContainerClient:
         """Get the ContainerClient for the configured container.
+
+        Derived per access on purpose: ``get_container_client`` costs ~0.14 ms
+        and shares the parent's transport and policies through
+        ``AsyncTransportWrapper``, whose ``close()`` is a no-op. Caching it
+        would buy nothing and add a second lifetime to reason about.
 
         Returns:
             ContainerClient for the target container.
@@ -213,153 +340,23 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
 
         return wrapper
 
-    def _init_credential_mode(  # noqa: PLR0911
-        self,
-    ) -> tuple[AzureCredentialMode, AzureSessionParams]:
-        """Determine and initialize the credential mode.
-
-        Returns:
-            Tuple of (credential mode, session parameters).
-
-        """
-        params: AzureSessionParams = {}
-        if self.sas_token is not None:
-            params.update(
-                {
-                    "sas_token": self.sas_token,
-                },
-            )
-            return AzureCredentialMode.SharedAccessSignature, params
-
-        if self.shared_access_key is not None:
-            params.update(
-                {
-                    "shared_access_key": self.shared_access_key,
-                },
-            )
-
-            return AzureCredentialMode.SharedAccessKey, params
-
-        if self.connection_string is not None:
-            params.update(
-                {
-                    "connection_string": self.connection_string,
-                },
-            )
-            return AzureCredentialMode.ConnectionString, params
-
-        if all(
-            field is not None
-            for field in (
-                self.tenant_id,
-                self.client_id,
-                self.client_secret,
-            )
-        ):
-            params.update(
-                {
-                    "tenant_id": self.tenant_id,
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
-                },
-            )
-            return AzureCredentialMode.ClientSecret, params
-
-        self.shared_access_key = os.getenv(self.AzureStorageAccessKey)
-        if self.shared_access_key is not None:
-            params.update(
-                {
-                    "shared_access_key": self.shared_access_key,
-                },
-            )
-
-            return AzureCredentialMode.EnvVarSharedAccessKey, params
-
-        self.connection_string = os.getenv(self.AzureStorageConnectionString)
-        if self.connection_string is not None:
-            params.update(
-                {
-                    "connection_string": self.connection_string,
-                },
-            )
-
-            return AzureCredentialMode.EnvVarConnectionString, params
-
-        return AzureCredentialMode.Default, params
-
-    @property
-    def account_url(self) -> str:
-        """Get the Azure storage account URL.
-
-        Returns:
-            The formatted account URL.
-
-        """
-        return self.TmplAccountURL.format(
-            storage_account_name=self.storage_account_name,
-        )
-
-    def _create_client(self) -> BlobServiceClient:
-        """Create a BlobServiceClient based on the credential mode.
-
-        Returns:
-            Configured BlobServiceClient instance.
-
-        Raises:
-            InvalidArgumentsError: If credential mode is unsupported.
-
-        """
-        match self.mode:
-            case AzureCredentialMode.SharedAccessSignature:
-                return BlobServiceClient(
-                    self.account_url,
-                    credential=self.sas_token,
-                )
-            case AzureCredentialMode.ClientSecret:
-                return BlobServiceClient(
-                    self.account_url,
-                    credential=ClientSecretCredential(
-                        cast("str", self.tenant_id),
-                        cast("str", self.client_id),
-                        cast("str", self.client_secret),
-                    ),
-                )
-            case AzureCredentialMode.ConnectionString | AzureCredentialMode.EnvVarConnectionString:
-                return BlobServiceClient.from_connection_string(
-                    cast("str", self.connection_string),
-                )
-            case AzureCredentialMode.SharedAccessKey | AzureCredentialMode.EnvVarSharedAccessKey:
-                return BlobServiceClient(
-                    self.account_url,
-                    credential=self.shared_access_key,
-                )
-            case AzureCredentialMode.Default:
-                return BlobServiceClient(
-                    self.account_url,
-                    credential=DefaultAzureCredential(),
-                )
-            case _:
-                raise InvalidArgumentsError(detail=f"mode = {self.mode}")
-
     @staticmethod
     def _ensure_client[S: "AzureBlobStorage", **P, RT](
         func: Callable[Concatenate[S, P], Coro[RT]],
     ) -> Callable[Concatenate[S, P], Coro[RT]]:
-        """Wrap async function to ensure client is initialized.
+        """Wrap an async method so a client is bound for its duration.
 
-        Create and manage the client lifecycle, initializing it before
-        the operation and cleaning up afterward. Uses ContextVar for
-        async-safe, per-coroutine client isolation to avoid race
-        conditions when multiple coroutines share the same instance.
-
-        When max_concurrent_clients is set, limits the number of
-        concurrent client connections using ConcurrencyLimiter.
+        Borrows the provider's cached client and binds it to a ContextVar for
+        the length of the call. Nested calls see the same client through the
+        inherited context. The borrow is counted by the provider, so an idle
+        sweep can never close the client mid-operation, and the client is
+        released -- not closed -- on the way out.
 
         Args:
             func: The async function requiring a client.
 
         Returns:
-            Wrapped function with client lifecycle management.
+            Wrapped function with client binding.
 
         """
 
@@ -374,7 +371,7 @@ class AzureBlobStorage(IFileStorage[BlobServiceClient]):
                 return await func(self, *args, **kwargs)
 
             async def _execute_with_client() -> RT:
-                async with self._create_client() as client:
+                async with self.provider.borrow() as client:
                     token = self._client_ctx.set(client)
                     try:
                         return await func(self, *args, **kwargs)

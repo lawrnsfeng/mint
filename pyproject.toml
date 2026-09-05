@@ -104,6 +104,12 @@ ignore = [
     "D101",
     "D102",
 ]
+# Structural stubs mirroring vendor SDK signatures: the bodies are `...` and the
+# `**kwargs: Any` shapes are the vendors', not ours.
+"client_protocols.py" = [
+    "ANN401",  # any-type
+    "D102",  # undocumented-public-method
+]
 
 [tool.mypy]
 python_version = "3.12"

@@ -1,13 +1,15 @@
 """Unit tests for S3Storage error branches and edge cases.
 
-These tests mock the underlying aiobotocore client so that native error
-codes, pagination continuation, and credential-resolution branches that
-are impractical to trigger against a real LocalStack instance can be
-exercised deterministically.
+These tests inject a stand-in S3 client so that native error codes, pagination
+continuation, and credential-resolution branches that are impractical to
+trigger against a real LocalStack instance can be exercised deterministically.
+
+Doubles are spec'd against `IS3Client`: since Python 3.12 an `isinstance` check
+against a runtime-checkable Protocol uses `inspect.getattr_static`, which does
+not fire `MagicMock.__getattr__`, so a bare `MagicMock` satisfies no protocol.
+Spec'ing also gives the async members `AsyncMock` children.
 """
 
-import contextlib
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
+from mint.fs.asynk.client_protocols import IS3Client
 from mint.fs.asynk.s3 import S3Storage
 from mint.fs.asynk.s3_structs import S3CredentialMode
 from mint.fs.exc import (
@@ -31,19 +34,18 @@ def _client_error(code: str) -> ClientError:
     return ClientError({"Error": {"Code": code}}, "SomeOperation")
 
 
-@contextlib.asynccontextmanager
-async def _client_ctx(client: MagicMock) -> AsyncIterator[MagicMock]:
-    """Async context manager yielding the given mock client."""
-    yield client
+def _mock_client() -> MagicMock:
+    """Build a spec'd S3 client double that satisfies IS3Client."""
+    return MagicMock(spec=IS3Client)
 
 
 def _storage_with_mock_client(client: MagicMock) -> S3Storage:
-    """Return an S3Storage whose _create_client yields the given mock."""
-    storage = S3Storage(bucket_name="test-bucket", region_name="us-east-1")
-    storage._create_client = MagicMock(  # type: ignore[method-assign]
-        return_value=_client_ctx(client),
+    """Return an S3Storage that borrows the given injected client."""
+    return S3Storage(
+        bucket_name="test-bucket",
+        region_name="us-east-1",
+        client=client,
     )
-    return storage
 
 
 class TestCredentialModeBranches:
@@ -112,7 +114,7 @@ class TestGetErrorPaths:
 
     async def test_get_reraises_non_not_found_client_error(self) -> None:
         """A non-404 ClientError from get_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.get_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -129,7 +131,7 @@ class TestSaveErrorPaths:
         self,
     ) -> None:
         """A non-404 ClientError from head_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(return_value={"Contents": []})
         client.head_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
@@ -147,7 +149,7 @@ class TestCopyErrorPaths:
         self,
     ) -> None:
         """A non-404 ClientError from head_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(return_value={"Contents": []})
         client.head_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
@@ -159,7 +161,7 @@ class TestCopyErrorPaths:
 
     async def test_copy_single_exceeds_five_gb_limit(self) -> None:
         """Objects larger than 5 GB raise CopySourceTooLargeError."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(
             return_value={"Contents": []},
         )
@@ -173,7 +175,7 @@ class TestCopyErrorPaths:
 
     async def test_copy_folder_partial_failure_recorded(self) -> None:
         """Failures during folder copy are captured, not raised."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(
             return_value={
                 "Contents": [{"Key": "src/a.txt"}, {"Key": "src/b.txt"}],
@@ -199,7 +201,7 @@ class TestMoveErrorPaths:
 
     async def test_move_raises_cleanup_error_on_copy_failure(self) -> None:
         """MoveCleanupError is raised when the copy step has failures."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(
             return_value={"Contents": [{"Key": "src/a.txt"}]},
         )
@@ -215,7 +217,7 @@ class TestRemoveErrorPaths:
 
     async def test_remove_reraises_non_not_found_error(self) -> None:
         """A non-404 ClientError from head_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.head_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -230,7 +232,7 @@ class TestStatErrorPaths:
 
     async def test_stat_reraises_non_not_found_error(self) -> None:
         """A non-404 ClientError from head_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.head_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -245,7 +247,7 @@ class TestListPagination:
 
     async def test_list_follows_continuation_token(self) -> None:
         """list() issues a second call when NextContinuationToken is set."""
-        client = MagicMock()
+        client = _mock_client()
         responses = [
             {
                 "Contents": [{"Key": "a.txt"}],
@@ -264,7 +266,7 @@ class TestListPagination:
 
     async def test_list_detailed_follows_continuation_token(self) -> None:
         """list_detailed() issues a second call when a token is present."""
-        client = MagicMock()
+        client = _mock_client()
         responses = [
             {
                 "Contents": [{"Key": "a.txt"}],
@@ -284,7 +286,7 @@ class TestListPagination:
         self,
     ) -> None:
         """A failed head_object during show_stats is logged and skipped."""
-        client = MagicMock()
+        client = _mock_client()
         client.list_objects_v2 = AsyncMock(
             return_value={"Contents": [{"Key": "a.txt"}]},
         )
@@ -307,7 +309,7 @@ class TestGenPresignedUrlErrorPaths:
         self,
     ) -> None:
         """A non-404 ClientError from head_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.head_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -324,12 +326,9 @@ class TestEnsureBucketBranches:
         self,
     ) -> None:
         """A non-default region passes a LocationConstraint."""
-        client = MagicMock()
+        client = _mock_client()
         client.create_bucket = AsyncMock(return_value={})
-        storage = S3Storage(bucket_name="b", region_name="eu-west-1")
-        storage._create_client = MagicMock(  # type: ignore[method-assign]
-            return_value=_client_ctx(client),
-        )
+        storage = S3Storage(bucket_name="b", region_name="eu-west-1", client=client)
 
         await storage.ensure_bucket()
 
@@ -342,7 +341,7 @@ class TestEnsureBucketBranches:
         self,
     ) -> None:
         """An unrelated ClientError from create_bucket propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.create_bucket = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -357,7 +356,7 @@ class TestGetFileobjErrorPaths:
 
     async def test_get_fileobj_reraises_non_not_found_error(self) -> None:
         """A non-404 ClientError from get_object propagates unchanged."""
-        client = MagicMock()
+        client = _mock_client()
         client.get_object = AsyncMock(
             side_effect=_client_error("AccessDenied"),
         )
@@ -373,7 +372,7 @@ class TestGetRaisesNotFound:
 
     async def test_get_raises_object_not_found(self) -> None:
         """A 404 ClientError from get_object raises ObjectNotFoundError."""
-        client = MagicMock()
+        client = _mock_client()
         client.get_object = AsyncMock(
             side_effect=_client_error("NoSuchKey"),
         )

@@ -3,9 +3,10 @@
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 import pytest
+from aiobotocore.session import AioSession
 
 from mint.fs.asynk.s3 import S3Storage, _GetObjectContextManager
 from mint.fs.asynk.s3_structs import S3CredentialMode
@@ -13,6 +14,7 @@ from mint.fs.exc import (
     AmbiguousFolderPathError,
     FileAlreadyExistsError,
     FolderAlreadyExistsError,
+    IncompatibleClientError,
     ObjectNotFoundError,
     TrailingSlashNotAllowedError,
     UnsupportedRefTypeError,
@@ -26,6 +28,9 @@ from mint.fs.structs import (
 )
 from mint.utils.exc import InvalidConcurrencyLimitError
 from tests.storage.conftest import LocalStackContainer
+
+if TYPE_CHECKING:
+    from types_aiobotocore_s3.client import S3Client
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -1664,3 +1669,146 @@ class TestConcurrencyLimiter:
                 region_name=LocalStackContainer.DEFAULT_REGION,
                 max_concurrent_clients=0,
             )
+
+
+# ---------------------------------------------------------------------------
+# Client reuse
+# ---------------------------------------------------------------------------
+
+
+class TestClientReuse:
+    """The provider hands one cached client to every operation.
+
+    Before caching, each top-level call opened a fresh aiobotocore session --
+    re-running the whole credential chain, including the EC2 instance-metadata
+    probe, and discarding a warm TLS pool every time.
+    """
+
+    async def test_gather_shares_one_client(self, s3_storage: S3Storage) -> None:
+        """50 concurrent top-level calls borrow a single client.
+
+        Each `asyncio.gather` branch starts in a fresh context, so under the
+        old design every one of them built its own session.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("reuse/probe.txt", b"data")
+        before = s3_storage.provider.created_count
+
+        await asyncio.gather(*[s3_storage.stat("reuse/probe.txt") for _ in range(50)])
+
+        assert s3_storage.provider.created_count - before == 0
+        assert s3_storage.provider.cached_count == 1
+
+    async def test_sequential_calls_share_one_client(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """Consecutive top-level calls reuse the client.
+
+        This is the case the ContextVar binding alone always missed: the first
+        call unbinds on exit, so the second used to start from scratch.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("reuse/seq.txt", b"data")
+        before = s3_storage.provider.created_count
+
+        await s3_storage.stat("reuse/seq.txt")
+        await s3_storage.stat("reuse/seq.txt")
+        await s3_storage.stat("reuse/seq.txt")
+
+        assert s3_storage.provider.created_count == before
+
+    async def test_nested_calls_reuse_the_binding(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """A fan-out inside an operation runs on the outer binding.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        for i in range(3):
+            await s3_storage.save(f"reuse/tree/f{i}.txt", b"x")
+        before = s3_storage.provider.created_count
+
+        result = await s3_storage.copy("reuse/tree/", "reuse/copy/", recursive=True)
+
+        assert len(result.success) == 3
+        assert s3_storage.provider.created_count == before
+
+    async def test_failure_leaves_no_stale_binding(
+        self,
+        s3_storage: S3Storage,
+    ) -> None:
+        """An operation that raises unbinds the client and stays usable.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        with pytest.raises(ObjectNotFoundError):
+            await s3_storage.stat("reuse/definitely-missing.txt")
+
+        assert s3_storage._client_ctx.get() is None
+
+        await s3_storage.save("reuse/after-failure.txt", b"ok")
+        assert (await s3_storage.stat("reuse/after-failure.txt")).size == 2
+
+    async def test_clone_shares_the_cache(self, s3_storage: S3Storage) -> None:
+        """A clone borrows from the same provider, not a second one.
+
+        Args:
+            s3_storage: S3Storage fixture.
+
+        """
+        await s3_storage.save("reuse/clone.txt", b"data")
+        cloned = s3_storage.clone()
+        before = s3_storage.provider.created_count
+
+        await cloned.stat("reuse/clone.txt")
+
+        assert cloned.provider is s3_storage.provider
+        assert s3_storage.provider.created_count == before
+
+    async def test_injected_client_is_used_and_not_closed(
+        self,
+        s3_endpoint_url: str,
+    ) -> None:
+        """A caller-owned client is borrowed verbatim and left open.
+
+        Args:
+            s3_endpoint_url: LocalStack S3 endpoint URL.
+
+        """
+        session = AioSession()
+        async with session.create_client(
+            "s3",
+            endpoint_url=s3_endpoint_url,
+            aws_access_key_id=LocalStackContainer.ACCESS_KEY,
+            aws_secret_access_key=LocalStackContainer.SECRET_KEY,
+            region_name=LocalStackContainer.DEFAULT_REGION,
+        ) as owned:
+            storage = S3Storage(
+                bucket_name=LocalStackContainer.TEST_BUCKET_NAME,
+                client=owned,
+            )
+            await storage.save("reuse/injected.txt", b"data")
+
+            assert storage.provider.created_count == 0
+            # The client is still usable after mint is done with it.
+            await owned.head_object(
+                Bucket=LocalStackContainer.TEST_BUCKET_NAME,
+                Key="reuse/injected.txt",
+            )
+
+    async def test_non_conforming_client_is_rejected(self) -> None:
+        """A wrong-shaped client fails at construction, not mid-operation."""
+        with pytest.raises(IncompatibleClientError):
+            S3Storage(bucket_name="b", client=cast("S3Client", object()))

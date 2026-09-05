@@ -282,3 +282,62 @@ async def test_limiter_decorator_and_context_manager_share_depth() -> None:
             )
 
     await asyncio.gather(service.outer(), intruder())
+
+
+class TestEventLoopAffinity:
+    """`asyncio.Semaphore` binds to the loop that first contends on it.
+
+    A limiter held at module scope has to survive one loop ending, or it makes
+    the object holding it unusable for the rest of the process.
+    """
+
+    def test_limiter_works_across_sequential_loops(self) -> None:
+        """A single eagerly-built semaphore would raise on the second loop."""
+        limiter = ConcurrencyLimiter(2)
+
+        async def body() -> list[int]:
+            async def op(i: int) -> int:
+                async with limiter:
+                    await asyncio.sleep(0.005)
+                    return i
+
+            return await asyncio.gather(*[op(i) for i in range(6)])
+
+        for _ in range(3):
+            assert len(asyncio.run(body())) == 6
+
+    def test_semaphore_map_does_not_grow_across_loops(self) -> None:
+        """A bound semaphore references its own loop, defeating the weak key.
+
+        Closed loops are pruned explicitly, or the map grows for the life of a
+        process that cycles event loops.
+        """
+        limiter = ConcurrencyLimiter(2)
+
+        async def body() -> None:
+            async def op() -> None:
+                async with limiter:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.gather(*[op() for _ in range(4)])
+
+        for _ in range(4):
+            asyncio.run(body())
+            assert limiter.bound_loop_count == 1
+
+    def test_decorator_form_also_survives_a_new_loop(self) -> None:
+        """`limit` acquires and releases the same per-loop semaphore."""
+        limiter = ConcurrencyLimiter(2)
+
+        class Worker:
+            @limiter.limit
+            async def run(self) -> int:
+                await asyncio.sleep(0.005)
+                return 1
+
+        async def body() -> int:
+            worker = Worker()
+            return sum(await asyncio.gather(*[worker.run() for _ in range(4)]))
+
+        assert asyncio.run(body()) == 4
+        assert asyncio.run(body()) == 4

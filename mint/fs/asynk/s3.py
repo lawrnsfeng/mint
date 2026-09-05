@@ -1,7 +1,7 @@
 """S3-compatible async file storage implementation of IFileStorage."""
 
 import asyncio
-import os
+import warnings
 from collections.abc import Callable, Collection, Coroutine, Sequence
 from contextvars import ContextVar
 from functools import wraps
@@ -25,6 +25,7 @@ from sprout import ChildRef, Executor, FetchResult
 
 from mint.fs.exc import (
     AmbiguousFolderPathError,
+    ClientNotInitializedError,
     CopySourceTooLargeError,
     FileAlreadyExistsError,
     FileStorageError,
@@ -48,17 +49,24 @@ from mint.utils.batch import Batch
 from mint.utils.limiter import ConcurrencyLimiter
 
 from .interface import IFileStorage
-from .s3_structs import S3CredentialMode, S3SessionParams
+from .lifecycle import reject_conflicting_sources
+from .s3_provider import S3ClientProvider
 
 if TYPE_CHECKING:
-    from aiobotocore.session import ClientCreatorContext
     from types_aiobotocore_s3.client import S3Client
     from types_aiobotocore_s3.literals import BucketLocationConstraintType
+
+    from .provider import ClientFactory
+    from .s3_structs import S3CredentialMode, S3SessionParams
 
 logger = get_logger(__name__)
 type Coro[T] = Coroutine[Any, Any, T]
 
-_ERR_CLIENT_NOT_INITIALIZED: Final[str] = "Client is not initialized"
+_DEPRECATED_MAX_CLIENTS: Final[str] = (
+    "max_concurrent_clients is deprecated; use max_concurrent_ops. Clients are now "
+    "cached and shared per (configuration, event loop), so this bounds concurrent "
+    "operations rather than client creation."
+)
 _S3_COPY_MAX_BYTES: Final[int] = 5 * 1024 * 1024 * 1024
 _1MB: Final[int] = 1024 * 1024
 _1KB: Final[int] = 1024
@@ -78,10 +86,15 @@ class S3Storage(IFileStorage["S3Client"]):
     4. IAM role / instance metadata
 
     Note:
-        Each top-level call opens a new aiobotocore client/session
-        (see _ensure_client). Pass max_concurrent_clients to bound
-        concurrent session creation, especially against single-process
-        endpoints like LocalStack.
+        Clients are cached per (configuration, event loop) by an
+        :class:`~mint.fs.asynk.s3_provider.S3ClientProvider`, so every
+        operation reuses one aiobotocore session, one resolved credential
+        set, and one warm connection pool.
+
+        On shutdown call ``await S3ClientProvider.aclose_shared()``. Only call
+        ``await storage.provider.aclose()`` for a provider you built and passed
+        in yourself: a configuration-built storage shares its provider with
+        every sibling configured alike, and closing it would break theirs too.
 
     """
 
@@ -104,7 +117,13 @@ class S3Storage(IFileStorage["S3Client"]):
         profile_name: str = "default",
         region_name: str | None = None,
         *,
+        provider: S3ClientProvider | None = None,
+        client: "S3Client | None" = None,
+        client_factory: "ClientFactory[S3Client] | None" = None,
+        max_pool_connections: int | None = None,
+        max_concurrent_ops: int | None = None,
         max_concurrent_clients: int | None = None,
+        auto_shutdown: bool = True,
     ) -> None:
         """Initialize S3Storage.
 
@@ -117,11 +136,25 @@ class S3Storage(IFileStorage["S3Client"]):
             session_token: AWS session token (for temporary credentials).
             profile_name: AWS shared credentials profile name.
             region_name: AWS region name.
-            max_concurrent_clients: Max concurrent client connections.
-                None for unlimited. Each top-level call opens a new
-                aiobotocore session (see _ensure_client), so unlimited
-                concurrency can overwhelm lightweight/single-process
-                endpoints (e.g. LocalStack).
+            provider: Client provider to borrow from. When omitted, the
+                credential arguments select a process-default provider, so two
+                storages configured alike share one cached client.
+            client: A caller-owned S3 client, used verbatim and never closed by
+                mint. Test doubles must be spec'd (``MagicMock(spec=IS3Client)``).
+            client_factory: Called per cache miss to build a client, so mint
+                still gets one client per event loop. Mint owns the result.
+            max_pool_connections: Per-client HTTP pool size, and the effective
+                concurrency ceiling now that one client serves every operation.
+                Defaults to ``S3ClientProvider.DefaultMaxPoolConnections`` (64)
+                rather than botocore's 10; raise it for wider fan-out.
+            max_concurrent_ops: Cap on concurrent operations, via
+                ConcurrencyLimiter. None for unlimited.
+            max_concurrent_clients: Deprecated alias for ``max_concurrent_ops``.
+                Clients are cached now, so nothing bounds client creation.
+            auto_shutdown: Close this loop's clients automatically when the
+                event loop tears down, as a fallback for callers who never get
+                to close the provider. Ignored when ``provider`` is supplied --
+                that provider's own setting wins.
 
         """
         self.bucket_name = bucket_name
@@ -131,39 +164,127 @@ class S3Storage(IFileStorage["S3Client"]):
         self.aws_session_token = session_token
         self.profile_name = profile_name
         self.region_name = region_name
+        self.max_pool_connections = max_pool_connections
 
-        self.mode, self.params = self._init_credential_mode()
+        if max_concurrent_clients is not None:
+            warnings.warn(_DEPRECATED_MAX_CLIENTS, DeprecationWarning, stacklevel=2)
+        ops_limit = (
+            max_concurrent_ops if max_concurrent_ops is not None else max_concurrent_clients
+        )
+
+        reject_conflicting_sources(
+            storage=type(self).__name__,
+            provider=provider,
+            client=client,
+            client_factory=client_factory,
+        )
+        # Build the limiter first: it validates ops_limit, and registering a
+        # provider before that would leave the failed construction's provider
+        # in the process-global registry for the next caller to inherit.
+        self._limiter: ConcurrencyLimiter | None = (
+            ConcurrencyLimiter(ops_limit) if ops_limit is not None else None
+        )
+        self._auto_shutdown = auto_shutdown
+        self._owns_provider = provider is None and client is None and client_factory is None
+        self._provider = provider or self._build_provider(
+            client=client,
+            client_factory=client_factory,
+            auto_shutdown=auto_shutdown,
+        )
         self._client_ctx: ContextVar[S3Client | None] = ContextVar(
             f"_s3_client_{id(self)}",
             default=None,
         )
-        self._limiter: ConcurrencyLimiter | None = (
-            ConcurrencyLimiter(max_concurrent_clients)
-            if max_concurrent_clients is not None
-            else None
+
+    def _build_provider(
+        self,
+        *,
+        client: "S3Client | None",
+        client_factory: "ClientFactory[S3Client] | None",
+        auto_shutdown: bool,
+    ) -> S3ClientProvider:
+        """Build this storage's provider, sharing one when the config allows.
+
+        An injected client or factory is caller-specific, so those providers are
+        never shared; a purely configuration-driven one is looked up in the
+        process-default registry so sibling storages reuse a single client.
+
+        Args:
+            client: Caller-owned client, if any.
+            client_factory: Caller-supplied factory, if any.
+            auto_shutdown: Whether to arm the loop-teardown fallback.
+
+        Returns:
+            The provider this storage should borrow from.
+
+        """
+        candidate = S3ClientProvider(
+            endpoint_url=self.endpoint_url,
+            access_key=self.aws_access_key_id,
+            secret_key=self.aws_secret_access_key,
+            session_token=self.aws_session_token,
+            profile_name=self.profile_name,
+            region_name=self.region_name,
+            client=client,
+            client_factory=client_factory,
+            max_pool_connections=self.max_pool_connections,
+            auto_shutdown=auto_shutdown,
         )
+        if client is not None or client_factory is not None:
+            return candidate
+        return S3ClientProvider.shared(candidate)
+
+    @property
+    def provider(self) -> S3ClientProvider:
+        """The provider this storage borrows its client from.
+
+        Re-resolves a process-default provider that has since been closed, so
+        that ``aclose_shared()`` at the end of one event loop does not
+        permanently break a storage held at module scope. A provider the caller
+        passed in stays closed: its lifetime is theirs, and
+        ``ProviderClosedError`` is the honest signal.
+        """
+        if self._owns_provider and self._provider.is_closed:
+            self._provider = self._build_provider(
+                client=None,
+                client_factory=None,
+                auto_shutdown=self._auto_shutdown,
+            )
+        return self._provider
+
+    @property
+    def mode(self) -> "S3CredentialMode":
+        """Credential mode resolved by the provider."""
+        return self._provider.mode
+
+    @property
+    def params(self) -> "S3SessionParams":
+        """Session parameters resolved by the provider."""
+        return self._provider.params
 
     @property
     def client(self) -> "S3Client":
         """Get the underlying S3Client.
 
         Returns:
-            The initialized S3Client instance.
+            The S3Client bound to the current operation.
 
         Raises:
-            RuntimeError: If client is not initialized.
+            ClientNotInitializedError: If accessed outside an operation.
 
         """
         client = self._client_ctx.get()
         if client is None:
-            raise RuntimeError(_ERR_CLIENT_NOT_INITIALIZED)
+            raise ClientNotInitializedError(storage=type(self).__name__)
         return client
 
     def clone(self) -> Self:
-        """Return a new S3Storage instance with identical configuration.
+        """Return a new S3Storage sharing this instance's provider.
 
         Returns:
-            New S3Storage with the same parameters.
+            New S3Storage with the same configuration and the same client cache.
+            A clone of a storage that owns its provider stays able to recover
+            from ``aclose_shared()``, just as the original does.
 
         """
         return self.__class__(
@@ -174,86 +295,15 @@ class S3Storage(IFileStorage["S3Client"]):
             session_token=self.aws_session_token,
             profile_name=self.profile_name,
             region_name=self.region_name,
-            max_concurrent_clients=(self._limiter.max_concurrent if self._limiter else None),
-        )
-
-    def _init_credential_mode(
-        self,
-    ) -> tuple[S3CredentialMode, S3SessionParams]:
-        """Determine credential mode and build session params.
-
-        Returns:
-            Tuple of (credential mode, session parameters dict).
-
-        """
-        params: S3SessionParams = {}
-
-        if self.aws_access_key_id and self.aws_secret_access_key:
-            params.update(
-                {
-                    "aws_access_key_id": self.aws_access_key_id,
-                    "aws_secret_access_key": self.aws_secret_access_key,
-                    "aws_session_token": self.aws_session_token,
-                    "region_name": self.region_name,
-                },
-            )
-            return S3CredentialMode.KeyPair, params
-
-        self.aws_access_key_id = os.getenv(self.AWSAccessKeyID)
-        self.aws_secret_access_key = os.getenv(self.AWSSecretAccessKey)
-        self.aws_session_token = os.getenv(self.AWSSessionToken)
-        if self.aws_access_key_id and self.aws_secret_access_key:
-            params.update(
-                {
-                    "aws_access_key_id": self.aws_access_key_id,
-                    "aws_secret_access_key": self.aws_secret_access_key,
-                    "aws_session_token": self.aws_session_token,
-                    "region_name": self.region_name,
-                },
-            )
-            return S3CredentialMode.EnvVar, params
-
-        if self._has_aws_profile(self.profile_name):
-            params.update({"profile_name": self.profile_name})
-            return S3CredentialMode.SharedCredentials, params
-
-        return S3CredentialMode.IAMRole, params
-
-    @staticmethod
-    def _has_aws_profile(profile_name: str) -> bool:
-        """Check if the named AWS profile exists in ~/.aws/credentials.
-
-        Args:
-            profile_name: AWS shared credentials profile name.
-
-        Returns:
-            True if the profile file exists, False otherwise.
-
-        """
-        credentials_path = Path.home() / ".aws" / "credentials"
-        if not credentials_path.exists():
-            return False
-        content = credentials_path.read_text(encoding="utf-8")
-        header = "[default]" if profile_name == "default" else f"[{profile_name}]"
-        return header in content
-
-    def _create_client(self) -> "ClientCreatorContext[S3Client]":
-        """Create an aiobotocore async S3 client context manager.
-
-        Returns:
-            Async context manager yielding an S3Client.
-
-        """
-        from aiobotocore.session import get_session  # noqa: PLC0415
-
-        session = get_session()
-        return session.create_client(
-            self.S3Resource,
-            region_name=self.params.get("region_name"),
-            endpoint_url=self.endpoint_url,
-            aws_access_key_id=self.params.get("aws_access_key_id"),
-            aws_secret_access_key=self.params.get("aws_secret_access_key"),
-            aws_session_token=self.params.get("aws_session_token"),
+            # Pass no provider when this storage owns a process-default
+            # one: the clone resolves the same shared instance from the
+            # registry, and keeps the ability to recover from a shutdown that
+            # closed it. Handing over the object would freeze the clone to a
+            # provider it cannot re-resolve.
+            provider=None if self._owns_provider else self._provider,
+            max_pool_connections=self.max_pool_connections,
+            max_concurrent_ops=(self._limiter.max_concurrent if self._limiter else None),
+            auto_shutdown=self._auto_shutdown,
         )
 
     @staticmethod
@@ -299,28 +349,20 @@ class S3Storage(IFileStorage["S3Client"]):
     def _ensure_client[S: "S3Storage", **P, RT](
         func: Callable[Concatenate[S, P], Coro[RT]],
     ) -> Callable[Concatenate[S, P], Coro[RT]]:
-        """Wrap async function to ensure client is initialized.
+        """Wrap an async method so a client is bound for its duration.
 
-        Uses ContextVar for per-coroutine client isolation: nested
-        calls (e.g. copy() calling list()) reuse the client already
-        bound in the current context, but each top-level call spawned
-        via asyncio.gather/create_task starts in a fresh context and
-        opens a brand-new aiobotocore session (real connection pool
-        setup, not just a lightweight handle like Azure's SDK clients).
-
-        Caution:
-            Because each independent top-level call is this expensive,
-            fanning out hundreds of concurrent top-level calls against
-            a single-process dev server (e.g. LocalStack) can exhaust
-            it and cause connection resets/hangs. Set
-            max_concurrent_clients to bound how many of these sessions
-            may be created at once via ConcurrencyLimiter.
+        Borrows the provider's cached client and binds it to a ContextVar for
+        the length of the call. Nested calls (``copy()`` calling ``list()``, or
+        a fan-out spawned after the binding exists) see the same client through
+        the inherited context. The borrow is counted by the provider, so an idle
+        sweep can never close the client mid-operation, and the client is
+        released -- not closed -- on the way out.
 
         Args:
             func: The async function requiring a client.
 
         Returns:
-            Wrapped function with client lifecycle management.
+            Wrapped function with client binding.
 
         """
 
@@ -335,7 +377,7 @@ class S3Storage(IFileStorage["S3Client"]):
                 return await func(self, *args, **kwargs)
 
             async def _execute_with_client() -> RT:
-                async with self._create_client() as client:
+                async with self.provider.borrow() as client:
                     token = self._client_ctx.set(client)
                     try:
                         return await func(self, *args, **kwargs)

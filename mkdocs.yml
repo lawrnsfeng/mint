@@ -25,6 +25,7 @@ nav:
   - Home: index.md
   - File Storage:
       - Usage: fs/usage.md
+      - Client Caching: fs/client-caching.md
       - API Reference: fs/api.md
       - Implementation Notes: s3-implementation-notes.md
   - DB Repository Layer:

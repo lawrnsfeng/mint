@@ -1,6 +1,7 @@
 """Concurrency limiting utilities for async operations."""
 
 import asyncio
+import weakref
 from collections.abc import Callable, Coroutine
 from contextvars import ContextVar
 from functools import wraps
@@ -54,7 +55,10 @@ class ConcurrencyLimiter:
         self._max_concurrent = (
             max_concurrent if max_concurrent is not None else self.DEFAULT_MAX_CONCURRENT
         )
-        self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        self._semaphores: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop,
+            asyncio.Semaphore,
+        ] = weakref.WeakKeyDictionary()
         self._acquired_ctx: ContextVar[int] = ContextVar(
             f"_limiter_depth_{id(self)}",
             default=0,
@@ -64,6 +68,32 @@ class ConcurrencyLimiter:
     def max_concurrent(self) -> int:
         """Get the maximum concurrent operations allowed."""
         return self._max_concurrent
+
+    @property
+    def _semaphore(self) -> asyncio.Semaphore:
+        """Return the semaphore for the running loop, creating it on demand.
+
+        `asyncio.Semaphore` binds to the first event loop that contends on it,
+        so a single eagerly-built semaphore makes the whole limiter -- and any
+        object holding one -- unusable on a second loop. That matters for a
+        limiter held at module scope: the storage it belongs to recovers from
+        one loop ending, and the limiter has to recover with it.
+
+        Returns:
+            The semaphore belonging to the running loop.
+
+        """
+        loop = asyncio.get_running_loop()
+        # A bound semaphore keeps a reference to its own loop, so the weak key
+        # never fires on its own; prune closed loops explicitly or the map
+        # grows for the life of a process that cycles event loops.
+        for dead in [known for known in self._semaphores if known.is_closed()]:
+            self._semaphores.pop(dead, None)
+        semaphore = self._semaphores.get(loop)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self._max_concurrent)
+            self._semaphores[loop] = semaphore
+        return semaphore
 
     async def __aenter__(self) -> Self:
         """Acquire the semaphore on context entry."""
@@ -84,6 +114,11 @@ class ConcurrencyLimiter:
         self._acquired_ctx.set(depth - 1)
         if depth - 1 == 0:
             self._semaphore.release()
+
+    @property
+    def bound_loop_count(self) -> int:
+        """How many event loops this limiter currently holds a semaphore for."""
+        return len(self._semaphores)
 
     def limit[S, **P, R](
         self,
@@ -113,12 +148,13 @@ class ConcurrencyLimiter:
             if self._acquired_ctx.get() > 0:
                 return await func(self_inner, *args, **kwargs)
 
-            await self._semaphore.acquire()
+            semaphore = self._semaphore
+            await semaphore.acquire()
             token = self._acquired_ctx.set(1)
             try:
                 return await func(self_inner, *args, **kwargs)
             finally:
                 self._acquired_ctx.reset(token)
-                self._semaphore.release()
+                semaphore.release()
 
         return wrapper

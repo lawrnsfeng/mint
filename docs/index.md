@@ -15,7 +15,9 @@ SQLModel-based repository layer for Postgres.
   (`mint.db.sync`): zero-boilerplate CRUD on a new table, soft-delete and
   per-owner scoping enforced automatically (not opt-in, including on
   hand-written custom queries), single-query pagination-with-count,
-  insert-or-update (`upsert`), multi-repository atomic transactions, and
+  insert-or-update (`upsert`), session scopes (`@db.scoped`, `@scoped`)
+  that give any function one session and one transaction shared with
+  everything it calls, caller-committed `UnitOfWork` transactions, and
   read-only materialized-view-backed tables.
 - **[Utils](utils/usage.md)** — `ConcurrencyLimiter` (reentrant async
   semaphore wrapper) and `Batch` (splitting a sequence/iterator into sized

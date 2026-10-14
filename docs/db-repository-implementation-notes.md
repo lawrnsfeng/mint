@@ -25,6 +25,8 @@ the patterns other developers should follow when adding a new table.
 | Anomalous-result exception *(mint-internal, Phase 2)* | `AbnormalResultError` | `OperationalError` (existing, previously-unused) | A query returning no row on `count()`/`create()` (e.g. an `ON CONFLICT DO NOTHING` upsert) is an infrastructure-level "should never happen" condition, matching `OperationalError`'s existing role in `mint.fs`'s `s3.py`/`abs.py` — not a domain error worth its own bespoke type. |
 | Scoping bypass option *(mint-internal, Phase 2)* | Two booleans: `mint_include_deleted`, `mint_skip_owner_scope` | One `mint_scope_bypass: frozenset[type]` (of scoping mixin classes) | A future scoping dimension means adding a mixin class and a check, not a third named boolean constant. |
 | Scoping listener type checks *(mint-internal, Phase 2)* | `hasattr(schema, "is_deleted")`, `getattr(self, "owner", None)` | `issubclass(schema, IsDeletedMixin)`, `isinstance(self, IScopedRepository)` | Real type narrowing over duck-typed attribute probing — now a project rule (`.claude/rules/coding-style.md`, "Type narrowing over hasattr/getattr"). `issubclass()` can't be used against a `Protocol` with data members (`TypeError`), which is why the schema check targets concrete mixin classes rather than a `HasSoftDelete`-style Protocol (removed). |
+| Session slot owner *(mint-internal, 0.4)* | One `ContextVar` per repository instance | One `ContextVar` per `Database` instance, bound by `Database.session_scope()` | The per-repository slot isolated tasks correctly but nothing else could see it: a plain function had no scoped session, and a call from one repository into another opened a second session on a second connection. On the database, the slot is shared by every repository and every `@db.scoped` function in the task. |
+| Commit point *(mint-internal, 0.4)* | Every mutating statement committed when `auto_commit` was set, nested or not | The outermost scope commits once on exit; statements commit individually only on an externally-owned session | A nested `create()` committed the outer call's earlier writes mid-flight, so a method failing after two writes left both behind and atomicity needed `UnitOfWork` plus `auto_commit=False` on every participant. |
 
 ## Zero-boilerplate CRUD
 
@@ -354,11 +356,60 @@ docs, found fresh.
   flat bounded fan-out (exactly what `mint/fs/asynk/s3.py` already does
   for `save_many`/`copy`/`remove_many`); `sprout.Executor` is the right
   tool specifically for *hierarchical* work, not a flat list.
-- **Reads never auto-commit, even with `auto_commit=True`.** `execute()`/
-  `execute_many()` only commit when the statement isn't a plain `Select` —
-  fixed over the ported predecessor, which committed after every statement
-  including pure reads (an unnecessary round trip with no correctness
-  benefit).
+- **Reads never commit per statement, even with `auto_commit=True`.**
+  On an externally-owned session `execute()`/`execute_many()` only commit
+  when the statement isn't a plain `Select` — fixed over the ported
+  predecessor, which committed after every statement including pure reads
+  (an unnecessary round trip with no correctness benefit). Inside a
+  session scope no statement commits at all; the outermost scope ends with
+  one `COMMIT`. For a read-only scope that `COMMIT` replaces the
+  `ROLLBACK` the pool would otherwise issue when the connection is
+  returned, so it costs no extra round trip.
+- **(0.4) A scope must record its `dbschema`.** A joined scope reuses a
+  session whose `schema_translate_map` was fixed when it was opened. A
+  repository configured for another tenant joining it would run against
+  the wrong schema with no error, so the scope stores its schema in
+  `Session.info` and a mismatching joiner raises
+  `ScopeSchemaMismatchError`.
+- **(0.4) One scoping listener per shared session, not one per
+  repository.** The first attempt registered each joining repository's
+  own listener on the scope's session. A session-wide listener filters
+  every statement on the session, so one repository's owner criteria
+  were applied to another repository's queries on the same table — an
+  unscoped repository saw only the first owner's rows. A scope's session
+  now carries a single static dispatcher, and `ensure_session` names the
+  running repository's listener in `Session.info` for the length of the
+  call, restoring the previous one on the way out. An externally-supplied
+  session keeps the per-repository listener, and the constraint
+  documented for `UnitOfWork`.
+- **(0.4) `event.contains()` is not a safe "already registered?" check.**
+  SQLAlchemy's listener registry is keyed by `id(target)`, and an entry
+  outlives its target while anything still references the target's
+  listener collection. A new engine or session allocated at a recycled
+  address then makes `event.contains()` answer `True` with nothing
+  registered on it. Guarding `event.listen()` with it left roughly twenty
+  engines per test run without the failed-statement listener, and would
+  have left a session without its scoping listener — no owner filter, no
+  error. Found by a test that failed one run in three on the committed
+  lock only. `event.listen()` itself is safe to repeat (it deduplicates
+  by the live collection), so the engine listener is registered
+  unconditionally, and the session dispatcher is guarded by a key in the
+  session's own `info` dict.
+- **(0.4) `COMMIT` on an aborted transaction succeeds, as a rollback.**
+  After a failed statement Postgres answers `COMMIT` with `ROLLBACK` and
+  neither driver raises. With one transaction per scope, a caught
+  `IntegrityError` would turn a successful return into silently lost
+  writes. An engine-level `handle_error` listener flags the connection;
+  a scope that finds the flag at commit time runs `SELECT 1` first, which
+  fails in an aborted transaction and passes after a rollback to a
+  savepoint, and raises `ScopeAbortedError` on failure. The probe costs a
+  round trip only after an error.
+- **(0.4) A `ContextVar` value outlives the scope in a child task.** A
+  task created inside a scope gets a copy of the context, and the
+  parent's `reset()` does not reach it. After the parent exits, the child
+  still held the closed session — which SQLAlchemy happily reuses — and
+  would join a scope nobody commits. The scope's `Session.info` entry is
+  removed on exit, and a session without it is not joinable.
 - **(confirmed, Phase 2) `MaterializedViewRepository.refresh_materialized_view()`
   ignored `auto_commit`.** Found via code review: it unconditionally called
   `self.session.commit()`, the only write path in the layer that didn't

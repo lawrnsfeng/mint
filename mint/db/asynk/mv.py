@@ -27,5 +27,4 @@ class MaterializedViewRepository[T: Base](RepositoryBase[T]):
         """Refresh the underlying materialized view without blocking readers."""
         stmt = text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {self.table_name}")
         await self.session.execute(stmt)
-        if self.auto_commit:
-            await self.session.commit()
+        await self._commit_statement()

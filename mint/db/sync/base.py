@@ -1,7 +1,8 @@
 """Generic sync repository base: session isolation + scoping listener.
 
-Sync mirror of :mod:`mint.db.asynk.base`. The same ``ContextVar`` mechanism
-isolates sessions per thread here (a ``ContextVar`` is as valid for
+Sync mirror of :mod:`mint.db.asynk.base`. The same ``ContextVar`` mechanism,
+with the slot held by the :class:`Database`, isolates sessions per thread
+here (a ``ContextVar`` is as valid for
 thread-based isolation as it is for asyncio-task-based isolation — each OS
 thread that doesn't explicitly copy a context gets its own top-level
 context), which also fixes the predecessor implementation's separate
@@ -9,10 +10,10 @@ sync-side bug (a ``scoped_session(scopefunc=None)`` degrading to thread-id
 scoping and risking a session leaking across pooled threads).
 """
 
-from collections.abc import Callable, Sequence
-from contextvars import ContextVar
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from functools import wraps
-from typing import Any, Concatenate, Protocol, TypedDict, cast, runtime_checkable
+from typing import Any, Concatenate, Final, Protocol, TypedDict, cast, runtime_checkable
 
 from sqlalchemy import Select, event, func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -26,6 +27,9 @@ from mint.db.typedefs import CRUDStatement, PaginatedResult
 from .database import Database
 
 _SCOPE_BYPASS_OPTION = "mint_scope_bypass"
+# Session.info key holding the scoping listener of the repository whose
+# method is currently running.
+_ACTIVE_SCOPING_KEY: Final[str] = "mint_active_scoping"
 
 
 @runtime_checkable
@@ -65,11 +69,12 @@ class RepositoryKwargs(TypedDict, total=False):
 class RepositoryBase[T: Base]:
     """Generic data-access base for one SQLModel table.
 
-    Session lifecycle defaults to zero-ceremony: a top-level call to any
-    ``ensure_session``-decorated method opens a session, isolated per thread
-    via ``ContextVar``, and closes it automatically. Passing an explicit
-    ``session`` (typically via :class:`mint.db.sync.uow.UnitOfWork`) opts
-    into caller-managed transaction boundaries instead.
+    Session lifecycle defaults to zero-ceremony: a call to any
+    ``ensure_session``-decorated method joins the session scope already
+    open on the database in this thread, or opens one, commits it and
+    closes it when no scope is open. Passing an explicit ``session``
+    (typically via :class:`mint.db.sync.uow.UnitOfWork`) opts into
+    caller-managed transaction boundaries instead.
     """
 
     Schema: type[T]
@@ -90,16 +95,15 @@ class RepositoryBase[T: Base]:
                 hatch). When set, this repository never opens its own
                 session.
             dbschema: Multi-tenant schema-translate target.
-            auto_commit: Whether mutating statements commit automatically.
-                Reads never commit regardless of this flag.
+            auto_commit: Whether this repository commits its own work.
+                When a call opens the session scope, the scope commits
+                once on exit. On an externally-owned ``session``, each
+                mutating statement commits. Ignored when the call joins a
+                scope something else opened: that scope's owner decides.
 
         """
         self._db = db
         self._external_session = session
-        self._session_ctx: ContextVar[Session | None] = ContextVar(
-            f"_db_session_{id(self)}",
-            default=None,
-        )
         self._dbschema = dbschema
         self.auto_commit = auto_commit
         if session is not None:
@@ -120,18 +124,65 @@ class RepositoryBase[T: Base]:
                 supplied.
 
         """
-        session = self._external_session or self._session_ctx.get()
-        if session is None:
-            raise SessionNotInitializedError(repository=type(self).__name__)
-        return session
+        if self._external_session is not None:
+            return self._external_session
+        try:
+            return self._db.current_session
+        except SessionNotInitializedError as exc:
+            raise SessionNotInitializedError(repository=type(self).__name__) from exc
+
+    @staticmethod
+    def _dispatch_scoping(orm_execute_state: ORMExecuteState) -> None:
+        """Apply the scoping of the repository whose method is running, if any.
+
+        The one listener registered on a session-scope session. That
+        session is shared by every repository on the database, so a
+        listener per repository would apply each one's owner criteria to
+        all the others' statements; this one forwards to the listener
+        named in ``Session.info`` only.
+        """
+        listener = orm_execute_state.session.info.get(_ACTIVE_SCOPING_KEY)
+        if callable(listener):
+            listener(orm_execute_state)
+
+    @contextmanager
+    def _scoping(self, session: Session) -> Generator[None]:
+        """Make this repository the one whose scoping applies, for the block.
+
+        Restores the previously active repository on exit, so a method of
+        one repository calling into another gets its own scoping back
+        afterwards.
+        """
+        # The key's presence, not event.contains(), says whether this session
+        # already has the dispatcher: contains() looks the target up by id()
+        # and answers True for a new session at a recycled address, which
+        # would leave that session with no scoping at all.
+        if _ACTIVE_SCOPING_KEY not in session.info:
+            event.listen(session, "do_orm_execute", RepositoryBase._dispatch_scoping)
+        previous = session.info.get(_ACTIVE_SCOPING_KEY)
+        session.info[_ACTIVE_SCOPING_KEY] = self._scope_listener
+        try:
+            yield
+        finally:
+            session.info[_ACTIVE_SCOPING_KEY] = previous
+
+    def _commit_statement(self) -> None:
+        """Commit after a mutating statement on an externally-owned session.
+
+        Inside a session scope nothing commits per statement: the scope
+        commits once, when its outermost level exits.
+        """
+        if self._external_session is not None and self.auto_commit:
+            self._external_session.commit()
 
     def _scope_listener(self, orm_execute_state: ORMExecuteState) -> None:
         """Inject soft-delete/owner ``with_loader_criteria`` for this schema.
 
-        Registered once per session this repository is bound to (see
-        ``ensure_session`` and ``__init__``). Applies to every statement
-        executed through that session, including hand-written custom
-        queries that never call a helper method.
+        Reached through :meth:`_dispatch_scoping` while one of this
+        repository's methods runs in a session scope, and registered
+        directly on an externally-supplied session (see ``__init__``).
+        Applies to every statement executed that way, including
+        hand-written custom queries that never call a helper method.
 
         A statement opts out of one or more scoping dimensions via
         ``.execution_options(mint_scope_bypass=frozenset({IsDeletedMixin}))``
@@ -191,10 +242,11 @@ class RepositoryBase[T: Base]:
     ) -> Callable[Concatenate[R, P], RT]:
         """Wrap a method so it always runs with a bound session.
 
-        Nested calls within one thread reuse the session already bound in
-        that thread's context (or the externally-supplied one); a
-        top-level call opens a fresh, thread-isolated session and closes it
-        on exit.
+        With an externally-supplied session the method runs on it as is.
+        Otherwise it runs inside :meth:`Database.session_scope`: a call made
+        while a scope is open in this thread joins it, and a top-level call
+        opens a fresh, thread-isolated session, commits it when
+        ``auto_commit`` is set and closes it on exit.
 
         Args:
             func: The method requiring a session.
@@ -206,15 +258,16 @@ class RepositoryBase[T: Base]:
 
         @wraps(func)
         def wrapper(self: R, *args: P.args, **kwargs: P.kwargs) -> RT:
-            if self._external_session is not None or self._session_ctx.get() is not None:
+            if self._external_session is not None:
                 return func(self, *args, **kwargs)
-            with self._db.create_session(dbschema=self._dbschema) as session:
-                event.listen(session, "do_orm_execute", self._scope_listener)
-                token = self._session_ctx.set(session)
-                try:
-                    return func(self, *args, **kwargs)
-                finally:
-                    self._session_ctx.reset(token)
+            with (
+                self._db.session_scope(
+                    dbschema=self._dbschema,
+                    commit=self.auto_commit,
+                ) as session,
+                self._scoping(session),
+            ):
+                return func(self, *args, **kwargs)
 
         return wrapper
 
@@ -236,8 +289,8 @@ class RepositoryBase[T: Base]:
         """
         result = self.session.execute(stmt)
         obj = result.scalar()
-        if self.auto_commit and not isinstance(stmt, Select):
-            self.session.commit()
+        if not isinstance(stmt, Select):
+            self._commit_statement()
         return obj
 
     @ensure_session
@@ -263,8 +316,8 @@ class RepositoryBase[T: Base]:
         if unique:
             result = result.unique()
         objs = result.scalars().all()
-        if self.auto_commit and not isinstance(stmt, Select):
-            self.session.commit()
+        if not isinstance(stmt, Select):
+            self._commit_statement()
         return objs
 
     @ensure_session

@@ -371,6 +371,22 @@ docs, found fresh.
   the wrong schema with no error, so the scope stores its schema in
   `Session.info` and a mismatching joiner raises
   `ScopeSchemaMismatchError`.
+- **(0.4) The package `__init__` must not import the repository base.**
+  `Database` and `UnitOfWork` never needed SQLModel, but importing any
+  submodule runs the package `__init__` first, and that imported
+  `base.py` and with it `sqlmodel`. The repository names are now served
+  by a module-level `__getattr__` (PEP 562). It is defined under
+  `if not TYPE_CHECKING`: a `__getattr__` a type checker can see makes
+  every misspelt `from mint.db.asynk import ...` type-check.
+- **(0.4) A dependency group is not an extra.** `[dependency-groups]` is
+  for a project's own development environment and is not written to the
+  wheel's metadata, so `mint[db]` resolved to nothing for a consumer. The
+  database dependencies are `[project.optional-dependencies]` now.
+- **(0.4) `sqlalchemy` alone does not bring `greenlet`.** SQLAlchemy 2.0
+  installs it through a platform marker that stops at Python 3.12, and
+  2.1 dropped it from the default install altogether; the async layer
+  then fails at import. Declared as `sqlalchemy[asyncio]`. Found by the
+  lowest-versions CI run.
 - **(0.4) One scoping listener per shared session, not one per
   repository.** The first attempt registered each joining repository's
   own listener on the scope's session. A session-wide listener filters
@@ -472,7 +488,8 @@ against real Postgres in `tests/db/asynk/test_models.py` and
 
 ## Dependencies
 
-Added under a `db` dependency-group (`sqlmodel`, `sqlalchemy`, `asyncpg`,
-`psycopg2-binary`, `pydantic-settings`) and a `postgres` extra on the `test`
-group's `testcontainers`, mirroring the existing `s3`/`azure` groups. Sync
-Postgres access uses `psycopg2`; async uses `asyncpg`.
+Two extras. `mint[db]` is the session lifecycle: `sqlalchemy[asyncio]`,
+`asyncpg`, `psycopg2-binary`, `pydantic-settings`. `mint[orm]` is
+`mint[db]` plus `sqlmodel`, for the repository layer. Sync Postgres access
+uses `psycopg2`; async uses `asyncpg`. The `test` group carries a
+`postgres` extra on `testcontainers`, mirroring the `s3`/`azure` groups.

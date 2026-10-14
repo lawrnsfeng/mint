@@ -453,6 +453,39 @@ from a separate worker — the
 mint deliberately offers no primitive for suspending a transaction across
 a network call.
 
+## Using mint.db without SQLModel
+
+The session lifecycle — `Database`, session scopes, `UnitOfWork` — needs
+SQLAlchemy only. A service that builds its statements with SQLAlchemy Core
+and has no use for the repository classes installs `mint[db]` (not
+`mint[orm]`) and never imports SQLModel:
+
+```python
+from sqlalchemy import func, insert, select
+from mint.db.asynk import Database, scoped
+
+class NoteStore:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    @scoped
+    async def add(self, body: str) -> int:
+        session = self.db.current_session
+        await session.execute(insert(notes).values(body=body))
+        result = await session.execute(select(func.count()).select_from(notes))
+        return result.scalar_one()
+```
+
+- Importing `mint.db.asynk` or `mint.db.sync` loads the lifecycle names
+  only. `RepositoryBase`, `EntityRepository`, the mixins and
+  `MaterializedViewRepository` are imported from the same package paths
+  as before, on first access — that is the moment SQLModel is required.
+- Soft-delete and owner scoping are repository features, applied through
+  an ORM session event. A Core statement executed on the session is not
+  filtered by them.
+- There is no generic repository for Core tables, on purpose: a Core
+  service's own query functions already are that layer.
+
 ## Unit of Work: multi-table transactions
 
 A session scope covers most multi-table work with less ceremony.

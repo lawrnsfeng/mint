@@ -1421,17 +1421,25 @@ dependencies = [
     { name = "structlog" },
 ]
 
-[package.dev-dependencies]
-azure = [
-    { name = "azure-identity" },
-    { name = "azure-storage-blob" },
-]
+[package.optional-dependencies]
 db = [
     { name = "asyncpg" },
     { name = "psycopg2-binary" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+]
+orm = [
+    { name = "asyncpg" },
+    { name = "psycopg2-binary" },
+    { name = "pydantic-settings" },
+    { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "sqlmodel" },
+]
+
+[package.dev-dependencies]
+azure = [
+    { name = "azure-identity" },
+    { name = "azure-storage-blob" },
 ]
 dev = [
     { name = "mypy" },
@@ -1462,22 +1470,25 @@ test = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=25.1.0" },
     { name = "aiohttp", specifier = ">=3.13.2" },
+    { name = "asyncpg", marker = "extra == 'db'", specifier = ">=0.30.0" },
+    { name = "asyncpg", marker = "extra == 'orm'", specifier = ">=0.30.0" },
+    { name = "psycopg2-binary", marker = "extra == 'db'", specifier = ">=2.9.10" },
+    { name = "psycopg2-binary", marker = "extra == 'orm'", specifier = ">=2.9.10" },
     { name = "pydantic", specifier = ">=2.12.5" },
+    { name = "pydantic-settings", marker = "extra == 'db'", specifier = ">=2.6.0" },
+    { name = "pydantic-settings", marker = "extra == 'orm'", specifier = ">=2.6.0" },
     { name = "sprout", git = "ssh://git@github.com/lawrnsfeng/sprout.git" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'db'", specifier = ">=2.0.36" },
+    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'orm'", specifier = ">=2.0.36" },
+    { name = "sqlmodel", marker = "extra == 'orm'", specifier = ">=0.0.22" },
     { name = "structlog", specifier = ">=25.5.0" },
 ]
+provides-extras = ["db", "orm"]
 
 [package.metadata.requires-dev]
 azure = [
     { name = "azure-identity", specifier = ">=1.25.1" },
     { name = "azure-storage-blob", specifier = "~=12.27.1" },
-]
-db = [
-    { name = "asyncpg", specifier = ">=0.30.0" },
-    { name = "psycopg2-binary", specifier = ">=2.9.10" },
-    { name = "pydantic-settings", specifier = ">=2.6.0" },
-    { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.36" },
-    { name = "sqlmodel", specifier = ">=0.0.22" },
 ]
 dev = [
     { name = "mypy", specifier = ">=1.19.0" },

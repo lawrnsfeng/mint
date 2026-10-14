@@ -26,7 +26,7 @@ s3 = [
 ]
 db = [
     "sqlmodel>=0.0.22",
-    "sqlalchemy>=2.0.36",
+    "sqlalchemy[asyncio]>=2.0.36",
     "asyncpg>=0.30.0",
     "psycopg2-binary>=2.9.10",
     "pydantic-settings>=2.6.0",
@@ -49,9 +49,9 @@ test = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "pytest-mock>=3.15.1",
-    "testcontainers[azurite]>=4.0.0",
-    "testcontainers[localstack]>=4.0.0",
-    "testcontainers[postgres]>=4.0.0",
+    "testcontainers[azurite]>=4.1.0",
+    "testcontainers[localstack]>=4.1.0",
+    "testcontainers[postgres]>=4.1.0",
 ]
 
 [build-system]
@@ -133,6 +133,9 @@ warn_required_dynamic_aliases = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "concurrency: session-isolation regression tests run under concurrent tasks or threads",
+]
 filterwarnings = [
     # Suppress internal testcontainers library deprecation (their own code issue)
     "ignore:The @wait_container_is_ready decorator is deprecated:DeprecationWarning:testcontainers.core.waiting_utils",

@@ -18,6 +18,8 @@ from mint.db.asynk.database import Database
 from mint.db.asynk.entity import EntityRepository
 from tests.db.schemas import TItem
 
+pytestmark = pytest.mark.concurrency
+
 
 class TItemCreate(SQLModel):
     """Create-payload for TItem."""

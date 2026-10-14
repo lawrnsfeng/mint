@@ -657,6 +657,21 @@ statement has already run is a silent no-op). Inside a session scope
 nothing commits until the scope exits, so this only arises on a session
 you commit by hand — a `UnitOfWork`, or `create_session()`.
 
+## Not planned
+
+Left out on purpose. Each would widen what this layer has to get right
+for every consumer, for the benefit of few:
+
+- **Read replicas, sharding, coordination across several databases.** One
+  `Database` is one engine. A service that needs two constructs two and
+  keeps their scopes apart.
+- **A repository layer for SQLAlchemy Core tables.** See "Using mint.db
+  without SQLModel".
+- **Suspending a transaction across a network call.** See "Keep network
+  calls out of a scope".
+- **Detecting a network call inside a scope.** Socket guards and event
+  hooks all leak. It stays a convention, and a review rule.
+
 ## Real-world schema shapes
 
 - **No `id` column** (a composite-key join table): use `RepositoryBase[T]`

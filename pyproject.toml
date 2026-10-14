@@ -160,7 +160,7 @@ cov = "python -m pytest --cov=mint --cov-report=term-missing tests"
 [tool.semantic_release]
 commit_parser = "conventional"
 tag_format = "v{version}"
-major_on_zero = true
+major_on_zero = false
 allow_zero_version = true
 commit_message = "chore(release): v{version}\n\n[skip ci]"
 commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

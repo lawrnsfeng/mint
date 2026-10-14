@@ -35,6 +35,7 @@ nav:
   - Utils:
       - Usage: utils/usage.md
       - API Reference: utils/api.md
+  - Versioning: versioning.md
 plugins:
   - search
   - mkdocstrings:

@@ -59,3 +59,5 @@ As a dependency of another project, the extras are `mint[db]` and
   caveats confirmed against real Postgres.
 - **[Utils usage](utils/usage.md)** / **[API reference](utils/api.md)**
   — `Batch`/`ConcurrencyLimiter` for bounded concurrent fan-out.
+- **[Versioning and deprecation](versioning.md)** — what the public API
+  is, how it may change, and what CI proves on every pull request.

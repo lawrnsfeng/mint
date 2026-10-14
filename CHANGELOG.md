@@ -2,6 +2,26 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-10-14)
+
+### Build System
+
+- Commit a refreshed lock and test against it ([#5](https://github.com/lawrnsfeng/mint/pull/5),
+  [`bc1fdd6`](https://github.com/lawrnsfeng/mint/commit/bc1fdd6cd3fd53af0d4a232f3b57b6cd79047e72))
+
+### Continuous Integration
+
+- Run tests with a postgres matrix and coverage gate
+  ([#5](https://github.com/lawrnsfeng/mint/pull/5),
+  [`bc1fdd6`](https://github.com/lawrnsfeng/mint/commit/bc1fdd6cd3fd53af0d4a232f3b57b6cd79047e72))
+
+### Features
+
+- **db**: Scope a session to any function and commit once
+  ([#6](https://github.com/lawrnsfeng/mint/pull/6),
+  [`4522018`](https://github.com/lawrnsfeng/mint/commit/452201864b8797d22395cc951f51b29bf7ebcd5b))
+
+
 ## v0.3.0 (2026-09-05)
 
 ### Bug Fixes

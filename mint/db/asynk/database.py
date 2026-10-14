@@ -4,24 +4,29 @@ from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from functools import cached_property, wraps
-from typing import Any, Final
+from typing import Any, Final, overload
 
 from sqlalchemy import event, text
 from sqlalchemy.engine import ExceptionContext
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import QueuePool
 
 from mint.db.exc import (
+    CommitOutcomeUnknownError,
     ConfigError,
+    PoolExhaustedError,
     ScopeAbortedError,
     ScopeSchemaMismatchError,
     SessionNotInitializedError,
 )
+from mint.db.retry import ScopeRetry
 from mint.db.settings import DatabaseSettings
 
 type Coro[T] = Coroutine[Any, Any, T]
@@ -61,8 +66,9 @@ class Database:
                 is supplied directly.
             engine: Pre-built engine to use instead of creating one from
                 ``uri``/``settings`` (primarily for tests).
-            settings: Pool/echo tuning. Defaults to environment-sourced
-                :class:`DatabaseSettings`.
+            settings: Pool, timeout and echo tuning. Defaults to
+                environment-sourced :class:`DatabaseSettings`. Applied only
+                when the engine is built here from ``uri``.
 
         Raises:
             ConfigError: If neither ``uri`` nor ``engine`` is supplied.
@@ -83,6 +89,8 @@ class Database:
                 pool_size=self.settings.POOL_SIZE,
                 max_overflow=self.settings.MAX_OVERFLOW,
                 pool_recycle=self.settings.POOL_RECYCLE,
+                pool_timeout=self.settings.POOL_TIMEOUT,
+                connect_args=self._connect_args,
             )
         else:
             raise ConfigError(detail="either uri or engine must be supplied")
@@ -95,6 +103,14 @@ class Database:
     def engine(self) -> AsyncEngine:
         """Return the underlying async engine."""
         return self._engine
+
+    @property
+    def _connect_args(self) -> dict[str, dict[str, str]]:
+        """Return the asyncpg connect arguments the settings call for."""
+        timeout_ms = self.settings.STATEMENT_TIMEOUT_MS
+        if timeout_ms is None:
+            return {}
+        return {"server_settings": {"statement_timeout": str(timeout_ms)}}
 
     @cached_property
     def _sessionmaker(self) -> async_sessionmaker[AsyncSession]:
@@ -121,6 +137,10 @@ class Database:
             A fresh :class:`AsyncSession`, rolled back on error and always
             closed on exit.
 
+        Raises:
+            PoolExhaustedError: If no pooled connection of this database
+                became free within the pool timeout.
+
         """
         async with self._sessionmaker() as session:
             try:
@@ -129,9 +149,32 @@ class Database:
                         execution_options={"schema_translate_map": {None: dbschema}},
                     )
                 yield session
+            except PoolTimeoutError as exc:
+                exhausted = self._pool_exhaustion
+                if exhausted is None:
+                    raise
+                raise exhausted from exc
             except Exception:
                 await session.rollback()
                 raise
+
+    @property
+    def _pool_exhaustion(self) -> PoolExhaustedError | None:
+        """Return the error describing this pool's exhaustion, if it is exhausted.
+
+        ``None`` when this pool still has an idle connection to hand out:
+        a pool timeout seen then was raised by some other engine used
+        inside the block, and is left as it is.
+        """
+        pool = self._engine.pool
+        if not isinstance(pool, QueuePool) or pool.checkedin() > 0:
+            return None
+        return PoolExhaustedError(
+            pool_size=pool.size(),
+            overflow=pool.overflow(),
+            checked_out=pool.checkedout(),
+            timeout=pool.timeout(),
+        )
 
     @staticmethod
     def _flag_failed_statement(context: ExceptionContext) -> None:
@@ -165,6 +208,8 @@ class Database:
             ScopeAbortedError: If a statement failed earlier in the scope,
                 the error was caught, and the transaction was not restored
                 by rolling back to a savepoint.
+            CommitOutcomeUnknownError: If the connection was lost while
+                the commit was in flight.
 
         """
         if not session.in_transaction():
@@ -175,7 +220,12 @@ class Database:
                 await session.execute(text("SELECT 1"))
             except DBAPIError as exc:
                 raise ScopeAbortedError from exc
-        await session.commit()
+        try:
+            await session.commit()
+        except DBAPIError as exc:
+            if exc.connection_invalidated:
+                raise CommitOutcomeUnknownError from exc
+            raise
 
     @property
     def current_session(self) -> AsyncSession:
@@ -247,24 +297,97 @@ class Database:
                 del session.info[_SCOPE_DBSCHEMA_KEY]
                 self._session_ctx.reset(token)
 
-    def scoped[**P, RT](self, func: Callable[P, Coro[RT]]) -> Callable[P, Coro[RT]]:
-        """Wrap a coroutine function so it runs inside a :meth:`session_scope`.
+    async def run_in_scope[T](
+        self,
+        call: Callable[[], Coro[T]],
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> T:
+        """Run ``call`` inside a :meth:`session_scope` and return its result.
 
-        Works on any function or method. The session is reachable through
-        :attr:`current_session` from the function and from everything it
-        calls, decorated or not.
+        With ``retries`` set and no scope open yet, a scope that fails with
+        a transient error — a serialization failure, a deadlock, a
+        connection lost before the commit — is rolled back and ``call`` is
+        run again in a fresh one, after a short backoff. A connection lost
+        *while committing* is not retried: the outcome is unknown, and it
+        surfaces as :class:`CommitOutcomeUnknownError`. When this call
+        joins a scope that is already open it never retries either: the
+        transaction belongs to that scope's owner, and only re-running the
+        owner's whole function can replay it.
 
         Args:
-            func: The coroutine function to scope.
+            call: The zero-argument coroutine function to run.
+            retries: Extra attempts after the first on a transient error.
+                ``call`` runs again from the top, so everything it does
+                must be safe to repeat.
+            dbschema: Multi-tenant schema-translate target for the scope.
 
         Returns:
-            The wrapped function.
+            Whatever ``call`` returns.
 
         """
 
-        @wraps(func)
-        async def wrapper(*args: P.args, **kwargs: P.kwargs) -> RT:
-            async with self.session_scope():
-                return await func(*args, **kwargs)
+        async def attempt() -> T:
+            async with self.session_scope(dbschema=dbschema):
+                return await call()
 
-        return wrapper
+        if retries <= 0 or self._bound_session is not None:
+            return await attempt()
+        return await ScopeRetry(retries=retries).as_async_retrying(attempt)
+
+    @overload
+    def scoped[**P, RT](self, func: Callable[P, Coro[RT]], /) -> Callable[P, Coro[RT]]: ...
+
+    @overload
+    def scoped[**P, RT](
+        self,
+        /,
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> Callable[[Callable[P, Coro[RT]]], Callable[P, Coro[RT]]]: ...
+
+    def scoped[**P, RT](
+        self,
+        func: Callable[P, Coro[RT]] | None = None,
+        /,
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> Callable[P, Coro[RT]] | Callable[[Callable[P, Coro[RT]]], Callable[P, Coro[RT]]]:
+        """Wrap a coroutine function so it runs inside a :meth:`session_scope`.
+
+        Works on any function or method, bare (``@db.scoped``) or with
+        options (``@db.scoped(retries=2, dbschema="tenant_a")``). The session is reachable
+        through :attr:`current_session` from the function and from
+        everything it calls, decorated or not.
+
+        Args:
+            func: The coroutine function to scope, when used bare.
+            retries: Extra attempts on a transient error — see
+                :meth:`run_in_scope`.
+            dbschema: Multi-tenant schema-translate target for the scope.
+                For a schema only known per call, use
+                :meth:`run_in_scope` or :meth:`session_scope` instead.
+
+        Returns:
+            The wrapped function, or a decorator producing it when called
+            with options.
+
+        """
+
+        def decorate(target: Callable[P, Coro[RT]]) -> Callable[P, Coro[RT]]:
+            @wraps(target)
+            async def wrapper(*args: P.args, **kwargs: P.kwargs) -> RT:
+                return await self.run_in_scope(
+                    lambda: target(*args, **kwargs),
+                    retries=retries,
+                    dbschema=dbschema,
+                )
+
+            return wrapper
+
+        if func is None:
+            return decorate
+        return decorate(func)

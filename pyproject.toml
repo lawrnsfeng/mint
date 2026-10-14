@@ -19,6 +19,7 @@ db = [
     "asyncpg>=0.30.0",
     "psycopg2-binary>=2.9.10",
     "pydantic-settings>=2.6.0",
+    "tenacity>=9.0.0",
 ]
 # The SQLModel repository layer on top of it.
 orm = [

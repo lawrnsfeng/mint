@@ -1427,6 +1427,7 @@ db = [
     { name = "psycopg2-binary" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "tenacity" },
 ]
 orm = [
     { name = "asyncpg" },
@@ -1434,6 +1435,7 @@ orm = [
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
     { name = "sqlmodel" },
+    { name = "tenacity" },
 ]
 
 [package.dev-dependencies]
@@ -1482,6 +1484,8 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'orm'", specifier = ">=2.0.36" },
     { name = "sqlmodel", marker = "extra == 'orm'", specifier = ">=0.0.22" },
     { name = "structlog", specifier = ">=25.5.0" },
+    { name = "tenacity", marker = "extra == 'db'", specifier = ">=9.0.0" },
+    { name = "tenacity", marker = "extra == 'orm'", specifier = ">=9.0.0" },
 ]
 provides-extras = ["db", "orm"]
 

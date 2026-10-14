@@ -15,6 +15,12 @@ behavioral difference to distinguish (see the [Usage guide](usage.md#sync-vs-asy
 
 ::: mint.db.asynk.scope.IDatabaseBound
 
+::: mint.db.retry.ScopeRetry
+
+## Settings
+
+::: mint.db.settings.DatabaseSettings
+
 ## Repositories
 
 ::: mint.db.asynk.RepositoryBase
@@ -74,3 +80,7 @@ behavioral difference to distinguish (see the [Usage guide](usage.md#sync-vs-asy
 ::: mint.db.exc.ScopeSchemaMismatchError
 
 ::: mint.db.exc.ScopeAbortedError
+
+::: mint.db.exc.PoolExhaustedError
+
+::: mint.db.exc.CommitOutcomeUnknownError

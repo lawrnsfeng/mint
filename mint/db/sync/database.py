@@ -1,6 +1,6 @@
 """Sync engine + session-factory owner for mint.db repositories."""
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from functools import cached_property
 
@@ -75,7 +75,7 @@ class Database:
         self,
         *,
         dbschema: str | None = None,
-    ) -> Iterator[Session]:
+    ) -> Generator[Session]:
         """Open a new session, applying an optional multi-tenant schema.
 
         Args:

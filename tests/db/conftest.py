@@ -7,6 +7,7 @@ async driver. See specs/002-db-repository-layer/research.md,
 "Verification approach".
 """
 
+import os
 from collections.abc import AsyncGenerator, Generator, Iterator
 from typing import Final
 
@@ -19,7 +20,8 @@ from mint.db.asynk.database import Database as AsyncDatabase
 from mint.db.models import Base
 from mint.db.sync.database import Database as SyncDatabase
 
-_IMAGE: Final[str] = "postgres:16"
+# CI overrides this to run the suite across a Postgres version matrix.
+_IMAGE: Final[str] = os.environ.get("MINT_TEST_POSTGRES_IMAGE", "postgres:16")
 
 
 @pytest.fixture(scope="session")

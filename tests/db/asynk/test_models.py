@@ -22,7 +22,7 @@ table instead of one shared ``declared_attr`` mixin. Documented in
 docs/db-repository-implementation-notes.md.
 """
 
-from typing import ClassVar, cast
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -169,7 +169,7 @@ class TWithHybrid(BaseWithUUID, table=True):
     # pydantic's namespace scanner rejects an un-annotated hybrid_property
     # descriptor otherwise (same friction class as declared_attr, see
     # module docstring) — this is the documented pydantic-suggested fix.
-    model_config: ClassVar[SQLModelConfig] = {"ignored_types": (hybrid_property,)}
+    model_config = SQLModelConfig(ignored_types=(hybrid_property,))
 
     first_name: str
     last_name: str | None = None
@@ -248,7 +248,7 @@ class TFullStackUser(
 ):
     """4+ mixin stack, plus a concrete owner relationship and a cross-mixin hybrid_property."""
 
-    model_config: ClassVar[SQLModelConfig] = {"ignored_types": (hybrid_property,)}
+    model_config = SQLModelConfig(ignored_types=(hybrid_property,))
 
     username: str
     created_by_user_id: UUID | None = Field(default=None, foreign_key="treftarget.id")

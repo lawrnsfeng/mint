@@ -24,6 +24,10 @@ test:
 testv:
 	@uv run python -m pytest -s tests
 
+.PHONY: test-concurrency
+test-concurrency:
+	@uv run python -m pytest -m concurrency tests
+
 .PHONY: cov
 cov:
 	@uv run python -m pytest --cov=mint --cov-report=term-missing tests

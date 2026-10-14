@@ -21,7 +21,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import (
     AbstractAsyncContextManager,
     AsyncExitStack,
@@ -335,7 +335,7 @@ class ClientProviderBase[T](ABC):
                 logger.exception("failed to close shared provider %s", key[0])
 
     @asynccontextmanager
-    async def borrow(self) -> AsyncIterator[T]:
+    async def borrow(self) -> AsyncGenerator[T]:
         """Lend a cached client for the duration of one logical operation.
 
         The borrow is counted, so an idle sweep can never close a client out

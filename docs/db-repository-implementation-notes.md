@@ -426,6 +426,42 @@ docs, found fresh.
   still held the closed session — which SQLAlchemy happily reuses — and
   would join a scope nobody commits. The scope's `Session.info` entry is
   removed on exit, and a session without it is not joinable.
+- **(0.4) `UnitOfWork` closed its session without telling it why.**
+  `__aexit__` called `AsyncExitStack.aclose()`, which exits the session's
+  context manager with no exception information. The rollback still
+  happened, implicitly, when the session closed — but the `except`
+  clauses in `Database.create_session()` never ran, so an error that
+  `create_session()` translates (pool exhaustion) came out untranslated
+  on the `UnitOfWork` path only. It now forwards the exception triple to
+  the stack's own `__aexit__`.
+- **(0.4) Retry is decided by SQLSTATE, read through a `Protocol`.**
+  asyncpg (through SQLAlchemy's adapter) and psycopg2 both expose the
+  code as `pgcode` on the driver exception; `mint.db.retry.IDriverError`
+  narrows to it with `isinstance`. Only `40001` and `40P01` retry, plus
+  `DBAPIError.connection_invalidated` before the commit (see the next
+  note for why not during it). Backoff is
+  `tenacity.wait_random_exponential` — `wait_exponential_jitter` renamed
+  an argument between tenacity 9.0 and 9.2, and the declared floor has to
+  work.
+- **(0.4) A disconnect is only retryable before the commit.** `40001`
+  and `40P01` mean Postgres rolled the transaction back. A connection
+  lost while `COMMIT` is in flight means nothing of the kind: the commit
+  may have been applied and only its acknowledgement lost. Found via code
+  review — the first version retried on any invalidated connection, which
+  could run a committed function a second time. The commit itself is now
+  wrapped, and a disconnect there raises `CommitOutcomeUnknownError`,
+  which the retry policy does not match.
+- **(0.4) A pool timeout carries no reference to its pool.**
+  `create_session()` wraps the caller's whole block, so a
+  `sqlalchemy.exc.TimeoutError` passing through it may come from a
+  different engine used inside. It is translated to `PoolExhaustedError`
+  only when this pool has no idle connection, which is necessary for the
+  timeout to be its own; otherwise it is re-raised untouched. That
+  cannot rule out two pools being exhausted at once.
+- **(0.4) A simulated serialization failure needs no second
+  transaction.** `DO $$ BEGIN RAISE EXCEPTION '...' USING ERRCODE =
+  '40001'; END $$` makes Postgres raise the real SQLSTATE through the real
+  driver path, which is what the retry tests use.
 - **(confirmed, Phase 2) `MaterializedViewRepository.refresh_materialized_view()`
   ignored `auto_commit`.** Found via code review: it unconditionally called
   `self.session.commit()`, the only write path in the layer that didn't

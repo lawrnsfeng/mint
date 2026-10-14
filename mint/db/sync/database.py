@@ -4,19 +4,24 @@ from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cached_property, wraps
-from typing import Final
+from typing import Final, overload
 
 from sqlalchemy import Engine, create_engine, event, text
 from sqlalchemy.engine import ExceptionContext
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from mint.db.exc import (
+    CommitOutcomeUnknownError,
     ConfigError,
+    PoolExhaustedError,
     ScopeAbortedError,
     ScopeSchemaMismatchError,
     SessionNotInitializedError,
 )
+from mint.db.retry import ScopeRetry
 from mint.db.settings import DatabaseSettings
 
 # Session.info key holding the dbschema of the scope a session is bound by.
@@ -54,8 +59,9 @@ class Database:
                 is supplied directly.
             engine: Pre-built engine to use instead of creating one from
                 ``uri``/``settings`` (primarily for tests).
-            settings: Pool/echo tuning. Defaults to environment-sourced
-                :class:`DatabaseSettings`.
+            settings: Pool, timeout and echo tuning. Defaults to
+                environment-sourced :class:`DatabaseSettings`. Applied only
+                when the engine is built here from ``uri``.
 
         Raises:
             ConfigError: If neither ``uri`` nor ``engine`` is supplied.
@@ -76,6 +82,8 @@ class Database:
                 pool_size=self.settings.POOL_SIZE,
                 max_overflow=self.settings.MAX_OVERFLOW,
                 pool_recycle=self.settings.POOL_RECYCLE,
+                pool_timeout=self.settings.POOL_TIMEOUT,
+                connect_args=self._connect_args,
             )
         else:
             raise ConfigError(detail="either uri or engine must be supplied")
@@ -88,6 +96,14 @@ class Database:
     def engine(self) -> Engine:
         """Return the underlying sync engine."""
         return self._engine
+
+    @property
+    def _connect_args(self) -> dict[str, str]:
+        """Return the psycopg2 connect arguments the settings call for."""
+        timeout_ms = self.settings.STATEMENT_TIMEOUT_MS
+        if timeout_ms is None:
+            return {}
+        return {"options": f"-c statement_timeout={timeout_ms}"}
 
     @cached_property
     def _sessionmaker(self) -> sessionmaker[Session]:
@@ -114,6 +130,10 @@ class Database:
             A fresh :class:`Session`, rolled back on error and always
             closed on exit.
 
+        Raises:
+            PoolExhaustedError: If no pooled connection of this database
+                became free within the pool timeout.
+
         """
         with self._sessionmaker() as session:
             try:
@@ -122,9 +142,32 @@ class Database:
                         execution_options={"schema_translate_map": {None: dbschema}},
                     )
                 yield session
+            except PoolTimeoutError as exc:
+                exhausted = self._pool_exhaustion
+                if exhausted is None:
+                    raise
+                raise exhausted from exc
             except Exception:
                 session.rollback()
                 raise
+
+    @property
+    def _pool_exhaustion(self) -> PoolExhaustedError | None:
+        """Return the error describing this pool's exhaustion, if it is exhausted.
+
+        ``None`` when this pool still has an idle connection to hand out:
+        a pool timeout seen then was raised by some other engine used
+        inside the block, and is left as it is.
+        """
+        pool = self._engine.pool
+        if not isinstance(pool, QueuePool) or pool.checkedin() > 0:
+            return None
+        return PoolExhaustedError(
+            pool_size=pool.size(),
+            overflow=pool.overflow(),
+            checked_out=pool.checkedout(),
+            timeout=pool.timeout(),
+        )
 
     @staticmethod
     def _flag_failed_statement(context: ExceptionContext) -> None:
@@ -158,6 +201,8 @@ class Database:
             ScopeAbortedError: If a statement failed earlier in the scope,
                 the error was caught, and the transaction was not restored
                 by rolling back to a savepoint.
+            CommitOutcomeUnknownError: If the connection was lost while
+                the commit was in flight.
 
         """
         if not session.in_transaction():
@@ -168,7 +213,12 @@ class Database:
                 session.execute(text("SELECT 1"))
             except DBAPIError as exc:
                 raise ScopeAbortedError from exc
-        session.commit()
+        try:
+            session.commit()
+        except DBAPIError as exc:
+            if exc.connection_invalidated:
+                raise CommitOutcomeUnknownError from exc
+            raise
 
     @property
     def current_session(self) -> Session:
@@ -240,24 +290,97 @@ class Database:
                 del session.info[_SCOPE_DBSCHEMA_KEY]
                 self._session_ctx.reset(token)
 
-    def scoped[**P, RT](self, func: Callable[P, RT]) -> Callable[P, RT]:
-        """Wrap a function so it runs inside a :meth:`session_scope`.
+    def run_in_scope[T](
+        self,
+        call: Callable[[], T],
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> T:
+        """Run ``call`` inside a :meth:`session_scope` and return its result.
 
-        Works on any function or method. The session is reachable through
-        :attr:`current_session` from the function and from everything it
-        calls, decorated or not.
+        With ``retries`` set and no scope open yet, a scope that fails with
+        a transient error — a serialization failure, a deadlock, a
+        connection lost before the commit — is rolled back and ``call`` is
+        run again in a fresh one, after a short backoff. A connection lost
+        *while committing* is not retried: the outcome is unknown, and it
+        surfaces as :class:`CommitOutcomeUnknownError`. When this call
+        joins a scope that is already open it never retries either: the
+        transaction belongs to that scope's owner, and only re-running the
+        owner's whole function can replay it.
 
         Args:
-            func: The function to scope.
+            call: The zero-argument function to run.
+            retries: Extra attempts after the first on a transient error.
+                ``call`` runs again from the top, so everything it does
+                must be safe to repeat.
+            dbschema: Multi-tenant schema-translate target for the scope.
 
         Returns:
-            The wrapped function.
+            Whatever ``call`` returns.
 
         """
 
-        @wraps(func)
-        def wrapper(*args: P.args, **kwargs: P.kwargs) -> RT:
-            with self.session_scope():
-                return func(*args, **kwargs)
+        def attempt() -> T:
+            with self.session_scope(dbschema=dbschema):
+                return call()
 
-        return wrapper
+        if retries <= 0 or self._bound_session is not None:
+            return attempt()
+        return ScopeRetry(retries=retries).as_retrying(attempt)
+
+    @overload
+    def scoped[**P, RT](self, func: Callable[P, RT], /) -> Callable[P, RT]: ...
+
+    @overload
+    def scoped[**P, RT](
+        self,
+        /,
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> Callable[[Callable[P, RT]], Callable[P, RT]]: ...
+
+    def scoped[**P, RT](
+        self,
+        func: Callable[P, RT] | None = None,
+        /,
+        *,
+        retries: int = 0,
+        dbschema: str | None = None,
+    ) -> Callable[P, RT] | Callable[[Callable[P, RT]], Callable[P, RT]]:
+        """Wrap a function so it runs inside a :meth:`session_scope`.
+
+        Works on any function or method, bare (``@db.scoped``) or with
+        options (``@db.scoped(retries=2, dbschema="tenant_a")``). The session is reachable
+        through :attr:`current_session` from the function and from
+        everything it calls, decorated or not.
+
+        Args:
+            func: The function to scope, when used bare.
+            retries: Extra attempts on a transient error — see
+                :meth:`run_in_scope`.
+            dbschema: Multi-tenant schema-translate target for the scope.
+                For a schema only known per call, use
+                :meth:`run_in_scope` or :meth:`session_scope` instead.
+
+        Returns:
+            The wrapped function, or a decorator producing it when called
+            with options.
+
+        """
+
+        def decorate(target: Callable[P, RT]) -> Callable[P, RT]:
+            @wraps(target)
+            def wrapper(*args: P.args, **kwargs: P.kwargs) -> RT:
+                return self.run_in_scope(
+                    lambda: target(*args, **kwargs),
+                    retries=retries,
+                    dbschema=dbschema,
+                )
+
+            return wrapper
+
+        if func is None:
+            return decorate
+        return decorate(func)

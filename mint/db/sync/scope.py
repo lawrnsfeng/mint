@@ -2,9 +2,11 @@
 
 from collections.abc import Callable
 from functools import wraps
-from typing import Concatenate, Protocol
+from typing import Concatenate, Protocol, overload
 
 from .database import Database
+
+type Method[T, **P, RT] = Callable[Concatenate[T, P], RT]
 
 
 class IDatabaseBound(Protocol):
@@ -16,26 +18,58 @@ class IDatabaseBound(Protocol):
         ...
 
 
+@overload
 def scoped[T: IDatabaseBound, **P, RT](
-    func: Callable[Concatenate[T, P], RT],
-) -> Callable[Concatenate[T, P], RT]:
+    func: Method[T, P, RT],
+    /,
+) -> Method[T, P, RT]: ...
+
+
+@overload
+def scoped[T: IDatabaseBound, **P, RT](
+    *,
+    retries: int = 0,
+    dbschema: str | None = None,
+) -> Callable[[Method[T, P, RT]], Method[T, P, RT]]: ...
+
+
+def scoped[T: IDatabaseBound, **P, RT](
+    func: Method[T, P, RT] | None = None,
+    /,
+    *,
+    retries: int = 0,
+    dbschema: str | None = None,
+) -> Method[T, P, RT] | Callable[[Method[T, P, RT]], Method[T, P, RT]]:
     """Wrap a method so it runs inside a session scope on ``self.db``.
 
     The method-level form of :meth:`Database.scoped`, for a class that
     receives its database at construction time and so has none to name at
-    class-definition time.
+    class-definition time. Used bare (``@scoped``) or with options
+    (``@scoped(retries=2, dbschema="tenant_a")``).
 
     Args:
-        func: The method to scope.
+        func: The method to scope, when used bare.
+        retries: Extra attempts on a transient error — see
+            :meth:`Database.run_in_scope`.
+        dbschema: Multi-tenant schema-translate target for the scope.
 
     Returns:
-        The wrapped method.
+        The wrapped method, or a decorator producing it when called with
+        options.
 
     """
 
-    @wraps(func)
-    def wrapper(self: T, *args: P.args, **kwargs: P.kwargs) -> RT:
-        with self.db.session_scope():
-            return func(self, *args, **kwargs)
+    def decorate(target: Method[T, P, RT]) -> Method[T, P, RT]:
+        @wraps(target)
+        def wrapper(self: T, *args: P.args, **kwargs: P.kwargs) -> RT:
+            return self.db.run_in_scope(
+                lambda: target(self, *args, **kwargs),
+                retries=retries,
+                dbschema=dbschema,
+            )
 
-    return wrapper
+        return wrapper
+
+    if func is None:
+        return decorate
+    return decorate(func)

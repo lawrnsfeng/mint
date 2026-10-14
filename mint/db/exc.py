@@ -70,3 +70,31 @@ class ScopeAbortedError(RepositoryError):
         "without rolling back to a savepoint: the transaction is aborted and "
         "cannot be committed"
     )
+
+
+@dataclass
+class PoolExhaustedError(RepositoryError):
+    """No pooled connection became free within the pool timeout."""
+
+    TEMPLATE = (
+        "no database connection became free within {timeout}s "
+        "(pool size {pool_size}, overflow {overflow}, checked out {checked_out})"
+    )
+    pool_size: int
+    overflow: int
+    checked_out: int
+    timeout: float
+
+
+@dataclass
+class CommitOutcomeUnknownError(RepositoryError):
+    """The connection was lost while a session scope was committing.
+
+    The server may or may not have applied the transaction, so the scope
+    is never re-run on this error: doing so could apply its work twice.
+    """
+
+    TEMPLATE = (
+        "the connection was lost while committing: the transaction may or may "
+        "not have been applied"
+    )

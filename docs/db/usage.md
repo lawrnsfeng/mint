@@ -453,6 +453,89 @@ from a separate worker — the
 mint deliberately offers no primitive for suspending a transaction across
 a network call.
 
+## Timeouts, pool exhaustion, retries, savepoints
+
+### Timeouts
+
+```python
+from mint.db.settings import DatabaseSettings
+
+db = Database(uri, settings=DatabaseSettings(STATEMENT_TIMEOUT_MS=5_000, POOL_TIMEOUT=10))
+```
+
+- **`STATEMENT_TIMEOUT_MS`** (`SQLALCHEMY_STATEMENT_TIMEOUT_MS`) sets
+  Postgres' `statement_timeout` on every connection the engine opens. A
+  statement that overruns is cancelled by the server and surfaces as a
+  `sqlalchemy.exc.DBAPIError` with SQLSTATE `57014`. Default `None`: no
+  limit.
+- **`POOL_TIMEOUT`** (`SQLALCHEMY_POOL_TIMEOUT`) is how many seconds a
+  call waits for a free pooled connection. Default `30`.
+- Both apply only when `Database` builds the engine itself from a URI. An
+  engine passed as `engine=` keeps whatever it was created with.
+
+### Pool exhaustion
+
+When every pooled connection is checked out and none comes back within
+`POOL_TIMEOUT`, the waiting call raises `mint.db.exc.PoolExhaustedError`
+instead of SQLAlchemy's generic `TimeoutError`. It carries the pool's own
+counters at that moment — `pool_size`, `overflow`, `checked_out` — and
+the `timeout` that ran out. The usual cause is not a pool that is too
+small but scopes that are too long — see "Keep network calls out of a
+scope".
+
+### Retrying a scope
+
+```python
+@db.scoped(retries=2)            # or @scoped(retries=2) on a method
+async def transfer(source: UUID, target: UUID, amount: int) -> None:
+    ...
+```
+
+`retries` re-runs the *whole function* in a fresh session when its scope
+fails with a transient error: a serialization failure (`40001`), a
+deadlock (`40P01`), or a connection SQLAlchemy reports as lost before the
+commit. Waits between attempts back off exponentially with jitter. After
+the last attempt the original database error is raised.
+
+- **The function runs again from the top.** Everything in it must be safe
+  to repeat — no counters bumped in memory, no messages sent, no remote
+  calls with side effects. This is one more reason to keep network calls
+  out of a scope.
+- **Only the outermost scope retries.** A retrying function called inside
+  another scope joins it and fails on the first error: the transaction
+  belongs to the outer scope, and only re-running the outer function can
+  replay it. Put `retries` on the outermost one.
+- **A connection lost while committing is not retried.** The server may
+  already have applied the transaction, and running the function again
+  could apply it twice. The scope raises `CommitOutcomeUnknownError`
+  instead; whether to retry is a decision for code that can check what
+  was written.
+- Anything else — a constraint violation, a cancelled statement, an
+  application exception — is never retried.
+- `db.run_in_scope(call, retries=2)` is the same thing without a
+  decorator, for a zero-argument callable.
+- Both decorators and `run_in_scope` also take `dbschema=`, to open the
+  scope for a tenant schema. A decorator argument is fixed when the
+  function is defined; for a tenant only known per request, use
+  `db.run_in_scope(call, dbschema=tenant)` or
+  `async with db.session_scope(dbschema=tenant)`.
+
+### Savepoints
+
+Nothing inside a scope commits, so a SQLAlchemy savepoint holds for the
+length of its block. There is no mint wrapper; use the session's own:
+
+```python
+@db.scoped
+async def import_rows(rows: list[RowCreate]) -> None:
+    for row in rows:
+        try:
+            async with db.current_session.begin_nested():
+                await repo.create(row)
+        except IntegrityError:
+            continue             # this row is rolled back, the rest stand
+```
+
 ## Using mint.db without SQLModel
 
 The session lifecycle — `Database`, session scopes, `UnitOfWork` — needs

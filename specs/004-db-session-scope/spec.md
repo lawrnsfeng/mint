@@ -136,13 +136,15 @@ both applied when `Database` builds its own engine.
 ### FR-10: Pool exhaustion has its own error
 
 A pool checkout that times out raises `PoolExhaustedError` carrying the pool
-size, the overflow and the timeout.
+size, the current overflow, the number of connections checked out and the
+timeout.
 
 ### FR-11: Opt-in retry of the outermost scope
 
 `@db.scoped(retries=n)` re-runs the function when its scope fails with a
-serialization failure, a deadlock or an invalidated connection. A scope that
-joined another does not retry.
+serialization failure, a deadlock or a connection invalidated before the
+commit. A scope that joined another does not retry. A connection lost while
+committing raises `CommitOutcomeUnknownError` and is never retried.
 
 ### FR-12: Savepoints work inside a scope
 

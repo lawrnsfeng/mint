@@ -77,8 +77,13 @@ class UnitOfWork:
             exc_tb: Traceback if the block raised, else ``None``.
 
         """
-        self._exit_stack.close()
-        self._session = None
+        # Hand the exception to the session's own context manager rather
+        # than just closing it, so it rolls back and translates errors
+        # exactly as it does outside a unit of work.
+        try:
+            self._exit_stack.__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self._session = None
 
     @property
     def db(self) -> Database:

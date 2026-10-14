@@ -1,8 +1,8 @@
 # mint
 
 Practical utility library: async file storage backends behind a common
-protocol, the concurrency primitives they're built on, and a generic
-SQLModel-based repository layer for Postgres.
+protocol, the concurrency primitives they're built on, and a Postgres
+session lifecycle with a generic SQLModel-based repository layer on top.
 
 ## What's in here
 
@@ -10,9 +10,11 @@ SQLModel-based repository layer for Postgres.
   `save`, `copy`, `move`, `remove`, `remove_many`, `stat`, `list`,
   `list_detailed`) with two implementations: `AzureBlobStorage` (Azure Blob
   Storage) and `S3Storage` (S3-compatible — AWS S3, LocalStack, MinIO).
-- **[DB Repository Layer](db/usage.md)** — generic SQLModel-based
-  repository layer for Postgres, async (`mint.db.asynk`) and sync
-  (`mint.db.sync`): zero-boilerplate CRUD on a new table, soft-delete and
+- **[DB Repository Layer](db/usage.md)** — Postgres session lifecycle
+  (usable with SQLAlchemy Core alone, via `mint[db]`) and a generic
+  SQLModel-based repository layer on top of it (`mint[orm]`), async
+  (`mint.db.asynk`) and sync (`mint.db.sync`): zero-boilerplate CRUD on a
+  new table, soft-delete and
   per-owner scoping enforced automatically (not opt-in, including on
   hand-written custom queries), single-query pagination-with-count,
   insert-or-update (`upsert`), session scopes (`@db.scoped`, `@scoped`)
@@ -33,14 +35,18 @@ SQLModel-based repository layer for Postgres.
 uv sync --all-extras --all-groups --all-packages -U   # or: make sync
 ```
 
-Storage backends and the DB layer are optional dependency groups — pull in
-only what you need:
+Storage backends are optional dependency groups and the DB layer is a pair
+of optional extras — pull in only what you need:
 
 ```bash
 uv sync --group azure   # AzureBlobStorage
 uv sync --group s3      # S3Storage
-uv sync --group db      # mint.db (SQLModel + asyncpg + psycopg2)
+uv sync --extra db      # mint.db session lifecycle (SQLAlchemy + asyncpg + psycopg2)
+uv sync --extra orm     # the above plus the SQLModel repository layer
 ```
+
+As a dependency of another project, the extras are `mint[db]` and
+`mint[orm]`.
 
 ## Where to go next
 
@@ -53,3 +59,5 @@ uv sync --group db      # mint.db (SQLModel + asyncpg + psycopg2)
   caveats confirmed against real Postgres.
 - **[Utils usage](utils/usage.md)** / **[API reference](utils/api.md)**
   — `Batch`/`ConcurrencyLimiter` for bounded concurrent fan-out.
+- **[Versioning and deprecation](versioning.md)** — what the public API
+  is, how it may change, and what CI proves on every pull request.

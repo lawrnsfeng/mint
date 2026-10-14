@@ -1,1 +1,1 @@
-"""Generic SQLModel-based repository layer for mint, async and sync."""
+"""Postgres session lifecycle and SQLModel-based repository layer, async and sync."""

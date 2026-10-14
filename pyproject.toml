@@ -12,6 +12,21 @@ dependencies = [
     "structlog>=25.5.0",
 ]
 
+[project.optional-dependencies]
+# Session lifecycle only: Database, UnitOfWork, session scopes.
+db = [
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.10",
+    "pydantic-settings>=2.6.0",
+    "tenacity>=9.0.0",
+]
+# The SQLModel repository layer on top of it.
+orm = [
+    "mint[db]",
+    "sqlmodel>=0.0.22",
+]
+
 [tool.uv.sources]
 sprout = { git = "ssh://git@github.com/lawrnsfeng/sprout.git" }
 
@@ -23,13 +38,6 @@ azure = [
 s3 = [
     "aiobotocore>=2.15.2",
     "types-aiobotocore[s3]>=2.15.2",
-]
-db = [
-    "sqlmodel>=0.0.22",
-    "sqlalchemy[asyncio]>=2.0.36",
-    "asyncpg>=0.30.0",
-    "psycopg2-binary>=2.9.10",
-    "pydantic-settings>=2.6.0",
 ]
 docs = [
     "mkdocs>=1.6.0",
@@ -152,7 +160,7 @@ cov = "python -m pytest --cov=mint --cov-report=term-missing tests"
 [tool.semantic_release]
 commit_parser = "conventional"
 tag_format = "v{version}"
-major_on_zero = true
+major_on_zero = false
 allow_zero_version = true
 commit_message = "chore(release): v{version}\n\n[skip ci]"
 commit_author = "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"

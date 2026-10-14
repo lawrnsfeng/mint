@@ -371,6 +371,22 @@ docs, found fresh.
   the wrong schema with no error, so the scope stores its schema in
   `Session.info` and a mismatching joiner raises
   `ScopeSchemaMismatchError`.
+- **(0.4) The package `__init__` must not import the repository base.**
+  `Database` and `UnitOfWork` never needed SQLModel, but importing any
+  submodule runs the package `__init__` first, and that imported
+  `base.py` and with it `sqlmodel`. The repository names are now served
+  by a module-level `__getattr__` (PEP 562). It is defined under
+  `if not TYPE_CHECKING`: a `__getattr__` a type checker can see makes
+  every misspelt `from mint.db.asynk import ...` type-check.
+- **(0.4) A dependency group is not an extra.** `[dependency-groups]` is
+  for a project's own development environment and is not written to the
+  wheel's metadata, so `mint[db]` resolved to nothing for a consumer. The
+  database dependencies are `[project.optional-dependencies]` now.
+- **(0.4) `sqlalchemy` alone does not bring `greenlet`.** SQLAlchemy 2.0
+  installs it through a platform marker that stops at Python 3.12, and
+  2.1 dropped it from the default install altogether; the async layer
+  then fails at import. Declared as `sqlalchemy[asyncio]`. Found by the
+  lowest-versions CI run.
 - **(0.4) One scoping listener per shared session, not one per
   repository.** The first attempt registered each joining repository's
   own listener on the scope's session. A session-wide listener filters
@@ -410,6 +426,42 @@ docs, found fresh.
   still held the closed session — which SQLAlchemy happily reuses — and
   would join a scope nobody commits. The scope's `Session.info` entry is
   removed on exit, and a session without it is not joinable.
+- **(0.4) `UnitOfWork` closed its session without telling it why.**
+  `__aexit__` called `AsyncExitStack.aclose()`, which exits the session's
+  context manager with no exception information. The rollback still
+  happened, implicitly, when the session closed — but the `except`
+  clauses in `Database.create_session()` never ran, so an error that
+  `create_session()` translates (pool exhaustion) came out untranslated
+  on the `UnitOfWork` path only. It now forwards the exception triple to
+  the stack's own `__aexit__`.
+- **(0.4) Retry is decided by SQLSTATE, read through a `Protocol`.**
+  asyncpg (through SQLAlchemy's adapter) and psycopg2 both expose the
+  code as `pgcode` on the driver exception; `mint.db.retry.IDriverError`
+  narrows to it with `isinstance`. Only `40001` and `40P01` retry, plus
+  `DBAPIError.connection_invalidated` before the commit (see the next
+  note for why not during it). Backoff is
+  `tenacity.wait_random_exponential` — `wait_exponential_jitter` renamed
+  an argument between tenacity 9.0 and 9.2, and the declared floor has to
+  work.
+- **(0.4) A disconnect is only retryable before the commit.** `40001`
+  and `40P01` mean Postgres rolled the transaction back. A connection
+  lost while `COMMIT` is in flight means nothing of the kind: the commit
+  may have been applied and only its acknowledgement lost. Found via code
+  review — the first version retried on any invalidated connection, which
+  could run a committed function a second time. The commit itself is now
+  wrapped, and a disconnect there raises `CommitOutcomeUnknownError`,
+  which the retry policy does not match.
+- **(0.4) A pool timeout carries no reference to its pool.**
+  `create_session()` wraps the caller's whole block, so a
+  `sqlalchemy.exc.TimeoutError` passing through it may come from a
+  different engine used inside. It is translated to `PoolExhaustedError`
+  only when this pool has no idle connection, which is necessary for the
+  timeout to be its own; otherwise it is re-raised untouched. That
+  cannot rule out two pools being exhausted at once.
+- **(0.4) A simulated serialization failure needs no second
+  transaction.** `DO $$ BEGIN RAISE EXCEPTION '...' USING ERRCODE =
+  '40001'; END $$` makes Postgres raise the real SQLSTATE through the real
+  driver path, which is what the retry tests use.
 - **(confirmed, Phase 2) `MaterializedViewRepository.refresh_materialized_view()`
   ignored `auto_commit`.** Found via code review: it unconditionally called
   `self.session.commit()`, the only write path in the layer that didn't
@@ -472,7 +524,8 @@ against real Postgres in `tests/db/asynk/test_models.py` and
 
 ## Dependencies
 
-Added under a `db` dependency-group (`sqlmodel`, `sqlalchemy`, `asyncpg`,
-`psycopg2-binary`, `pydantic-settings`) and a `postgres` extra on the `test`
-group's `testcontainers`, mirroring the existing `s3`/`azure` groups. Sync
-Postgres access uses `psycopg2`; async uses `asyncpg`.
+Two extras. `mint[db]` is the session lifecycle: `sqlalchemy[asyncio]`,
+`asyncpg`, `psycopg2-binary`, `pydantic-settings`. `mint[orm]` is
+`mint[db]` plus `sqlmodel`, for the repository layer. Sync Postgres access
+uses `psycopg2`; async uses `asyncpg`. The `test` group carries a
+`postgres` extra on `testcontainers`, mirroring the `s3`/`azure` groups.

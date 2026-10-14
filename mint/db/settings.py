@@ -20,3 +20,8 @@ class DatabaseSettings(BaseSettings):
     POOL_SIZE: int = 5
     MAX_OVERFLOW: int = 10
     POOL_RECYCLE: int = 300
+    # Seconds to wait for a free pooled connection before PoolExhaustedError.
+    POOL_TIMEOUT: float = 30.0
+    # Postgres statement_timeout for every connection, in milliseconds.
+    # None leaves the server default (no limit) in place.
+    STATEMENT_TIMEOUT_MS: int | None = None

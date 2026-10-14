@@ -152,4 +152,5 @@ uv run ty check
 pre-commit run --all-files
 ```
 
-Coding standards live in `.claude/rules/`.
+Coding standards live in `.claude/rules/`. What counts as the public API and
+how it may change is in [`docs/versioning.md`](docs/versioning.md).

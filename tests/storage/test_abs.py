@@ -267,7 +267,7 @@ async def test_get_empty_file_downloads_correctly(
 
     """
     blob_client = test_container.get_blob_client("get-empty.txt")
-    await blob_client.upload_blob(b"", overwrite=True)
+    await blob_client.upload_blob(BytesIO(b""), overwrite=True)
 
     async with aiofiles.tempfile.TemporaryDirectory() as tmpdir:
         save_path = Path(tmpdir) / "downloaded-empty.txt"
@@ -622,7 +622,7 @@ async def test_stat_empty_file_returns_zero_size(
 
     """
     blob_client = test_container.get_blob_client("stat-empty.txt")
-    await blob_client.upload_blob(b"", overwrite=True)
+    await blob_client.upload_blob(BytesIO(b""), overwrite=True)
 
     result = await azure_storage.stat("stat-empty.txt")
 

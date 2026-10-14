@@ -45,7 +45,7 @@ jobs:
             "ssh://git@github.com/"
       - name: Install locked dependencies
         if: matrix.resolution == 'locked'
-        run: uv sync --all-extras --all-groups --all-packages
+        run: uv sync --locked --all-extras --all-groups --all-packages
       - name: Install lowest declared dependencies
         if: matrix.resolution == 'lowest-direct'
         # Pinned to the oldest supported Python: the oldest driver releases
@@ -74,6 +74,6 @@ jobs:
           git config --global url."https://github.com/".insteadOf \
             "ssh://git@github.com/"
       - name: Install dependencies
-        run: uv sync --all-extras --all-groups --all-packages
+        run: uv sync --locked --all-extras --all-groups --all-packages
       - name: Run tests
         run: uv run --no-sync python -m pytest tests

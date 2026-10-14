@@ -8,7 +8,7 @@ lives in test_s3.py / test_abs.py.
 import asyncio
 import gc
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, ClassVar, cast
 from unittest.mock import MagicMock
@@ -478,7 +478,7 @@ class TestInjection:
         exited = False
 
         @asynccontextmanager
-        async def make() -> AsyncIterator[FakeClient]:
+        async def make() -> AsyncGenerator[FakeClient]:
             nonlocal exited
             try:
                 yield FakeClient()

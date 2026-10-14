@@ -1,6 +1,6 @@
 """Async engine + session-factory owner for mint.db repositories."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from functools import cached_property
 
@@ -79,7 +79,7 @@ class Database:
         self,
         *,
         dbschema: str | None = None,
-    ) -> AsyncIterator[AsyncSession]:
+    ) -> AsyncGenerator[AsyncSession]:
         """Open a new session, applying an optional multi-tenant schema.
 
         Args:

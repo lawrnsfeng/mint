@@ -21,8 +21,10 @@ protocol, plus the concurrency and execution primitives they're built on.
   `EntityRepository[T, I]` for zero-boilerplate CRUD on a new table,
   `SoftDeleteMixin`/`ResourceOwnerMixin` for soft-delete and per-owner
   scoping (enforced automatically, including on hand-written custom
-  queries — not opt-in), `UnitOfWork` for multi-repository atomic
-  transactions, and `MaterializedViewRepository` for read-only
+  queries — not opt-in), session scopes (`@db.scoped`, `@scoped`) that
+  give any function one session and one transaction shared with
+  everything it calls, `UnitOfWork` for caller-committed transactions,
+  and `MaterializedViewRepository` for read-only
   materialized-view-backed tables.
 
 See `docs/s3-implementation-notes.md` for a method-by-method comparison
@@ -121,7 +123,17 @@ job = await repo.create(JobCreate(name="x"))
 await repo.get(job.id)
 ```
 
-See `docs/db-repository-implementation-notes.md` for owner-scoped tables,
+Several calls in one transaction need one decorator:
+
+```python
+@db.scoped
+async def rename_all(names: dict[UUID, str]) -> None:
+    for job_id, name in names.items():
+        await repo.update(job_id, JobUpdate(name=name))
+# every update commits together when the function returns, or none do
+```
+
+See `docs/db/usage.md` for session scopes, owner-scoped tables,
 `UnitOfWork`, and materialized views.
 
 ## Development

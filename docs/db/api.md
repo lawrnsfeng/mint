@@ -9,6 +9,12 @@ behavioral difference to distinguish (see the [Usage guide](usage.md#sync-vs-asy
 
 ::: mint.db.asynk.Database
 
+## Session scopes
+
+::: mint.db.asynk.scope.scoped
+
+::: mint.db.asynk.scope.IDatabaseBound
+
 ## Repositories
 
 ::: mint.db.asynk.RepositoryBase
@@ -64,3 +70,7 @@ behavioral difference to distinguish (see the [Usage guide](usage.md#sync-vs-asy
 ::: mint.db.exc.ConfigError
 
 ::: mint.db.exc.DBSchemaNotSetError
+
+::: mint.db.exc.ScopeSchemaMismatchError
+
+::: mint.db.exc.ScopeAbortedError

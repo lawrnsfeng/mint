@@ -50,3 +50,23 @@ class DBSchemaNotSetError(RepositoryError):
 
     TEMPLATE = "dbschema must be set on {repository} to force a session schema"
     repository: str
+
+
+@dataclass
+class ScopeSchemaMismatchError(RepositoryError):
+    """A call joined a session scope opened for a different dbschema."""
+
+    TEMPLATE = "dbschema {requested} requested inside a session scope opened for {active}"
+    requested: str
+    active: str | None
+
+
+@dataclass
+class ScopeAbortedError(RepositoryError):
+    """A session scope tried to commit a transaction a handled error had aborted."""
+
+    TEMPLATE = (
+        "a statement failed inside this session scope and the error was handled "
+        "without rolling back to a savepoint: the transaction is aborted and "
+        "cannot be committed"
+    )

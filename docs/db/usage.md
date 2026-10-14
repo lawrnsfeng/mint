@@ -17,12 +17,18 @@ this guide cross-links into rather than duplicates.
 
 A few decisions shape everything else in this layer:
 
-- **Session isolation is per repository *instance*, via `ContextVar`, not
-  a shared attribute.** A repository instance is safe to reuse across
+- **Session isolation is per task, via a `ContextVar` on the `Database`,
+  not a shared attribute.** A repository instance is safe to reuse across
   concurrent tasks/threads — no per-call cloning, no locking. This is the
   single most load-bearing design choice here: the predecessor this layer
   replaced stored its active session on a plain instance attribute,
-  which raced under concurrent use.
+  which raced under concurrent use. Because the slot belongs to the
+  database, every repository and every scoped function on one database
+  shares the session bound in the current task.
+- **One transaction per outermost call.** Whatever opened the session
+  commits it, once, on the way out. Nothing nested inside commits, so a
+  call that fails part-way leaves nothing behind (see "Session scopes"
+  below).
 - **Scoping (soft-delete, owner) is unconditional, not opt-in.** Whether a
   query excludes soft-deleted or other-owner rows is decided by the
   *schema's own shape* (does it compose `IsDeletedMixin`/`OwnerMixin`) —
@@ -31,10 +37,10 @@ A few decisions shape everything else in this layer:
   query methods that silently skipped an opt-in scoping call.
 - **The zero-ceremony path needs no setup, ever.**
   `JobRepository(db).get(id)` opens a session, does the work, and closes
-  it — no context manager, no explicit transaction. `UnitOfWork` exists
-  purely as the *named, opt-in* escape hatch for the one case that
-  genuinely needs shared state across calls (multi-table atomicity), not
-  as the default ceremony every call pays.
+  it — no context manager, no explicit transaction. A session scope
+  (`@db.scoped`) widens that to a whole function when several calls must
+  succeed or fail together, and `UnitOfWork` stays available for the
+  caller that wants to hold the session and commit by hand.
 - **One class per table, not two.** A single `SQLModel` `table=True` class
   is both the ORM schema and the domain model — no separate pydantic
   response model glued on with a converter function.
@@ -168,9 +174,11 @@ job = await repo.execute(stmt)   # T | None
   whenever the statement uses `joinedload()` on a collection relationship
   (a join fans out one row per child, and duplicates need collapsing
   before `.scalars()`).
-- Both commit automatically when `self.auto_commit` is `True` **and** the
-  statement isn't a plain `Select` — reads never commit, regardless of
-  `auto_commit`.
+- Neither commits on its own inside a session scope: the outermost call
+  commits once, on exit, when its `auto_commit` is `True` (see "Session
+  scopes"). On an externally-owned session (`session=uow.session`) both
+  still commit per statement when `auto_commit` is `True` and the
+  statement isn't a plain `Select`.
 - **`sqlmodel.col()`** is needed on any field used as a query expression
   (`col(Job.id) == x`, `col(Job.name).startswith(...)`) — SQLModel types
   class attributes as their plain Python field type for pydantic's sake,
@@ -321,7 +329,135 @@ statement — and is the *only* sanctioned way to see soft-deleted or
 cross-owner rows. Every other query stays scoped by default; nothing is
 silently bypassed by accident.
 
+## Session scopes
+
+A session scope binds one session to the current task for the length of a
+function, and everything that function calls runs on it.
+
+```python
+from sqlalchemy import insert
+from mint.db.asynk import Database, scoped
+
+db = Database("postgresql+asyncpg://user:pass@localhost/mydb")
+
+@db.scoped                                   # any coroutine function
+async def place_order(payload: OrderCreate) -> Order:
+    order = await OrderRepository(db).create(payload)
+    await AuditRepository(db).create(AuditCreate(order_id=order.id))
+    await db.current_session.execute(insert(outbox).values(order_id=order.id))
+    return order
+# one session, one connection, one commit — or one rollback if anything raised
+```
+
+A class that receives its database at construction time has no `db` to
+name in a decorator at class-definition time. The bare `scoped` reads it
+from `self.db` instead:
+
+```python
+class OrderService:
+    def __init__(self, db: Database) -> None:
+        self.db = db
+
+    @scoped
+    async def place(self, payload: OrderCreate) -> Order:
+        order = await OrderRepository(self.db).create(payload)
+        await AuditRepository(self.db).create(AuditCreate(order_id=order.id))
+        return order
+```
+
+The same thing as a block, when a decorator doesn't fit:
+
+```python
+async with db.session_scope() as session:
+    ...
+```
+
+What a scope guarantees:
+
+- **The outermost scope is the unit.** It opens the session, commits on a
+  clean exit, rolls back on an exception, and closes. A scope entered
+  while another is open in the same task *joins* it: same session, no
+  commit, no close. Undecorated helper functions in between see the same
+  session through `db.current_session`.
+- **Repositories join automatically.** Every repository method already
+  runs in a scope of its own; called inside yours, it joins yours. Two
+  repositories in one scope share one session and one connection.
+- **Nothing inside commits.** A repository's `auto_commit` only matters
+  when that repository's call is the outermost one. Inside someone
+  else's scope it is ignored — the scope's owner decides. Pass
+  `commit=False` to `session_scope()` for a scope that never commits.
+  The same goes for a repository built with `auto_commit=False` and no
+  `session=`: when one of its methods is the outermost call, nothing that
+  method does is committed, including writes made through other
+  repositories it calls.
+- **A handled database error still aborts the transaction.** When a
+  statement fails, Postgres refuses every later statement in that
+  transaction and turns the final `COMMIT` into a silent `ROLLBACK`.
+  Catching the exception does not undo that. A scope that reaches its end
+  in this state raises `ScopeAbortedError` rather than report a commit
+  that did not happen. To survive an expected failure — a duplicate key,
+  say — wrap that one statement in a savepoint:
+  `async with db.current_session.begin_nested(): ...`.
+- **Each repository keeps its own scoping.** Soft-delete and owner
+  filters apply to the statements a repository's own methods run. Two
+  repositories for one table with different owners can share a scope
+  without seeing through each other's filter.
+- **A custom repository method is atomic.** A method decorated with
+  `ensure_session` that calls `self.create()` twice commits both rows
+  together, or neither. (Before 0.4 each write committed separately.)
+- **The connection is checked out lazily.** A scope takes a connection at
+  its first statement and holds it until the outermost scope exits. Work
+  that needs no database belongs before the first statement, or outside
+  the scope.
+- **One scope, one task.** A session is not safe for concurrent use, and
+  tasks started inside a scope inherit its session. Don't `gather()` or
+  open a `TaskGroup` inside a scope — fan out at the top level and let
+  each task open its own. A task that is still running after the scope
+  that started it has exited is the exception: the scope is gone, so the
+  task's next call opens a scope of its own.
+- **One scope, one `dbschema`.** `session_scope(dbschema="tenant_a")`
+  routes the whole scope to that schema. A repository with a different
+  `dbschema` joining it raises `ScopeSchemaMismatchError` rather than
+  silently querying the wrong tenant. One with no `dbschema` joins as is,
+  which means its unqualified table names resolve in the scope's schema
+  too — give a table that lives outside the tenant schemas an explicit
+  `schema=` in its definition.
+
+### Keep network calls out of a scope
+
+A scope holds a pooled connection from its first statement to its exit. A
+slow remote call in the middle holds that connection, and its open
+transaction, for as long as the remote takes. Nothing in mint can detect
+this — it is a matter of call structure. Resolve first, then transact:
+
+```python
+# Wrong: the connection waits on the network
+@db.scoped
+async def assign_quota(account_id: UUID) -> None:
+    account = await AccountRepository(db).get(account_id)
+    quota = await quota_client.fetch(account.plan)      # connection held here
+    await QuotaRepository(db).create(QuotaCreate(account_id=account_id, limit=quota))
+
+# Right: two short scopes around an unscoped remote call
+async def assign_quota(account_id: UUID) -> None:
+    account = await AccountRepository(db).get(account_id)        # scope 1
+    quota = await quota_client.fetch(account.plan)               # no connection held
+    await QuotaRepository(db).create(QuotaCreate(account_id=account_id, limit=quota))  # scope 2
+```
+
+When the remote call must happen *because of* a write, and the two must
+not drift apart, don't stretch the transaction over it. Write the intent
+to an outbox table in the same scope as the business write and deliver it
+from a separate worker — the
+[transactional outbox pattern](https://microservices.io/patterns/data/transactional-outbox.html).
+mint deliberately offers no primitive for suspending a transaction across
+a network call.
+
 ## Unit of Work: multi-table transactions
+
+A session scope covers most multi-table work with less ceremony.
+`UnitOfWork` is for the caller that wants to hold the session explicitly
+and decide when to commit:
 
 ```python
 from mint.db.asynk import UnitOfWork
@@ -356,6 +492,9 @@ async with UnitOfWork(db) as uow:
   are removed, so their owner criteria get silently ANDed together
   (empty results, no error). Harmless in the common case since a
   `UnitOfWork` block is short-lived and its session is discarded on exit.
+  A session scope does not have this constraint.
+- A `UnitOfWork` opened inside a session scope does not join it: it opens
+  its own session on a second connection.
 
 ## Materialized views
 
@@ -398,7 +537,9 @@ a commit, and per-connection options like `schema_translate_map` don't
 carry over. If you commit partway through a multi-statement operation
 under a `dbschema`, call `force_session_schema()` again immediately after
 the commit, before any other statement (reapplying after any other
-statement has already run is a silent no-op).
+statement has already run is a silent no-op). Inside a session scope
+nothing commits until the scope exits, so this only arises on a session
+you commit by hand — a `UnitOfWork`, or `create_session()`.
 
 ## Real-world schema shapes
 
@@ -428,8 +569,8 @@ The API surface is small on purpose:
 - **One required class attribute** (`Schema`) gets a repository subclass
   full CRUD — no `__init__` override, no method stubs to fill in.
 - **No context manager for the common case** — `JobRepository(db).get(id)`
-  needs nothing else. `UnitOfWork` is there when multi-table atomicity is
-  actually needed, not as ambient ceremony.
+  needs nothing else. One decorator (`@db.scoped`) is there when several
+  calls must be one transaction, not as ambient ceremony.
 - **Scoping needs zero per-method code** — compose a mixin onto the
   schema once, every query (built-in or hand-written) is scoped forever
   after.

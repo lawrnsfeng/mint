@@ -2,6 +2,24 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-10-14)
+
+### Documentation
+
+- Add versioning and deprecation policy ([#7](https://github.com/lawrnsfeng/mint/pull/7),
+  [`a1b03dd`](https://github.com/lawrnsfeng/mint/commit/a1b03dde0c83adc32dd67bf2ba6d5ed527fd97f3))
+
+### Features
+
+- **db**: Add timeouts, pool-exhaustion error and scope retry
+  ([#7](https://github.com/lawrnsfeng/mint/pull/7),
+  [`a1b03dd`](https://github.com/lawrnsfeng/mint/commit/a1b03dde0c83adc32dd67bf2ba6d5ed527fd97f3))
+
+- **db**: Make the session lifecycle importable without sqlmodel
+  ([#7](https://github.com/lawrnsfeng/mint/pull/7),
+  [`a1b03dd`](https://github.com/lawrnsfeng/mint/commit/a1b03dde0c83adc32dd67bf2ba6d5ed527fd97f3))
+
+
 ## v0.4.0 (2026-10-14)
 
 ### Build System
